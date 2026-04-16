@@ -6,12 +6,24 @@ from IPython.display import HTML
 from matplotlib.animation import FuncAnimation
 import matplotlib.pyplot as plt
 import os
+from pathlib import Path
 import pandas as pd
 import random
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset, DataLoader, Sampler
 import wandb
+import dotenv
+
+dotenv.load_dotenv(dotenv.find_dotenv())
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DATA_DIR = PROJECT_ROOT / "data"
+TRAIN_DIR = DATA_DIR / "train" / "train"
+TEST_DIR = DATA_DIR / "test" / "test"
+SUBMISSION_DIR = PROJECT_ROOT / "submissions"
+SUBMISSION_DIR.mkdir(exist_ok=True)
+COURT_IMAGE = PROJECT_ROOT / "src" / "img" / "basketball_court.png"
 
 # %% [markdown]
 # ### Public
@@ -268,7 +280,7 @@ class NBATrainer:
         """Setup reproducibility for a set of libraries."""
         torch.manual_seed(self.seed)
         random.seed(self.seed)
-        generator = torch.Generator(self.device).manual_seed(self.seed)
+        generator = torch.Generator().manual_seed(self.seed)
         return generator
 
     def create_sweep_config(self) -> dict:
@@ -385,8 +397,8 @@ class NBATrainer:
     def get_trajectory(self, X: Tensor) -> Tensor:
         """Generate the predicted trajectory using the trained model."""
         # Forward
-        model = NBAModel(4, 2, 32, 8, 12)
-        model.load_state_dict(torch.load("model.pth", weights_only=True))
+        model = NBAModel(4, 2, 32, 8, 12).to(self.device)
+        model.load_state_dict(torch.load("model.pth", weights_only=True, map_location=self.device))
         model.eval()
         with torch.no_grad():
             pred = model(X.unsqueeze(0).to(self.device)).cpu()
@@ -436,7 +448,7 @@ class NBATrainer:
         fig, ax = plt.subplots(figsize=(9, 5))
         ax.set_xlim(0, 95)
         ax.set_ylim(0, 50)
-        court_image = plt.imread("basketball_court.png")
+        court_image = plt.imread(str(COURT_IMAGE))
         ax.imshow(
             court_image, extent=ax.get_xlim() + ax.get_ylim(), aspect="auto", zorder=-1
         )
@@ -498,34 +510,18 @@ class NBATrainer:
         return HTML(ani.to_jshtml())
 
 
-# %%
-nba_trainer = NBATrainer(
-    batch_size=64,
-    epochs=10,
-    train_path="/path/to/folder/with/train/samples",
-    val_path="/path/to/folder/with/validation/samples",
-    device="gpu",
-    seed=0,
-)
+if __name__ == "__main__":
+    nba_trainer = NBATrainer(
+        batch_size=64,
+        epochs=10,
+        train_path=str(TRAIN_DIR),
+        val_path=str(TRAIN_DIR),
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        seed=0,
+    )
 
-# %%
-nba_trainer.get_kaggle_submission(
-    "/path/to/folder/with/test/samples", "/path/to/folder/where/to/save/submission_file"
-)
+    # Train
+    nba_trainer.train()
 
-# %%
-# Show a ground truth trajectory
-seq = torch.load("/path/to/folder/with/train/samples/0.pt")
-nba_trainer.animate_sequence(seq)
-
-# %%
-# Train
-nba_trainer.pipeline()
-
-# %%
-# Show a prediction by the model and compare it to ground truth
-seq = torch.load("/path/to/folder/with/train/samples/0.pt")
-X = seq.clone()[:8]
-X[:, :, [0, 1]] = (X[:, :, [0, 1]] - nba_trainer.mu) / nba_trainer.sigma
-pred = nba_trainer.get_trajectory(X)
-nba_trainer.animate_sequence(seq[:20], pred_seq=pred)
+    # Generate submission from the trained model
+    nba_trainer.get_kaggle_submission(str(TEST_DIR), str(SUBMISSION_DIR))
