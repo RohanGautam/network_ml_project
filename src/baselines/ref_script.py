@@ -2,6 +2,7 @@
 # # Data Processing
 
 # %%
+from datetime import datetime
 from IPython.display import HTML
 from matplotlib.animation import FuncAnimation
 import matplotlib.pyplot as plt
@@ -438,7 +439,8 @@ class NBATrainer:
             ],
         ).set_index("id")
         all_traj = all_traj.sort_index()
-        all_traj.to_csv(os.path.join(target_dir, "solution.csv"))
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        all_traj.to_csv(os.path.join(target_dir, f"solution_{timestamp}.csv"))
 
     def animate_sequence(
         self, sequence: Tensor, interval: int = 50, pred_seq: Tensor = None
