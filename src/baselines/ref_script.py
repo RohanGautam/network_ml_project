@@ -15,6 +15,7 @@ from torch import Tensor
 from torch.utils.data import Dataset, DataLoader, Sampler
 import wandb
 import dotenv
+import json
 
 dotenv.load_dotenv(dotenv.find_dotenv())
 
@@ -38,7 +39,7 @@ class NBADataset(Dataset):
 
     def __init__(
         self,
-        data_path: str,
+        files,
         context_size: int,
         horizon_size: int,
         mu: Tensor,
@@ -48,17 +49,13 @@ class NBADataset(Dataset):
         self.context_size = context_size
         self.horizon_size = horizon_size
         self.window_size = context_size + horizon_size
-        self.load_data(data_path, mu, sigma)
+        self.load_data(files, mu, sigma)
 
-    def load_data(self, data_path: str, mu: Tensor, sigma: Tensor):
+    def load_data(self, files, mu: Tensor, sigma: Tensor):
         """Load all sequences and normalize positions."""
         self.sequences = []
         self.max_start = []
-        for f in [
-            os.path.join(data_path, f)
-            for f in os.listdir(data_path)
-            if f.endswith(".pt")
-        ]:
+        for f in files:
             seq = torch.load(f, weights_only=False)  # [T,N,F]
             seq[:, :, [0, 1]] = (seq[:, :, [0, 1]].clone() - mu) / sigma
             self.sequences.append(seq)
@@ -234,8 +231,7 @@ class NBATrainer:
         self,
         batch_size: int,
         epochs: int,
-        train_path: str,
-        val_path: str,
+        split_path: str,
         device: str = "cuda",
         context_size: int = 8,
         horizon_size: int = 12,
@@ -246,28 +242,29 @@ class NBATrainer:
         self.device = device
         self.epochs = epochs
         self.horizon_size = horizon_size
-        self.train_path = train_path
-        self.val_path = val_path
+        self.split_path = split_path
         self.seed = seed
+        # Resolve split manifest into file lists
+
+        manifest = json.loads(Path(split_path).read_text())
+        data_dir = PROJECT_ROOT / manifest["data_dir"]
+        self.train_files = [data_dir / f for f in manifest["train"]]
+        self.val_files = [data_dir / f for f in manifest["val"]]
         # Load data
-        mu, sigma = self.compute_normalization_statistics(self.train_path)
+        mu, sigma = self.compute_normalization_statistics(self.train_files)
         self.mu, self.sigma = mu, sigma
         self.train_dataset = NBADataset(
-            self.train_path, context_size, horizon_size, mu, sigma
+            self.train_files, context_size, horizon_size, mu, sigma
         )
         self.val_dataset = NBADataset(
-            self.val_path, context_size, horizon_size, mu, sigma
+            self.val_files, context_size, horizon_size, mu, sigma
         )
 
-    def compute_normalization_statistics(self, data_path: str) -> tuple:
+    def compute_normalization_statistics(self, files) -> tuple:
         """Compute mu and sigma for normalization of spatial positions."""
         # Load all positions
         all_pos = []
-        for f in [
-            os.path.join(data_path, f)
-            for f in os.listdir(data_path)
-            if f.endswith(".pt")
-        ]:
+        for f in files:
             seq = torch.load(f, weights_only=False)  # [T,N,F]
             pos = seq[:, :, [0, 1]]
             all_pos.append(pos)
@@ -358,7 +355,7 @@ class NBATrainer:
                     sampler = dataloader.sampler
                     sampler.set_epoch(epoch)
                     scheduler.step()
-            torch.save(model.state_dict(), os.path.join(f"model.pth"))
+            torch.save(model.state_dict(), os.path.join("model.pth"))
 
     def train_one_epoch(
         self,
@@ -399,7 +396,9 @@ class NBATrainer:
         """Generate the predicted trajectory using the trained model."""
         # Forward
         model = NBAModel(4, 2, 32, 8, 12).to(self.device)
-        model.load_state_dict(torch.load("model.pth", weights_only=True, map_location=self.device))
+        model.load_state_dict(
+            torch.load("model.pth", weights_only=True, map_location=self.device)
+        )
         model.eval()
         with torch.no_grad():
             pred = model(X.unsqueeze(0).to(self.device)).cpu()
@@ -516,8 +515,7 @@ if __name__ == "__main__":
     nba_trainer = NBATrainer(
         batch_size=64,
         epochs=10,
-        train_path=str(TRAIN_DIR),
-        val_path=str(TRAIN_DIR),
+        split_path=str(PROJECT_ROOT / "splits" / "fold0.json"),
         device="cuda" if torch.cuda.is_available() else "cpu",
         seed=0,
     )
