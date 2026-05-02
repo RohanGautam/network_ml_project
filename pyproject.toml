@@ -13,5 +13,6 @@ dependencies = [
     "matplotlib>=3.10.8",
     "pandas>=3.0.2",
     "torch>=2.10.0,<2.11",
+    "torch-geometric>=2.7.0",
     "wandb>=0.26.0",
 ]
