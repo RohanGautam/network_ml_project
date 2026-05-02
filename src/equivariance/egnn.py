@@ -254,11 +254,10 @@ class NBAEGNNModel(nn.Module):
 
     At each timestep:
       1. GRU step encodes per-agent temporal dynamics.
-      2. EGNNLayer exchanges messages weighted by pairwise distances and
-         updates positions equivariantly.
-
-    Position prediction comes directly from the equivariant coord update,
-    not a separate linear projection head.
+      2. EGNNLayer exchanges geometry-aware messages and updates pos equivariantly.
+      3. A separate projection head proj(h) → xy produces the training target,
+         decoupling the MSE loss from the equivariant coord update. This prevents
+         autoregressive position error from compounding through the coord MLP.
     """
 
     def __init__(
@@ -272,6 +271,13 @@ class NBAEGNNModel(nn.Module):
         super().__init__()
         self.RNN = RNN(input_dim, state_dim)
         self.egnn = EGNNLayer(state_dim)
+        self.proj = nn.Sequential(
+            nn.Linear(state_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_dim),
+        )
         self.context_size = context_size
         self.horizon_size = horizon_size
 
@@ -282,21 +288,25 @@ class NBAEGNNModel(nn.Module):
         T = self.context_size + self.horizon_size
         all_preds = []
 
-        pos = X[:, 0, :, :2].reshape(B * N, 2)  # initialise from first frame
+        pos = X[:, 0, :, :2].reshape(B * N, 2)
 
         for t in range(T):
             if t < self.context_size:
                 x = X[:, t, :, :].reshape(B * N, F)
-                pos = X[:, t, :, :2].reshape(B * N, 2)  # ground-truth pos during context
+                pos = X[:, t, :, :2].reshape(B * N, 2)  # GT pos during context
             else:
-                # During prediction: feed [predicted_pos, static_features] as input
+                # proj output feeds next step's pos for geometry; static features appended
                 x = torch.cat([pos, X[:, 0, :, 2:].reshape(B * N, 2)], dim=1)
 
-            h = self.RNN.forward(x, h_prev)           # [B*N, D]
-            h, pos = self.egnn(h, pos, edge_index)    # equivariant update
+            h = self.RNN.forward(x, h_prev)         # [B*N, D]
+            h, pos_geo = self.egnn(h, pos, edge_index)  # geometry update (equivariant)
 
             if t >= self.context_size - 1 and t < T - 1:
-                all_preds.append(pos)  # equivariant coord IS the position prediction
+                pred_xy = self.proj(h)              # training target: clean projection
+                all_preds.append(pred_xy)
+                pos = pred_xy.detach()              # geometry pos from projection, not coord MLP
+            else:
+                pos = pos_geo                       # during context: use equivariant pos
 
             h_prev = h
 
@@ -535,7 +545,7 @@ if __name__ == "__main__":
 
     model = NBALightningModel(lr=3e-4)
 
-    wandb_logger = WandbLogger(project="NML_base", name="egnn_stable")
+    wandb_logger = WandbLogger(project="NML_base", name="egnn_proj")
 
     early_stop = EarlyStopping(monitor="val/loss", patience=20, mode="min")
 
