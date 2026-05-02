@@ -12,6 +12,10 @@ import lightning as L
 from lightning.pytorch.loggers import WandbLogger
 import dotenv
 import json
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from utils.metrics import compute_ade, compute_fde
 
 dotenv.load_dotenv(dotenv.find_dotenv())
 
@@ -211,14 +215,21 @@ class NBALightningModel(L.LightningModule):
         X, y = batch
         pred = self(X)
         loss = self.loss_fn.compute(pred, y)
-        self.log("train_loss", loss, on_epoch=True, prog_bar=True)
+        self.log("train/loss", loss, on_epoch=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         X, y = batch
         pred = self(X)
         loss = self.loss_fn.compute(pred, y)
-        self.log("val_loss", loss, on_epoch=True, prog_bar=True)
+        # Reshape target to [T, B*N, 2] to match pred
+        B, T, N, _ = y.shape
+        target_xy = y[:, :, :, :2].permute(1, 0, 2, 3).reshape(T, B * N, 2)
+        ade = compute_ade(pred, target_xy)
+        fde = compute_fde(pred, target_xy)
+        self.log("val/loss", loss, on_epoch=True, prog_bar=True)
+        self.log("val/ade", ade, on_epoch=True, prog_bar=True)
+        self.log("val/fde", fde, on_epoch=True, prog_bar=True)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
