@@ -51,8 +51,12 @@ class NBADataset(Dataset):
         self.sequences = []
         self.max_start = []
         for f in files:
-            seq = torch.load(f, weights_only=False)  # [T,N,F]
+            seq = torch.load(f, weights_only=False)  # [T,N,4]
             seq[:, :, [0, 1]] = (seq[:, :, [0, 1]].clone() - mu) / sigma
+            vel = torch.zeros_like(seq[:, :, :2])   # [T,N,2], zero-padded at t=0
+            vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
+            # feature layout: [x, y, dx, dy, isplayer, team]
+            seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
             self.sequences.append(seq)
             self.max_start.append(max(0, len(seq) - self.window_size))
 
@@ -178,14 +182,20 @@ class NBAModel(torch.nn.Module):
         h_prev = torch.zeros(size=(B * N, self.RNN.state_dim), device=X.device)
         T = self.context_size + self.horizon_size
         all_preds = []
+        # static features [isplayer, team] sit at indices 4,5 after velocity insertion
+        static = X[:, 0, :, 4:].reshape(B * N, 2)
+        # anchor for computing velocity at the first autoregressive step
+        pos_prev = X[:, self.context_size - 1, :, :2].reshape(B * N, 2)
         for t in range(T):
             if t < self.context_size:
                 x = X[:, t, :, :].reshape(B * N, F)
             else:
-                x = torch.cat([x, X[:, 0, :, 2:].reshape(B * N, 2)], dim=1)
+                vel = x - pos_prev          # predicted displacement
+                pos_prev = x
+                x = torch.cat([x, vel, static], dim=1)
             h = self.RNN.forward(x, h_prev)
             if t >= self.context_size - 1 and t < T - 1:
-                x = self.proj.forward(h)
+                x = self.proj.forward(h)    # x now holds the new predicted xy
                 all_preds.append(x)
             h_prev = h
         all_preds = torch.stack(all_preds, dim=0)  # [T,B*N,2]
@@ -197,7 +207,7 @@ class NBALightningModel(L.LightningModule):
 
     def __init__(
         self,
-        input_dim: int = 4,
+        input_dim: int = 6,
         output_dim: int = 2,
         state_dim: int = 32,
         context_size: int = 8,
@@ -258,9 +268,10 @@ class NBALightningModel(L.LightningModule):
             pred = self(X.unsqueeze(0).to(self.device)).cpu()
         X[:, :, :2] = X[:, :, :2] * sigma + mu
         pred = pred * sigma + mu
-        static = X[-1, :, 2:].unsqueeze(0).repeat(pred.size(0), 1, 1)
-        pred = torch.cat([pred, static], dim=-1)
-        return torch.cat([X, pred], dim=0).detach()
+        static = X[-1, :, 4:].unsqueeze(0).repeat(pred.size(0), 1, 1)  # isplayer, team
+        pred = torch.cat([pred, static], dim=-1)                         # [H, N, 4]
+        X_display = torch.cat([X[:, :, :2], X[:, :, 4:]], dim=-1)       # drop velocity
+        return torch.cat([X_display, pred], dim=0).detach()              # [C+H, N, 4]
 
     def animate_sequence(
         self, sequence: Tensor, interval: int = 50, pred_seq: Tensor = None
@@ -389,6 +400,9 @@ class NBADataModule(L.LightningDataModule):
                 continue
             seq = torch.load(os.path.join(test_dir, f), weights_only=False)
             seq[:, :, [0, 1]] = (seq[:, :, [0, 1]].clone() - self.mu) / self.sigma
+            vel = torch.zeros_like(seq[:, :, :2])
+            vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
+            seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
             traj = model.get_trajectory(seq, self.mu, self.sigma)
             traj = traj[8:, :, :2].reshape(-1)
             all_traj.append([int(f.removesuffix(".pt"))] + traj.tolist())
@@ -420,7 +434,7 @@ if __name__ == "__main__":
 
     model = NBALightningModel()
 
-    wandb_logger = WandbLogger(project="NML_base")
+    wandb_logger = WandbLogger(project="NML_base", name="gru_vel")
 
     early_stop = EarlyStopping(monitor="val/loss", patience=15, mode="min")
 
