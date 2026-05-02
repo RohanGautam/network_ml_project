@@ -10,6 +10,8 @@ from torch import Tensor
 from torch.utils.data import Dataset, DataLoader, Sampler
 import lightning as L
 from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.callbacks import EarlyStopping
+from torch_geometric.nn import MessagePassing
 import dotenv
 import json
 import sys
@@ -191,6 +193,94 @@ class NBAModel(torch.nn.Module):
         return all_preds
 
 
+def make_complete_edge_index(N: int, B: int, device) -> Tensor:
+    """
+    Fully-connected edge index (no self-loops) for a batch of B graphs, each with N nodes.
+    Node indices for graph b are offset by b*N, which is the standard PyG batching convention.
+    Returns shape [2, B * N * (N-1)].
+    """
+    src = torch.arange(N, device=device).repeat_interleave(N)
+    dst = torch.arange(N, device=device).repeat(N)
+    mask = src != dst
+    ei = torch.stack([src[mask], dst[mask]])  # [2, N*(N-1)]
+    E = ei.size(1)
+    ei_batched = ei.repeat(1, B)  # [2, B*E]
+    offsets = torch.arange(B, device=device).repeat_interleave(E) * N
+    return ei_batched + offsets.unsqueeze(0)  # [2, B*E]
+
+
+class GraphLayer(MessagePassing):
+    """
+    Fully-connected message-passing layer (PyG) over N agents.
+    For each agent i, aggregates MLP(h_i, h_j) messages from all j ≠ i,
+    then applies a residual update. Permutation equivariant over agents.
+    """
+
+    def __init__(self, state_dim: int):
+        super().__init__(aggr="mean")
+        self.msg_mlp = torch.nn.Sequential(
+            torch.nn.Linear(state_dim * 2, state_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(state_dim, state_dim),
+        )
+        self.update_mlp = torch.nn.Sequential(
+            torch.nn.Linear(state_dim * 2, state_dim),
+            torch.nn.ReLU(),
+        )
+
+    def forward(self, h: Tensor, edge_index: Tensor) -> Tensor:
+        """h: [B*N, D], edge_index: [2, E] -> [B*N, D]"""
+        agg = self.propagate(edge_index, h=h)  # [B*N, D]
+        return h + self.update_mlp(torch.cat([h, agg], dim=-1))
+
+    def message(self, h_i: Tensor, h_j: Tensor) -> Tensor:
+        return self.msg_mlp(torch.cat([h_i, h_j], dim=-1))
+
+
+class NBAGraphModel(torch.nn.Module):
+    """GRU + graph layer: after each GRU step, agents exchange information via message passing."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        state_dim: int,
+        context_size: int,
+        horizon_size: int,
+    ):
+        super().__init__()
+        self.RNN = RNN(input_dim, state_dim)
+        self.graph = GraphLayer(state_dim)
+        self.proj = torch.nn.Sequential(
+            torch.nn.Linear(state_dim, 64, bias=True),
+            torch.nn.ReLU(),
+            torch.nn.Linear(64, 64, bias=True),
+            torch.nn.ReLU(),
+            torch.nn.Linear(64, output_dim),
+        )
+        self.context_size = context_size
+        self.horizon_size = horizon_size
+
+    def forward(self, X: Tensor) -> Tensor:
+        B, _, N, F = X.shape
+        h_prev = torch.zeros(size=(B * N, self.RNN.state_dim), device=X.device)
+        edge_index = make_complete_edge_index(N, B, X.device)
+        T = self.context_size + self.horizon_size
+        all_preds = []
+        for t in range(T):
+            if t < self.context_size:
+                x = X[:, t, :, :].reshape(B * N, F)
+            else:
+                x = torch.cat([x, X[:, 0, :, 2:].reshape(B * N, 2)], dim=1)
+            h = self.RNN.forward(x, h_prev)  # [B*N, D]
+            h = self.graph(h, edge_index)  # [B*N, D]
+            if t >= self.context_size - 1 and t < T - 1:
+                x = self.proj.forward(h)
+                all_preds.append(x)
+            h_prev = h
+        return torch.stack(all_preds, dim=0)  # [T, B*N, 2]
+
+
 class NBALightningModel(L.LightningModule):
     ENTITY_MAPPING = {-1: "Team_A", 0: "Ball", 1: "Team_B"}
 
@@ -205,8 +295,15 @@ class NBALightningModel(L.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters()
-        self.net = NBAModel(input_dim, output_dim, state_dim, context_size, horizon_size)
+        self.net = NBAModel(
+            input_dim, output_dim, state_dim, context_size, horizon_size
+        )
         self.loss_fn = MultiStepMSE()
+
+    def on_fit_start(self):
+        dm = self.trainer.datamodule
+        self.register_buffer("mu", dm.mu.to(self.device))
+        self.register_buffer("sigma", dm.sigma.to(self.device))
 
     def forward(self, X: Tensor) -> Tensor:
         return self.net(X)
@@ -222,22 +319,22 @@ class NBALightningModel(L.LightningModule):
         X, y = batch
         pred = self(X)
         loss = self.loss_fn.compute(pred, y)
-        # Reshape target to [T, B*N, 2] to match pred
         B, T, N, _ = y.shape
         target_xy = y[:, :, :, :2].permute(1, 0, 2, 3).reshape(T, B * N, 2)
-        ade = compute_ade(pred, target_xy)
-        fde = compute_fde(pred, target_xy)
+        # important! we have to denormalise first.
+        pred_real = pred * self.sigma + self.mu
+        target_real = target_xy * self.sigma + self.mu
+        ade = compute_ade(pred_real, target_real)
+        fde = compute_fde(pred_real, target_real)
         self.log("val/loss", loss, on_epoch=True, prog_bar=True)
-        self.log("val/ade", ade, on_epoch=True, prog_bar=True)
-        self.log("val/fde", fde, on_epoch=True, prog_bar=True)
+        self.log("val/ade_ft", ade, on_epoch=True, prog_bar=True)
+        self.log("val/fde_ft", fde, on_epoch=True, prog_bar=True)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
             self.parameters(), lr=self.hparams.lr, weight_decay=5e-4
         )
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=300, gamma=0.5
-        )
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=300, gamma=0.5)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
     def get_trajectory(self, X: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
@@ -358,7 +455,9 @@ class NBADataModule(L.LightningDataModule):
         sampler = NBASampler(
             self.batch_size, self.train_dataset.max_start, seed=self.seed, shuffle=True
         )
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, sampler=sampler)
+        return DataLoader(
+            self.train_dataset, batch_size=self.batch_size, sampler=sampler
+        )
 
     def val_dataloader(self):
         sampler = NBASampler(
@@ -379,18 +478,42 @@ class NBADataModule(L.LightningDataModule):
             traj = model.get_trajectory(seq, self.mu, self.sigma)
             traj = traj[8:, :, :2].reshape(-1)
             all_traj.append([int(f.removesuffix(".pt"))] + traj.tolist())
-        df = pd.DataFrame(
-            all_traj,
-            columns=["id"]
-            + [
-                f"entity_{i}_time_{t}_{axis}"
-                for t in range(12)
-                for i in range(11)
-                for axis in ["x", "y"]
-            ],
-        ).set_index("id").sort_index()
+        df = (
+            pd.DataFrame(
+                all_traj,
+                columns=["id"]
+                + [
+                    f"entity_{i}_time_{t}_{axis}"
+                    for t in range(12)
+                    for i in range(11)
+                    for axis in ["x", "y"]
+                ],
+            )
+            .set_index("id")
+            .sort_index()
+        )
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         df.to_csv(os.path.join(target_dir, f"solution_{timestamp}.csv"))
+
+
+class NBAGraphLightningModel(NBALightningModel):
+    """GRU + graph layer model. Inherits all training/val/logging from NBALightningModel."""
+
+    def __init__(
+        self,
+        input_dim: int = 4,
+        output_dim: int = 2,
+        state_dim: int = 32,
+        context_size: int = 8,
+        horizon_size: int = 12,
+        lr: float = 1e-3,
+    ):
+        super().__init__(
+            input_dim, output_dim, state_dim, context_size, horizon_size, lr
+        )
+        self.net = NBAGraphModel(
+            input_dim, output_dim, state_dim, context_size, horizon_size
+        )
 
 
 if __name__ == "__main__":
@@ -401,14 +524,17 @@ if __name__ == "__main__":
         batch_size=64,
     )
 
-    model = NBALightningModel()
+    model = NBAGraphLightningModel()
 
     wandb_logger = WandbLogger(project="NML_base")
 
+    early_stop = EarlyStopping(monitor="val/loss", patience=15, mode="min")
+
     trainer = L.Trainer(
-        max_epochs=10,
+        max_epochs=100,
         logger=wandb_logger,
         accelerator="auto",
+        callbacks=[early_stop],
     )
 
     trainer.fit(model, data_module)
