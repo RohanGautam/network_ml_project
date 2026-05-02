@@ -205,8 +205,15 @@ class NBALightningModel(L.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters()
-        self.net = NBAModel(input_dim, output_dim, state_dim, context_size, horizon_size)
+        self.net = NBAModel(
+            input_dim, output_dim, state_dim, context_size, horizon_size
+        )
         self.loss_fn = MultiStepMSE()
+
+    def on_fit_start(self):
+        dm = self.trainer.datamodule
+        self.register_buffer("mu", dm.mu.to(self.device))
+        self.register_buffer("sigma", dm.sigma.to(self.device))
 
     def forward(self, X: Tensor) -> Tensor:
         return self.net(X)
@@ -225,19 +232,20 @@ class NBALightningModel(L.LightningModule):
         # Reshape target to [T, B*N, 2] to match pred
         B, T, N, _ = y.shape
         target_xy = y[:, :, :, :2].permute(1, 0, 2, 3).reshape(T, B * N, 2)
-        ade = compute_ade(pred, target_xy)
-        fde = compute_fde(pred, target_xy)
+        # Denormalize to original coordinate space (feet) before computing ADE/FDE
+        pred_real = pred * self.sigma + self.mu
+        target_real = target_xy * self.sigma + self.mu
+        ade = compute_ade(pred_real, target_real)
+        fde = compute_fde(pred_real, target_real)
         self.log("val/loss", loss, on_epoch=True, prog_bar=True)
-        self.log("val/ade", ade, on_epoch=True, prog_bar=True)
-        self.log("val/fde", fde, on_epoch=True, prog_bar=True)
+        self.log("val/ade_ft", ade, on_epoch=True, prog_bar=True)
+        self.log("val/fde_ft", fde, on_epoch=True, prog_bar=True)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
             self.parameters(), lr=self.hparams.lr, weight_decay=5e-4
         )
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=300, gamma=0.5
-        )
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=300, gamma=0.5)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
     def get_trajectory(self, X: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
@@ -358,7 +366,9 @@ class NBADataModule(L.LightningDataModule):
         sampler = NBASampler(
             self.batch_size, self.train_dataset.max_start, seed=self.seed, shuffle=True
         )
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, sampler=sampler)
+        return DataLoader(
+            self.train_dataset, batch_size=self.batch_size, sampler=sampler
+        )
 
     def val_dataloader(self):
         sampler = NBASampler(
@@ -379,16 +389,20 @@ class NBADataModule(L.LightningDataModule):
             traj = model.get_trajectory(seq, self.mu, self.sigma)
             traj = traj[8:, :, :2].reshape(-1)
             all_traj.append([int(f.removesuffix(".pt"))] + traj.tolist())
-        df = pd.DataFrame(
-            all_traj,
-            columns=["id"]
-            + [
-                f"entity_{i}_time_{t}_{axis}"
-                for t in range(12)
-                for i in range(11)
-                for axis in ["x", "y"]
-            ],
-        ).set_index("id").sort_index()
+        df = (
+            pd.DataFrame(
+                all_traj,
+                columns=["id"]
+                + [
+                    f"entity_{i}_time_{t}_{axis}"
+                    for t in range(12)
+                    for i in range(11)
+                    for axis in ["x", "y"]
+                ],
+            )
+            .set_index("id")
+            .sort_index()
+        )
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         df.to_csv(os.path.join(target_dir, f"solution_{timestamp}.csv"))
 
@@ -406,7 +420,7 @@ if __name__ == "__main__":
     wandb_logger = WandbLogger(project="NML_base")
 
     trainer = L.Trainer(
-        max_epochs=10,
+        max_epochs=100,
         logger=wandb_logger,
         accelerator="auto",
     )
