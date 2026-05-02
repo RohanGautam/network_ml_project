@@ -21,6 +21,19 @@ def compute_ade(pred: Tensor, target: Tensor) -> Tensor:
     return torch.norm(pred - target, dim=-1).mean()
 
 
+def compute_mse(pred: Tensor, target: Tensor) -> Tensor:
+    """
+    MSE averaged per timestep — matches the Kaggle leaderboard metric.
+
+    Args:
+        pred:   [T, B*N, 2]  — denormalized, in feet
+        target: [T, B*N, 2]  — denormalized, in feet
+    Returns:
+        scalar MSE in feet^2
+    """
+    return ((pred - target) ** 2).sum(dim=-1).mean()
+
+
 def compute_fde(pred: Tensor, target: Tensor) -> Tensor:
     """
     Final Displacement Error: mean L2 distance at the last predicted timestep.
