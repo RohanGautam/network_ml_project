@@ -10,6 +10,7 @@ from torch import Tensor
 from torch.utils.data import Dataset, DataLoader, Sampler
 import lightning as L
 from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.callbacks import EarlyStopping
 import dotenv
 import json
 import sys
@@ -419,10 +420,13 @@ if __name__ == "__main__":
 
     wandb_logger = WandbLogger(project="NML_base")
 
+    early_stop = EarlyStopping(monitor="val/loss", patience=15, mode="min")
+
     trainer = L.Trainer(
         max_epochs=100,
         logger=wandb_logger,
         accelerator="auto",
+        callbacks=[early_stop],
     )
 
     trainer.fit(model, data_module)
