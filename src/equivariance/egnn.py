@@ -358,10 +358,13 @@ class NBALightningModel(L.LightningModule):
         optimizer = torch.optim.Adam(
             self.parameters(), lr=self.hparams.lr, weight_decay=5e-4
         )
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=300, gamma=0.5
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=8, min_lr=1e-5
         )
-        return {"optimizer": optimizer, "lr_scheduler": scheduler}
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "monitor": "val/loss"},
+        }
 
     def get_trajectory(self, X: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
         """Generate the predicted trajectory for a single sequence."""
@@ -530,16 +533,17 @@ if __name__ == "__main__":
         batch_size=64,
     )
 
-    model = NBALightningModel()
+    model = NBALightningModel(lr=3e-4)
 
-    wandb_logger = WandbLogger(project="NML_base", name="egnn_es15")
+    wandb_logger = WandbLogger(project="NML_base", name="egnn_stable")
 
-    early_stop = EarlyStopping(monitor="val/loss", patience=15, mode="min")
+    early_stop = EarlyStopping(monitor="val/loss", patience=20, mode="min")
 
     trainer = L.Trainer(
         max_epochs=200,
         logger=wandb_logger,
         accelerator="auto",
+        gradient_clip_val=1.0,
         callbacks=[early_stop],
     )
 
