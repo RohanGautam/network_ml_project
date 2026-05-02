@@ -16,7 +16,7 @@ import json
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from utils.metrics import compute_ade, compute_fde
+from utils.metrics import compute_ade, compute_fde, compute_mse
 
 dotenv.load_dotenv(dotenv.find_dotenv())
 
@@ -238,9 +238,11 @@ class NBALightningModel(L.LightningModule):
         target_real = target_xy * self.sigma + self.mu
         ade = compute_ade(pred_real, target_real)
         fde = compute_fde(pred_real, target_real)
+        mse = compute_mse(pred_real, target_real)
         self.log("val/loss", loss, on_epoch=True, prog_bar=True)
         self.log("val/ade_ft", ade, on_epoch=True, prog_bar=True)
         self.log("val/fde_ft", fde, on_epoch=True, prog_bar=True)
+        self.log("val/mse_ft", mse, on_epoch=True, prog_bar=True)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
