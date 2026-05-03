@@ -17,7 +17,7 @@ import json
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from utils.metrics import compute_ade, compute_fde
+from utils.metrics import compute_ade, compute_fde, compute_mse
 
 dotenv.load_dotenv(dotenv.find_dotenv())
 
@@ -54,7 +54,7 @@ class NBADataset(Dataset):
         for f in files:
             seq = torch.load(f, weights_only=False)  # [T,N,4]
             seq[:, :, [0, 1]] = (seq[:, :, [0, 1]].clone() - mu) / sigma
-            vel = torch.zeros_like(seq[:, :, :2])   # [T,N,2], zero-padded at t=0
+            vel = torch.zeros_like(seq[:, :, :2])  # [T,N,2], zero-padded at t=0
             vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
             # feature layout: [x, y, dx, dy, isplayer, team]
             seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
@@ -285,7 +285,7 @@ class NBAGraphModel(torch.nn.Module):
                 pos_prev = x
                 x = torch.cat([x, vel, static], dim=1)
             h = self.RNN.forward(x, h_prev)  # [B*N, D]
-            h = self.graph(h, edge_index)    # [B*N, D]
+            h = self.graph(h, edge_index)  # [B*N, D]
             if t >= self.context_size - 1 and t < T - 1:
                 x = self.proj.forward(h)
                 all_preds.append(x)
@@ -338,9 +338,11 @@ class NBALightningModel(L.LightningModule):
         target_real = target_xy * self.sigma + self.mu
         ade = compute_ade(pred_real, target_real)
         fde = compute_fde(pred_real, target_real)
+        mse = compute_mse(pred_real, target_real)
         self.log("val/loss", loss, on_epoch=True, prog_bar=True)
         self.log("val/ade_ft", ade, on_epoch=True, prog_bar=True)
         self.log("val/fde_ft", fde, on_epoch=True, prog_bar=True)
+        self.log("val/mse_ft", mse, on_epoch=True, prog_bar=True)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
@@ -357,9 +359,9 @@ class NBALightningModel(L.LightningModule):
         X[:, :, :2] = X[:, :, :2] * sigma + mu
         pred = pred * sigma + mu
         static = X[-1, :, 4:].unsqueeze(0).repeat(pred.size(0), 1, 1)  # isplayer, team
-        pred = torch.cat([pred, static], dim=-1)                         # [H, N, 4]
-        X_display = torch.cat([X[:, :, :2], X[:, :, 4:]], dim=-1)       # drop velocity
-        return torch.cat([X_display, pred], dim=0).detach()              # [C+H, N, 4]
+        pred = torch.cat([pred, static], dim=-1)  # [H, N, 4]
+        X_display = torch.cat([X[:, :, :2], X[:, :, 4:]], dim=-1)  # drop velocity
+        return torch.cat([X_display, pred], dim=0).detach()  # [C+H, N, 4]
 
     def animate_sequence(
         self, sequence: Tensor, interval: int = 50, pred_seq: Tensor = None
