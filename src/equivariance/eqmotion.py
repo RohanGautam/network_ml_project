@@ -1,3 +1,7 @@
+"""
+The code snippets here are from https://github.com/MediaBrain-SJTU/EqMotion/tree/main .
+"""
+
 from torch import nn
 import torch
 import torch.nn.functional as F
@@ -266,7 +270,9 @@ class EqMotion(nn.Module):
 
         self.embedding = nn.Linear(in_node_nf, int(self.hidden_nf / 2))
         self.embedding2 = nn.Linear(in_node_nf, int(self.hidden_nf / 2))
-        self.id_embed = nn.Linear(id_dim, int(self.hidden_nf / 2)) if id_dim > 0 else None
+        self.id_embed = (
+            nn.Linear(id_dim, int(self.hidden_nf / 2)) if id_dim > 0 else None
+        )
         # self.embedding2 = nn.Linear(in_node_nf, int(self.hidden_nf))
 
         self.coord_trans = nn.Linear(in_channel, int(hid_channel), bias=False)
