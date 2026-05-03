@@ -257,6 +257,7 @@ class EqMotion(nn.Module):
         recurrent=False,
         norm_diff=False,
         tanh=False,
+        id_dim=0,
     ):
         super(EqMotion, self).__init__()
         self.hidden_nf = hidden_nf
@@ -265,6 +266,7 @@ class EqMotion(nn.Module):
 
         self.embedding = nn.Linear(in_node_nf, int(self.hidden_nf / 2))
         self.embedding2 = nn.Linear(in_node_nf, int(self.hidden_nf / 2))
+        self.id_embed = nn.Linear(id_dim, int(self.hidden_nf / 2)) if id_dim > 0 else None
         # self.embedding2 = nn.Linear(in_node_nf, int(self.hidden_nf))
 
         self.coord_trans = nn.Linear(in_channel, int(hid_channel), bias=False)
@@ -401,8 +403,7 @@ class EqMotion(nn.Module):
 
         return interaction_category
 
-    def forward(self, h, x, vel, edge_attr=None):
-        # hinit = torch.zeros()
+    def forward(self, h, x, vel, edge_attr=None, agent_id=None):
         vel_pre = torch.zeros_like(vel)
         vel_pre[:, :, 1:] = vel[:, :, :-1]
         vel_pre[:, :, 0] = vel[:, :, 0]
@@ -425,6 +426,8 @@ class EqMotion(nn.Module):
             vel = torch.matmul(dct_m, vel)
 
         h = self.embedding(h)
+        if self.id_embed is not None and agent_id is not None:
+            h = h + self.id_embed(agent_id)
         vel_angle_embedding = self.embedding2(vel_angle)
         h = torch.cat([h, vel_angle_embedding], dim=-1)
 

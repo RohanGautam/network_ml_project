@@ -151,6 +151,7 @@ class NBAEqMotionModel(nn.Module):
             act_fn=nn.SiLU(),
             n_layers=n_layers,
             recurrent=True,
+            id_dim=2,                  # isplayer + team
         )
 
     def forward(self, X: Tensor) -> Tensor:
@@ -158,7 +159,8 @@ class NBAEqMotionModel(nn.Module):
         pos = X[:, :, :, :2].permute(0, 2, 1, 3)   # [B, N, T_p, 2]
         vel = X[:, :, :, 2:4].permute(0, 2, 1, 3)  # [B, N, T_p, 2]
         h = torch.norm(vel, dim=-1)                  # [B, N, T_p]  velocity magnitudes
-        x_pred, _ = self.model(h, pos, vel)          # [B, N, T_f, 2]
+        agent_id = X[:, 0, :, 4:]                   # [B, N, 2]  isplayer + team (static)
+        x_pred, _ = self.model(h, pos, vel, agent_id=agent_id)  # [B, N, T_f, 2]
         # [B, N, T_f, 2] → [T_f, B, N, 2] → [T_f, B*N, 2]
         return x_pred.permute(2, 0, 1, 3).reshape(self.horizon_size, B * N, 2)
 
