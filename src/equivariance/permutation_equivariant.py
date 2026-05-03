@@ -11,6 +11,7 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 import lightning as L
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import EarlyStopping
+from torch_geometric.nn import MessagePassing
 import dotenv
 import json
 import sys
@@ -53,7 +54,7 @@ class NBADataset(Dataset):
         for f in files:
             seq = torch.load(f, weights_only=False)  # [T,N,4]
             seq[:, :, [0, 1]] = (seq[:, :, [0, 1]].clone() - mu) / sigma
-            vel = torch.zeros_like(seq[:, :, :2])   # [T,N,2], zero-padded at t=0
+            vel = torch.zeros_like(seq[:, :, :2])  # [T,N,2], zero-padded at t=0
             vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
             # feature layout: [x, y, dx, dy, isplayer, team]
             seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
@@ -182,24 +183,114 @@ class NBAModel(torch.nn.Module):
         h_prev = torch.zeros(size=(B * N, self.RNN.state_dim), device=X.device)
         T = self.context_size + self.horizon_size
         all_preds = []
-        # static features [isplayer, team] sit at indices 4,5 after velocity insertion
         static = X[:, 0, :, 4:].reshape(B * N, 2)
-        # anchor for computing velocity at the first autoregressive step
         pos_prev = X[:, self.context_size - 1, :, :2].reshape(B * N, 2)
         for t in range(T):
             if t < self.context_size:
                 x = X[:, t, :, :].reshape(B * N, F)
             else:
-                vel = x - pos_prev          # predicted displacement
+                vel = x - pos_prev
                 pos_prev = x
                 x = torch.cat([x, vel, static], dim=1)
             h = self.RNN.forward(x, h_prev)
             if t >= self.context_size - 1 and t < T - 1:
-                x = self.proj.forward(h)    # x now holds the new predicted xy
+                x = self.proj.forward(h)
                 all_preds.append(x)
             h_prev = h
         all_preds = torch.stack(all_preds, dim=0)  # [T,B*N,2]
         return all_preds
+
+
+def make_complete_edge_index(N: int, B: int, device) -> Tensor:
+    """
+    Fully-connected edge index (no self-loops) for a batch of B graphs, each with N nodes.
+    Node indices for graph b are offset by b*N, which is the standard PyG batching convention.
+    Returns shape [2, B * N * (N-1)].
+    """
+    src = torch.arange(N, device=device).repeat_interleave(N)
+    dst = torch.arange(N, device=device).repeat(N)
+    mask = src != dst
+    ei = torch.stack([src[mask], dst[mask]])  # [2, N*(N-1)]
+    E = ei.size(1)
+    ei_batched = ei.repeat(1, B)  # [2, B*E]
+    offsets = torch.arange(B, device=device).repeat_interleave(E) * N
+    return ei_batched + offsets.unsqueeze(0)  # [2, B*E]
+
+
+class GraphLayer(MessagePassing):
+    """
+    Fully-connected message-passing layer (PyG) over N agents.
+    For each agent i, aggregates MLP(h_i, h_j) messages from all j ≠ i,
+    then applies a residual update. Permutation equivariant over agents.
+    """
+
+    def __init__(self, state_dim: int):
+        super().__init__(aggr="mean")
+        self.msg_mlp = torch.nn.Sequential(
+            torch.nn.Linear(state_dim * 2, state_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(state_dim, state_dim),
+        )
+        self.update_mlp = torch.nn.Sequential(
+            torch.nn.Linear(state_dim * 2, state_dim),
+            torch.nn.ReLU(),
+        )
+
+    def forward(self, h: Tensor, edge_index: Tensor) -> Tensor:
+        """h: [B*N, D], edge_index: [2, E] -> [B*N, D]"""
+        agg = self.propagate(edge_index, h=h)  # [B*N, D]
+        return h + self.update_mlp(torch.cat([h, agg], dim=-1))
+
+    def message(self, h_i: Tensor, h_j: Tensor) -> Tensor:
+        return self.msg_mlp(torch.cat([h_i, h_j], dim=-1))
+
+
+class NBAGraphModel(torch.nn.Module):
+    """GRU + graph layer: after each GRU step, agents exchange information via message passing."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        state_dim: int,
+        context_size: int,
+        horizon_size: int,
+    ):
+        super().__init__()
+        self.RNN = RNN(input_dim, state_dim)
+        self.graph = GraphLayer(state_dim)
+        self.proj = torch.nn.Sequential(
+            torch.nn.Linear(state_dim, 64, bias=True),
+            torch.nn.ReLU(),
+            torch.nn.Linear(64, 64, bias=True),
+            torch.nn.ReLU(),
+            torch.nn.Linear(64, output_dim),
+        )
+        self.context_size = context_size
+        self.horizon_size = horizon_size
+
+    def forward(self, X: Tensor) -> Tensor:
+        B, _, N, F = X.shape
+        h_prev = torch.zeros(size=(B * N, self.RNN.state_dim), device=X.device)
+        edge_index = make_complete_edge_index(N, B, X.device)
+        T = self.context_size + self.horizon_size
+        all_preds = []
+        static = X[:, 0, :, 4:].reshape(B * N, 2)
+        pos_prev = X[:, self.context_size - 1, :, :2].reshape(B * N, 2)
+        for t in range(T):
+            if t < self.context_size:
+                x = X[:, t, :, :].reshape(B * N, F)
+            else:
+                vel = x - pos_prev
+                pos_prev = x
+                x = torch.cat([x, vel, static], dim=1)
+            h = self.RNN.forward(x, h_prev)  # [B*N, D]
+            h = self.graph(h, edge_index)  # [B*N, D]
+            if t >= self.context_size - 1 and t < T - 1:
+                x = self.proj.forward(h)
+                all_preds.append(x)
+            h_prev = h
+        return torch.stack(all_preds, dim=0)  # [T, B*N, 2]
 
 
 class NBALightningModel(L.LightningModule):
@@ -240,10 +331,9 @@ class NBALightningModel(L.LightningModule):
         X, y = batch
         pred = self(X)
         loss = self.loss_fn.compute(pred, y)
-        # Reshape target to [T, B*N, 2] to match pred
         B, T, N, _ = y.shape
         target_xy = y[:, :, :, :2].permute(1, 0, 2, 3).reshape(T, B * N, 2)
-        # Denormalize to original coordinate space (feet) before computing ADE/FDE
+        # important! we have to denormalise first.
         pred_real = pred * self.sigma + self.mu
         target_real = target_xy * self.sigma + self.mu
         ade = compute_ade(pred_real, target_real)
@@ -269,9 +359,9 @@ class NBALightningModel(L.LightningModule):
         X[:, :, :2] = X[:, :, :2] * sigma + mu
         pred = pred * sigma + mu
         static = X[-1, :, 4:].unsqueeze(0).repeat(pred.size(0), 1, 1)  # isplayer, team
-        pred = torch.cat([pred, static], dim=-1)                         # [H, N, 4]
-        X_display = torch.cat([X[:, :, :2], X[:, :, 4:]], dim=-1)       # drop velocity
-        return torch.cat([X_display, pred], dim=0).detach()              # [C+H, N, 4]
+        pred = torch.cat([pred, static], dim=-1)  # [H, N, 4]
+        X_display = torch.cat([X[:, :, :2], X[:, :, 4:]], dim=-1)  # drop velocity
+        return torch.cat([X_display, pred], dim=0).detach()  # [C+H, N, 4]
 
     def animate_sequence(
         self, sequence: Tensor, interval: int = 50, pred_seq: Tensor = None
@@ -424,6 +514,26 @@ class NBADataModule(L.LightningDataModule):
         df.to_csv(os.path.join(target_dir, f"solution_{timestamp}.csv"))
 
 
+class NBAGraphLightningModel(NBALightningModel):
+    """GRU + graph layer model. Inherits all training/val/logging from NBALightningModel."""
+
+    def __init__(
+        self,
+        input_dim: int = 6,
+        output_dim: int = 2,
+        state_dim: int = 32,
+        context_size: int = 8,
+        horizon_size: int = 12,
+        lr: float = 1e-3,
+    ):
+        super().__init__(
+            input_dim, output_dim, state_dim, context_size, horizon_size, lr
+        )
+        self.net = NBAGraphModel(
+            input_dim, output_dim, state_dim, context_size, horizon_size
+        )
+
+
 if __name__ == "__main__":
     L.seed_everything(0)
 
@@ -432,9 +542,9 @@ if __name__ == "__main__":
         batch_size=64,
     )
 
-    model = NBALightningModel()
+    model = NBAGraphLightningModel()
 
-    wandb_logger = WandbLogger(project="NML_base", name="gru_vel")
+    wandb_logger = WandbLogger(project="NML_base", name="graph_vel")
 
     early_stop = EarlyStopping(monitor="val/loss", patience=15, mode="min")
 
