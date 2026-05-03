@@ -1,13 +1,3 @@
-"""
-Model 4: EqMotion
-Sequence-to-sequence equivariant trajectory prediction.
-Takes the full context window at once; no autoregressive rollout.
-
-Key difference from Models 1-3: EqMotion processes the whole context window
-simultaneously using DCT-transformed coordinates as geometric features, with
-velocity angles computed internally as invariant pattern features.
-"""
-
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -38,9 +28,6 @@ SUBMISSION_DIR.mkdir(exist_ok=True)
 COURT_IMAGE = PROJECT_ROOT / "src" / "img" / "basketball_court.png"
 
 
-# ── Data pipeline (identical to other scripts) ────────────────────────────────
-
-
 class NBADataset(Dataset):
     def __init__(self, files, context_size, horizon_size, mu, sigma):
         super().__init__()
@@ -65,7 +52,9 @@ class NBADataset(Dataset):
     def __getitem__(self, index):
         seq_idx, start = index
         X = self.sequences[seq_idx][start : start + self.context_size]
-        y = self.sequences[seq_idx][start + self.context_size : start + self.window_size]
+        y = self.sequences[seq_idx][
+            start + self.context_size : start + self.window_size
+        ]
         return X, y
 
     def __len__(self):
@@ -87,11 +76,17 @@ class NBASampler(Sampler):
 
     def __iter__(self):
         n = len(self)
-        perm = torch.randperm(n, generator=self.generator).tolist() if self.shuffle else list(range(n))
+        perm = (
+            torch.randperm(n, generator=self.generator).tolist()
+            if self.shuffle
+            else list(range(n))
+        )
         perm_start = [(i, self.max_start[i]) for i in perm]
         for k in range(0, n, self.batch_size):
             for idx, max_start in perm_start[k : k + self.batch_size]:
-                start = torch.randint(0, max_start + 1, size=(), generator=self.generator)
+                start = torch.randint(
+                    0, max_start + 1, size=(), generator=self.generator
+                )
                 yield idx, start
 
     def __len__(self):
@@ -141,25 +136,25 @@ class NBAEqMotionModel(nn.Module):
         self.context_size = context_size
         self.horizon_size = horizon_size
         self.model = EqMotion(
-            in_node_nf=context_size,   # vel magnitudes: one scalar per context step
+            in_node_nf=context_size,  # vel magnitudes: one scalar per context step
             in_edge_nf=0,
             hidden_nf=hidden_nf,
-            in_channel=context_size,   # T_p — DCT input length
-            hid_channel=hid_channel,   # DCT latent temporal dim
+            in_channel=context_size,  # T_p — DCT input length
+            hid_channel=hid_channel,  # DCT latent temporal dim
             out_channel=horizon_size,  # T_f — DCT output length
-            device="cpu",              # Lightning handles device placement
+            device="cpu",  # Lightning handles device placement
             act_fn=nn.SiLU(),
             n_layers=n_layers,
             recurrent=True,
-            id_dim=2,                  # isplayer + team
+            id_dim=2,  # isplayer + team
         )
 
     def forward(self, X: Tensor) -> Tensor:
         B, T, N, _ = X.shape
-        pos = X[:, :, :, :2].permute(0, 2, 1, 3)   # [B, N, T_p, 2]
+        pos = X[:, :, :, :2].permute(0, 2, 1, 3)  # [B, N, T_p, 2]
         vel = X[:, :, :, 2:4].permute(0, 2, 1, 3)  # [B, N, T_p, 2]
-        h = torch.norm(vel, dim=-1)                  # [B, N, T_p]  velocity magnitudes
-        agent_id = X[:, 0, :, 4:]                   # [B, N, 2]  isplayer + team (static)
+        h = torch.norm(vel, dim=-1)  # [B, N, T_p]  velocity magnitudes
+        agent_id = X[:, 0, :, 4:]  # [B, N, 2]  isplayer + team (static)
         x_pred, _ = self.model(h, pos, vel, agent_id=agent_id)  # [B, N, T_f, 2]
         # [B, N, T_f, 2] → [T_f, B, N, 2] → [T_f, B*N, 2]
         return x_pred.permute(2, 0, 1, 3).reshape(self.horizon_size, B * N, 2)
@@ -180,7 +175,9 @@ class NBAEqMotionLightningModel(L.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters()
-        self.net = NBAEqMotionModel(context_size, horizon_size, hidden_nf, hid_channel, n_layers)
+        self.net = NBAEqMotionModel(
+            context_size, horizon_size, hidden_nf, hid_channel, n_layers
+        )
         self.loss_fn = MultiStepMSE()
 
     def on_fit_start(self):
@@ -207,16 +204,36 @@ class NBAEqMotionLightningModel(L.LightningModule):
         pred_real = pred * self.sigma + self.mu
         target_real = target_xy * self.sigma + self.mu
         self.log("val/loss", loss, on_epoch=True, prog_bar=True)
-        self.log("val/ade_ft", compute_ade(pred_real, target_real), on_epoch=True, prog_bar=True)
-        self.log("val/fde_ft", compute_fde(pred_real, target_real), on_epoch=True, prog_bar=True)
-        self.log("val/mse_ft", compute_mse(pred_real, target_real), on_epoch=True, prog_bar=True)
+        self.log(
+            "val/ade_ft",
+            compute_ade(pred_real, target_real),
+            on_epoch=True,
+            prog_bar=True,
+        )
+        self.log(
+            "val/fde_ft",
+            compute_fde(pred_real, target_real),
+            on_epoch=True,
+            prog_bar=True,
+        )
+        self.log(
+            "val/mse_ft",
+            compute_mse(pred_real, target_real),
+            on_epoch=True,
+            prog_bar=True,
+        )
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr, weight_decay=5e-4)
+        optimizer = torch.optim.Adam(
+            self.parameters(), lr=self.hparams.lr, weight_decay=5e-4
+        )
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=0.5, patience=8, min_lr=1e-5
         )
-        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "monitor": "val/loss"}}
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "monitor": "val/loss"},
+        }
 
     def get_trajectory(self, X: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
         self.eval()
@@ -225,13 +242,15 @@ class NBAEqMotionLightningModel(L.LightningModule):
         X[:, :, :2] = X[:, :, :2] * sigma + mu
         pred = pred * sigma + mu
         static = X[-1, :, 4:].unsqueeze(0).repeat(pred.size(0), 1, 1)  # [T_f, N, 2]
-        pred = torch.cat([pred, static], dim=-1)                         # [T_f, N, 4]
-        X_display = torch.cat([X[:, :, :2], X[:, :, 4:]], dim=-1)       # [T_p, N, 4]
-        return torch.cat([X_display, pred], dim=0).detach()              # [T_p+T_f, N, 4]
+        pred = torch.cat([pred, static], dim=-1)  # [T_f, N, 4]
+        X_display = torch.cat([X[:, :, :2], X[:, :, 4:]], dim=-1)  # [T_p, N, 4]
+        return torch.cat([X_display, pred], dim=0).detach()  # [T_p+T_f, N, 4]
 
 
 class NBADataModule(L.LightningDataModule):
-    def __init__(self, split_path, batch_size=64, context_size=8, horizon_size=12, seed=0):
+    def __init__(
+        self, split_path, batch_size=64, context_size=8, horizon_size=12, seed=0
+    ):
         super().__init__()
         self.split_path = split_path
         self.batch_size = batch_size
@@ -266,7 +285,9 @@ class NBADataModule(L.LightningDataModule):
         sampler = NBASampler(
             self.batch_size, self.train_dataset.max_start, seed=self.seed, shuffle=True
         )
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, sampler=sampler)
+        return DataLoader(
+            self.train_dataset, batch_size=self.batch_size, sampler=sampler
+        )
 
     def val_dataloader(self):
         sampler = NBASampler(
