@@ -28,7 +28,7 @@ import json
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from utils.metrics import compute_ade, compute_fde
+from utils.metrics import compute_ade, compute_fde, compute_mse
 
 dotenv.load_dotenv(dotenv.find_dotenv())
 
@@ -66,8 +66,12 @@ class NBADataset(Dataset):
         self.sequences = []
         self.max_start = []
         for f in files:
-            seq = torch.load(f, weights_only=False)  # [T,N,F]
+            seq = torch.load(f, weights_only=False)  # [T,N,4]
             seq[:, :, [0, 1]] = (seq[:, :, [0, 1]].clone() - mu) / sigma
+            vel = torch.zeros_like(seq[:, :, :2])
+            vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
+            # feature layout: [x, y, dx, dy, isplayer, team]
+            seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
             self.sequences.append(seq)
             self.max_start.append(max(0, len(seq) - self.window_size))
 
@@ -287,26 +291,28 @@ class NBAEGNNModel(nn.Module):
         edge_index = make_complete_edge_index(N, B, X.device)
         T = self.context_size + self.horizon_size
         all_preds = []
-
+        static = X[:, 0, :, 4:].reshape(B * N, 2)   # [isplayer, team] at indices 4,5
+        pos_prev = X[:, self.context_size - 1, :, :2].reshape(B * N, 2)
         pos = X[:, 0, :, :2].reshape(B * N, 2)
 
         for t in range(T):
             if t < self.context_size:
                 x = X[:, t, :, :].reshape(B * N, F)
-                pos = X[:, t, :, :2].reshape(B * N, 2)  # GT pos during context
+                pos = X[:, t, :, :2].reshape(B * N, 2)  # GT pos for EGNN geometry
             else:
-                # proj output feeds next step's pos for geometry; static features appended
-                x = torch.cat([pos, X[:, 0, :, 2:].reshape(B * N, 2)], dim=1)
+                vel = pos - pos_prev
+                pos_prev = pos
+                x = torch.cat([pos, vel, static], dim=1)
 
-            h = self.RNN.forward(x, h_prev)         # [B*N, D]
-            h, pos_geo = self.egnn(h, pos, edge_index)  # geometry update (equivariant)
+            h = self.RNN.forward(x, h_prev)
+            h, pos_geo = self.egnn(h, pos, edge_index)
 
             if t >= self.context_size - 1 and t < T - 1:
-                pred_xy = self.proj(h)              # training target: clean projection
+                pred_xy = self.proj(h)
                 all_preds.append(pred_xy)
-                pos = pred_xy.detach()              # geometry pos from projection, not coord MLP
+                pos = pred_xy.detach()  # proj output drives both next input and geometry
             else:
-                pos = pos_geo                       # during context: use equivariant pos
+                pos = pos_geo
 
             h_prev = h
 
@@ -321,7 +327,7 @@ class NBALightningModel(L.LightningModule):
 
     def __init__(
         self,
-        input_dim: int = 4,
+        input_dim: int = 6,
         output_dim: int = 2,
         state_dim: int = 32,
         context_size: int = 8,
@@ -360,9 +366,11 @@ class NBALightningModel(L.LightningModule):
         target_real = target_xy * self.sigma + self.mu
         ade = compute_ade(pred_real, target_real)
         fde = compute_fde(pred_real, target_real)
+        mse = compute_mse(pred_real, target_real)
         self.log("val/loss", loss, on_epoch=True, prog_bar=True)
         self.log("val/ade_ft", ade, on_epoch=True, prog_bar=True)
         self.log("val/fde_ft", fde, on_epoch=True, prog_bar=True)
+        self.log("val/mse_ft", mse, on_epoch=True, prog_bar=True)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
@@ -383,9 +391,10 @@ class NBALightningModel(L.LightningModule):
             pred = self(X.unsqueeze(0).to(self.device)).cpu()
         X[:, :, :2] = X[:, :, :2] * sigma + mu
         pred = pred * sigma + mu
-        static = X[-1, :, 2:].unsqueeze(0).repeat(pred.size(0), 1, 1)
-        pred = torch.cat([pred, static], dim=-1)
-        return torch.cat([X, pred], dim=0).detach()
+        static = X[-1, :, 4:].unsqueeze(0).repeat(pred.size(0), 1, 1)  # isplayer, team
+        pred = torch.cat([pred, static], dim=-1)                         # [H, N, 4]
+        X_display = torch.cat([X[:, :, :2], X[:, :, 4:]], dim=-1)       # drop velocity
+        return torch.cat([X_display, pred], dim=0).detach()              # [C+H, N, 4]
 
     def animate_sequence(
         self, sequence: Tensor, interval: int = 50, pred_seq: Tensor = None
@@ -514,6 +523,9 @@ class NBADataModule(L.LightningDataModule):
                 continue
             seq = torch.load(os.path.join(test_dir, f), weights_only=False)
             seq[:, :, [0, 1]] = (seq[:, :, [0, 1]].clone() - self.mu) / self.sigma
+            vel = torch.zeros_like(seq[:, :, :2])
+            vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
+            seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
             traj = model.get_trajectory(seq, self.mu, self.sigma)
             traj = traj[8:, :, :2].reshape(-1)
             all_traj.append([int(f.removesuffix(".pt"))] + traj.tolist())
@@ -545,7 +557,7 @@ if __name__ == "__main__":
 
     model = NBALightningModel(lr=3e-4)
 
-    wandb_logger = WandbLogger(project="NML_base", name="egnn_proj")
+    wandb_logger = WandbLogger(project="NML_base", name="egnn_vel")
 
     early_stop = EarlyStopping(monitor="val/loss", patience=20, mode="min")
 
