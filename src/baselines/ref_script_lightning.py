@@ -53,7 +53,7 @@ class NBADataset(Dataset):
         for f in files:
             seq = torch.load(f, weights_only=False)  # [T,N,4]
             seq[:, :, [0, 1]] = (seq[:, :, [0, 1]].clone() - mu) / sigma
-            vel = torch.zeros_like(seq[:, :, :2])   # [T,N,2], zero-padded at t=0
+            vel = torch.zeros_like(seq[:, :, :2])  # [T,N,2], zero-padded at t=0
             vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
             # feature layout: [x, y, dx, dy, isplayer, team]
             seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
@@ -154,6 +154,52 @@ class RNN(torch.nn.Module):
         return H_out
 
 
+class TransformerBackbone(torch.nn.Module):
+    """
+    Causal temporal Transformer backbone.
+
+    At each step, receives the full history of input feature vectors seen so far
+    and returns the last-token representation as the current hidden state.
+    The causal mask enforces the same left-to-right constraint as the GRU.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        state_dim: int,
+        nhead: int = 4,
+        num_layers: int = 2,
+        max_len: int = 20,
+    ):
+        super().__init__()
+        self.state_dim = state_dim
+        self.input_proj = torch.nn.Linear(input_dim, state_dim)
+        self.pos_embed = torch.nn.Embedding(max_len, state_dim)
+        encoder_layer = torch.nn.TransformerEncoderLayer(
+            d_model=state_dim,
+            nhead=nhead,
+            dim_feedforward=state_dim * 2,
+            dropout=0.1,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = torch.nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+    def forward(self, history: Tensor) -> Tensor:
+        # history: [B*N, T_seen, input_dim]
+        T = history.shape[1]
+        x = self.input_proj(history)
+        x = x + self.pos_embed(torch.arange(T, device=history.device))
+        out = self.encoder(
+            x,
+            mask=torch.nn.Transformer.generate_square_subsequent_mask(
+                T, device=history.device
+            ),
+            is_causal=True,
+        )
+        return out[:, -1, :]  # [B*N, state_dim]
+
+
 class NBAModel(torch.nn.Module):
     """Module to perform predictions on the NBA dataset."""
 
@@ -164,9 +210,20 @@ class NBAModel(torch.nn.Module):
         state_dim: int,
         context_size: int,
         horizon_size: int,
+        backbone: str = "gru",
     ):
         super().__init__()
-        self.RNN = RNN(input_dim, state_dim)
+        self.backbone_type = backbone
+        if backbone == "gru":
+            self.backbone = RNN(input_dim, state_dim)
+        elif backbone == "transformer":
+            self.backbone = TransformerBackbone(
+                input_dim, state_dim, nhead=4, num_layers=2
+            )
+        else:
+            raise ValueError(
+                f"Unknown backbone '{backbone}', choose 'gru' or 'transformer'"
+            )
         self.proj = torch.nn.Sequential(
             torch.nn.Linear(state_dim, 64, bias=True),
             torch.nn.ReLU(),
@@ -179,27 +236,41 @@ class NBAModel(torch.nn.Module):
 
     def forward(self, X: Tensor) -> Tensor:
         B, _, N, F = X.shape
-        h_prev = torch.zeros(size=(B * N, self.RNN.state_dim), device=X.device)
         T = self.context_size + self.horizon_size
         all_preds = []
-        # static features [isplayer, team] sit at indices 4,5 after velocity insertion
         static = X[:, 0, :, 4:].reshape(B * N, 2)
-        # anchor for computing velocity at the first autoregressive step
         pos_prev = X[:, self.context_size - 1, :, :2].reshape(B * N, 2)
-        for t in range(T):
-            if t < self.context_size:
-                x = X[:, t, :, :].reshape(B * N, F)
-            else:
-                vel = x - pos_prev          # predicted displacement
-                pos_prev = x
-                x = torch.cat([x, vel, static], dim=1)
-            h = self.RNN.forward(x, h_prev)
-            if t >= self.context_size - 1 and t < T - 1:
-                x = self.proj.forward(h)    # x now holds the new predicted xy
-                all_preds.append(x)
-            h_prev = h
-        all_preds = torch.stack(all_preds, dim=0)  # [T,B*N,2]
-        return all_preds
+
+        if self.backbone_type == "gru":
+            h_prev = torch.zeros(B * N, self.backbone.state_dim, device=X.device)
+            for t in range(T):
+                if t < self.context_size:
+                    x = X[:, t, :, :].reshape(B * N, F)
+                else:
+                    vel = x - pos_prev
+                    pos_prev = x
+                    x = torch.cat([x, vel, static], dim=1)
+                h = self.backbone(x, h_prev)
+                if t >= self.context_size - 1 and t < T - 1:
+                    x = self.proj(h)
+                    all_preds.append(x)
+                h_prev = h
+        else:  # transformer
+            history = []
+            for t in range(T):
+                if t < self.context_size:
+                    x = X[:, t, :, :].reshape(B * N, F)
+                else:
+                    vel = x - pos_prev
+                    pos_prev = x
+                    x = torch.cat([x, vel, static], dim=1)
+                history.append(x)
+                h = self.backbone(torch.stack(history, dim=1))
+                if t >= self.context_size - 1 and t < T - 1:
+                    x = self.proj(h)
+                    all_preds.append(x)
+
+        return torch.stack(all_preds, dim=0)  # [T, B*N, 2]
 
 
 class NBALightningModel(L.LightningModule):
@@ -213,11 +284,12 @@ class NBALightningModel(L.LightningModule):
         context_size: int = 8,
         horizon_size: int = 12,
         lr: float = 1e-3,
+        backbone: str = "gru",
     ):
         super().__init__()
         self.save_hyperparameters()
         self.net = NBAModel(
-            input_dim, output_dim, state_dim, context_size, horizon_size
+            input_dim, output_dim, state_dim, context_size, horizon_size, backbone
         )
         self.loss_fn = MultiStepMSE()
 
@@ -269,9 +341,9 @@ class NBALightningModel(L.LightningModule):
         X[:, :, :2] = X[:, :, :2] * sigma + mu
         pred = pred * sigma + mu
         static = X[-1, :, 4:].unsqueeze(0).repeat(pred.size(0), 1, 1)  # isplayer, team
-        pred = torch.cat([pred, static], dim=-1)                         # [H, N, 4]
-        X_display = torch.cat([X[:, :, :2], X[:, :, 4:]], dim=-1)       # drop velocity
-        return torch.cat([X_display, pred], dim=0).detach()              # [C+H, N, 4]
+        pred = torch.cat([pred, static], dim=-1)  # [H, N, 4]
+        X_display = torch.cat([X[:, :, :2], X[:, :, 4:]], dim=-1)  # drop velocity
+        return torch.cat([X_display, pred], dim=0).detach()  # [C+H, N, 4]
 
     def animate_sequence(
         self, sequence: Tensor, interval: int = 50, pred_seq: Tensor = None
@@ -425,6 +497,9 @@ class NBADataModule(L.LightningDataModule):
 
 
 if __name__ == "__main__":
+    # BACKBONE = "gru"  # toggle: "gru" or "transformer"
+    BACKBONE = "transformer"  # toggle: "gru" or "transformer"
+
     L.seed_everything(0)
 
     data_module = NBADataModule(
@@ -432,9 +507,9 @@ if __name__ == "__main__":
         batch_size=64,
     )
 
-    model = NBALightningModel()
+    model = NBALightningModel(backbone=BACKBONE)
 
-    wandb_logger = WandbLogger(project="NML_base", name="gru_vel")
+    wandb_logger = WandbLogger(project="NML_base", name=f"{BACKBONE}_vel")
 
     early_stop = EarlyStopping(monitor="val/loss", patience=15, mode="min")
 
