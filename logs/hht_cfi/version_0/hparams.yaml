@@ -1,0 +1,4 @@
+hidden_size: 64
+x_encoder_layers: 3
+x_encoder_head: 8
+lr: 0.001
