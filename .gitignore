@@ -3,6 +3,7 @@ data
 submissions
 NML_base
 wandb
+optuna_studies
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
