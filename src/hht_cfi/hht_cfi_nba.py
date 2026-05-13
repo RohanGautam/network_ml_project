@@ -33,12 +33,10 @@ import dotenv
 # ── Path setup ─────────────────────────────────────────────────────────────────
 _SRC  = Path(__file__).resolve().parents[1]          # .../src/
 _ROOT = Path(__file__).resolve().parents[2]          # .../network_ml_project/
-_HHT  = Path(__file__).resolve().parents[3] / "HHT-CFI"
 
-sys.path.insert(0, str(_HHT))   # HHT-CFI local imports (models, basemodel, …)
-sys.path.insert(0, str(_SRC))   # utils.metrics
+sys.path.insert(0, str(_SRC))   # utils.metrics + hht_cfi package
 
-from models import MyTraj  # noqa: E402
+from hht_cfi.models import MyTraj  # noqa: E402
 from utils.metrics import compute_ade, compute_fde, compute_mse  # noqa: E402
 
 dotenv.load_dotenv(dotenv.find_dotenv())
@@ -270,15 +268,22 @@ class NBAHHTCFIModel(nn.Module):
 
     def predict(self, X_obs: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
         """
-        Inference without ground truth. Uses last-observed-frame as dummy target
-        so best-mode selection favors stable trajectories.
+        Inference without ground truth. Uses constant-velocity extrapolation as
+        dummy target so mode selection picks the trajectory closest to "keep moving"
+        rather than the trajectory closest to zero (standing still).
 
         X_obs: [1, T_obs, N, 6]
         Returns: [T_pred, N, 2]  absolute positions in feet.
         """
         B, T_obs, N, _ = X_obs.shape
-        # dummy y = last observed frame repeated (encourages stable predictions)
-        dummy_y = X_obs[:, -1:, :, :].expand(-1, self.T_pred, -1, -1)
+        # Constant-velocity extrapolation in normalized (mu/sigma) space.
+        # velocity feature (channels 2:4) is already the per-frame position delta.
+        vel_norm = X_obs[:, -1, :, 2:4]   # [B, N, 2]
+        pos_norm = X_obs[:, -1, :, :2]    # [B, N, 2]
+        t = torch.arange(1, self.T_pred + 1, dtype=X_obs.dtype, device=X_obs.device)
+        future_pos = pos_norm.unsqueeze(1) + vel_norm.unsqueeze(1) * t.view(1, -1, 1, 1)  # [B, T_pred, N, 2]
+        dummy_y = X_obs[:, -1:, :, :].expand(-1, self.T_pred, -1, -1).clone()
+        dummy_y[:, :, :, :2] = future_pos
         inputs, edge_pair = _to_hht_inputs(X_obs, dummy_y, mu, sigma)
 
         _, full_pre_tra = self.model(inputs, edge_pair, epoch=0)
@@ -304,11 +309,15 @@ class NBAHHTCFILightningModel(L.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.net = NBAHHTCFIModel(hidden_size, x_encoder_layers, x_encoder_head)
+        self.mu: Tensor | None    = None
+        self.sigma: Tensor | None = None
 
     def on_fit_start(self):
         dm = self.trainer.datamodule
-        self.register_buffer("mu",    dm.mu.to(self.device))
-        self.register_buffer("sigma", dm.sigma.to(self.device))
+        # Plain attributes (not buffers) so mu/sigma don't pollute the checkpoint
+        # state dict.  The notebook reattaches them from the datamodule after load.
+        self.mu    = dm.mu.to(self.device)
+        self.sigma = dm.sigma.to(self.device)
 
     def training_step(self, batch, batch_idx):
         X, y = batch
@@ -341,6 +350,13 @@ class NBAHHTCFILightningModel(L.LightningModule):
         opt   = torch.optim.Adam(self.parameters(), lr=self.hparams.lr, weight_decay=5e-4)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=1000, eta_min=1e-5)
         return {"optimizer": opt, "lr_scheduler": sched}
+
+    def predict_batch(self, X_batch: Tensor) -> Tensor:
+        """
+        X_batch: [B, T_obs, N, 6] — normalized input (mu/sigma already attached).
+        Returns: pred_abs [T_pred, B*N, 2] in absolute feet, using CV dummy target.
+        """
+        return self.net.predict(X_batch, self.mu, self.sigma)
 
     def get_trajectory(self, X_context: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
         """
