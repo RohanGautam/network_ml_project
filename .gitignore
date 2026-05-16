@@ -4,7 +4,7 @@ submissions
 NML_base
 wandb
 optuna_studies
-models
+# models
 screen_results
 # Byte-compiled / optimized / DLL files
 __pycache__/
