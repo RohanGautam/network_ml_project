@@ -85,7 +85,7 @@ class MyTraj(nn.Module):
             if len(pair_now) != 0:
                 edge_pair_now  = pair_now.transpose(0, 1).to(device).long()
                 edge_type_now  = torch.zeros(edge_pair_now.size(-1), device=device)
-                node_type_now  = torch.ones_like(batch_class[left:right], dtype=torch.long)
+                node_type_now  = batch_class[left:right].long()
                 hidden_now     = hidden_state_unsplited[left:right]
                 cn_now         = cn[left:right]
 
@@ -126,5 +126,9 @@ class MyTraj(nn.Module):
         best_mode   = l2_norm_FDE.argmin(dim=0)
         sample_k    = out_mu[best_mode, torch.arange(batch_size)].permute(1, 0, 2)
         full_pre_tra.append(torch.cat((self.pre_obs, sample_k), axis=0))
+
+        # full_pre_tra[2], [3]: all K mode distributions for caller-side selection
+        full_pre_tra.append(out_mu)    # [K, B*N, T_pred, 2] — all means   in HHT space
+        full_pre_tra.append(out_sigma) # [K, B*N, T_pred, 2] — all scales
 
         return reg_loss, full_pre_tra

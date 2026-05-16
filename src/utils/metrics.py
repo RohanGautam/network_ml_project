@@ -31,7 +31,7 @@ def compute_mse(pred: Tensor, target: Tensor) -> Tensor:
     Returns:
         scalar MSE in feet^2
     """
-    return ((pred - target) ** 2).sum(dim=-1).mean()
+    return ((pred - target) ** 2).mean()
 
 
 def compute_fde(pred: Tensor, target: Tensor) -> Tensor:
@@ -74,3 +74,18 @@ def compute_min_fde(preds: Tensor, target: Tensor) -> Tensor:
     """
     l2 = torch.norm(preds[:, -1] - target[-1].unsqueeze(0), dim=-1)  # [K, B*N]
     return l2.min(dim=0).values.mean()
+
+
+def compute_min_mse(preds: Tensor, target: Tensor) -> Tensor:
+    """
+    minMSE: minimum MSE over K stochastic predictions — oracle best-mode MSE.
+
+    Args:
+        preds:  [K, T, B*N, 2]  — denormalized, in feet
+        target: [T, B*N, 2]     — denormalized, in feet
+    Returns:
+        scalar minMSE in feet²
+    """
+    sq_err = (preds - target.unsqueeze(0)) ** 2   # [K, T, B*N, 2]
+    mse_per_k = sq_err.mean(dim=(1, -1))          # [K, B*N] — mean over T and coords
+    return mse_per_k.min(dim=0).values.mean()

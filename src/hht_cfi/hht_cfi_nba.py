@@ -223,8 +223,11 @@ def _to_hht_inputs(X: Tensor, y: Tensor, mu: Tensor, sigma: Tensor):
     norm_flat = hht_norm.permute(1, 0, 2, 3).reshape(H, B * N, 2)
     abs_flat  = abs_full.permute(1, 0, 2, 3).reshape(H, B * N, 2)
 
-    # batch_abs_gt needs dummy class column: [H, B*N, 3]
-    batch_abs_gt = torch.cat([abs_flat, torch.zeros(H, B * N, 1, device=dev)], dim=-1)
+    # Agent type: ball=0, team_A=1, team_B=2
+    # is_player ∈ {0,1}, team_id ∈ {-1,0,1} (-1=team_B, 0=ball, 1=team_A)
+    agent_type = (X[:, 0, :, 4].long() + (X[:, 0, :, 5] < 0).long()).reshape(B * N)  # [B*N]
+    agent_type_col = agent_type.float().unsqueeze(0).expand(H, -1).unsqueeze(-1)       # [H, B*N, 1]
+    batch_abs_gt = torch.cat([abs_flat, agent_type_col], dim=-1)
 
     # batch_split: one (left, right) tensor pair per scene
     batch_split = [(torch.tensor(i * N), torch.tensor((i + 1) * N)) for i in range(B)]
@@ -240,6 +243,16 @@ def _to_hht_inputs(X: Tensor, y: Tensor, mu: Tensor, sigma: Tensor):
     edge_pair   = {(i * N, (i + 1) * N): [local_edges] for i in range(B)}
 
     return inputs, edge_pair
+
+
+# ── Inference toggles ───────────────────────────────────────────────────────────
+# To disable an improvement: set its flag to False, or comment out the True line.
+_USE_MIN_SCALE = True   # pick most confident mode (min total output scale) — no dummy_y needed
+_USE_TTA       = True   # y-flip test-time augmentation (2× forward passes, averaged)
+_USE_CLAMP     = True  # clip predictions to NBA court bounds
+
+_COURT_HALF_LEN = 47.5     # ft  (x-axis: baseline to baseline)
+_COURT_HALF_WID = 25.0     # ft  (y-axis: sideline to sideline)
 
 
 # ── Model wrapper ───────────────────────────────────────────────────────────────
@@ -266,35 +279,87 @@ class NBAHHTCFIModel(nn.Module):
         (loss1, loss2), full_pre_tra = self.model(inputs, edge_pair, epoch)
         return loss1 + loss2, full_pre_tra
 
-    def predict(self, X_obs: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
-        """
-        Inference without ground truth. Uses constant-velocity extrapolation as
-        dummy target so mode selection picks the trajectory closest to "keep moving"
-        rather than the trajectory closest to zero (standing still).
-
-        X_obs: [1, T_obs, N, 6]
-        Returns: [T_pred, N, 2]  absolute positions in feet.
-        """
-        B, T_obs, N, _ = X_obs.shape
-        # Constant-velocity extrapolation in normalized (mu/sigma) space.
-        # velocity feature (channels 2:4) is already the per-frame position delta.
-        vel_norm = X_obs[:, -1, :, 2:4]   # [B, N, 2]
-        pos_norm = X_obs[:, -1, :, :2]    # [B, N, 2]
+    def _forward_single(self, X_obs: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
+        """Single forward pass → denormalized absolute positions [T_pred, B*N, 2]."""
+        B, _, N, _ = X_obs.shape
+        # Dummy future: last-frame CV (only needed for the training loss path; mode
+        # selection at inference uses scale-based criterion, not this target).
+        vel_norm = X_obs[:, -1, :, 2:4]
+        pos_norm = X_obs[:, -1, :, :2]
         t = torch.arange(1, self.T_pred + 1, dtype=X_obs.dtype, device=X_obs.device)
-        future_pos = pos_norm.unsqueeze(1) + vel_norm.unsqueeze(1) * t.view(1, -1, 1, 1)  # [B, T_pred, N, 2]
+        future_pos = pos_norm.unsqueeze(1) + vel_norm.unsqueeze(1) * t.view(1, -1, 1, 1)
         dummy_y = X_obs[:, -1:, :, :].expand(-1, self.T_pred, -1, -1).clone()
         dummy_y[:, :, :, :2] = future_pos
-        inputs, edge_pair = _to_hht_inputs(X_obs, dummy_y, mu, sigma)
 
+        inputs, edge_pair = _to_hht_inputs(X_obs, dummy_y, mu, sigma)
         _, full_pre_tra = self.model(inputs, edge_pair, epoch=0)
 
-        pred_hht = full_pre_tra[0][-self.T_pred:]  # [T_pred, B*N, 2]
+        if _USE_MIN_SCALE:
+            # Pick the mode the model is most confident about (min total output scale).
+            # Independent of dummy_y — uses the model's own uncertainty estimate.
+            out_mu_all    = full_pre_tra[2]   # [K=20, B*N, T_pred, 2]
+            out_sigma_all = full_pre_tra[3]   # [K=20, B*N, T_pred, 2]
+            BN = out_mu_all.shape[1]
+            best = out_sigma_all.sum(dim=(-1, -2)).argmin(dim=0)  # [B*N]
+            pred_hht = out_mu_all[best, torch.arange(BN)].permute(1, 0, 2)  # [T_pred, B*N, 2]
+        else:
+            pred_hht = full_pre_tra[0][-self.T_pred:]  # ADE-optimal mode by CV dummy
 
-        # denormalize to feet
-        abs_obs  = X_obs[:, :, :, :2] * sigma + mu
-        shift    = abs_obs[:, -1].reshape(B * N, 2)
-        max_v    = (abs_obs - abs_obs[:, -1:]).abs().amax(1).reshape(B * N, 2).clamp(min=1.0)
-        return pred_hht * max_v.unsqueeze(0) + shift.unsqueeze(0)  # [T_pred, N, 2] when B=1
+        abs_obs = X_obs[:, :, :, :2] * sigma + mu
+        shift   = abs_obs[:, -1].reshape(B * N, 2)
+        max_v   = (abs_obs - abs_obs[:, -1:]).abs().amax(1).reshape(B * N, 2).clamp(min=1.0)
+        return pred_hht * max_v.unsqueeze(0) + shift.unsqueeze(0)
+
+    def predict(self, X_obs: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
+        """
+        Inference without ground truth.
+
+        X_obs: [B, T_obs, N, 6]  normalized input.
+        Returns: [T_pred, B*N, 2]  absolute positions in feet.
+
+        Toggle improvements via module-level flags above the class definition:
+          _USE_MIN_SCALE, _USE_TTA, _USE_CLAMP
+        """
+        pred = self._forward_single(X_obs, mu, sigma)  # [T_pred, B*N, 2]
+
+        if _USE_TTA:
+            # Mirror the scene across the court's y-axis (sideline symmetry).
+            # Negate normalized y and dy, run a second forward pass, flip back, average.
+            X_flip = X_obs.clone()
+            X_flip[:, :, :, 1] = -X_obs[:, :, :, 1]   # negate normalized y position
+            X_flip[:, :, :, 3] = -X_obs[:, :, :, 3]   # negate normalized y velocity (dy)
+            pred_flip = self._forward_single(X_flip, mu, sigma)
+            pred_flip[:, :, 1] = -pred_flip[:, :, 1]   # flip predicted y back
+            pred = (pred + pred_flip) / 2
+
+        if _USE_CLAMP:
+            pred[:, :, 0].clamp_(-_COURT_HALF_LEN, _COURT_HALF_LEN)
+            pred[:, :, 1].clamp_(-_COURT_HALF_WID, _COURT_HALF_WID)
+
+        return pred
+
+    def all_modes(self, X_obs: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
+        """All K decoder modes → [K, T_pred, B*N, 2] denormalized absolute positions."""
+        B, _, N, _ = X_obs.shape
+        vel_norm = X_obs[:, -1, :, 2:4]
+        pos_norm = X_obs[:, -1, :, :2]
+        t = torch.arange(1, self.T_pred + 1, dtype=X_obs.dtype, device=X_obs.device)
+        future_pos = pos_norm.unsqueeze(1) + vel_norm.unsqueeze(1) * t.view(1, -1, 1, 1)
+        dummy_y = X_obs[:, -1:, :, :].expand(-1, self.T_pred, -1, -1).clone()
+        dummy_y[:, :, :, :2] = future_pos
+
+        inputs, edge_pair = _to_hht_inputs(X_obs, dummy_y, mu, sigma)
+        _, full_pre_tra = self.model(inputs, edge_pair, epoch=0)
+
+        out_mu_all = full_pre_tra[2]  # [K=20, B*N, T_pred, 2] in HHT space
+
+        abs_obs = X_obs[:, :, :, :2] * sigma + mu
+        shift   = abs_obs[:, -1].reshape(B * N, 2)                                     # [B*N, 2]
+        max_v   = (abs_obs - abs_obs[:, -1:]).abs().amax(1).reshape(B * N, 2).clamp(min=1.0)
+
+        # denormalize: [K, B*N, T_pred, 2] → [K, T_pred, B*N, 2]
+        denorm = out_mu_all * max_v.unsqueeze(0).unsqueeze(2) + shift.unsqueeze(0).unsqueeze(2)
+        return denorm.permute(0, 2, 1, 3)
 
 
 # ── Lightning module ────────────────────────────────────────────────────────────
@@ -357,6 +422,13 @@ class NBAHHTCFILightningModel(L.LightningModule):
         Returns: pred_abs [T_pred, B*N, 2] in absolute feet, using CV dummy target.
         """
         return self.net.predict(X_batch, self.mu, self.sigma)
+
+    def predict_batch_all_modes(self, X_batch: Tensor) -> Tensor:
+        """
+        X_batch: [B, T_obs, N, 6] — normalized input.
+        Returns: [K=20, T_pred, B*N, 2] — all decoder modes in absolute feet.
+        """
+        return self.net.all_modes(X_batch, self.mu, self.sigma)
 
     def get_trajectory(self, X_context: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
         """
