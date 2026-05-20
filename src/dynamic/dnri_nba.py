@@ -30,7 +30,7 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from utils.metrics import compute_ade, compute_fde, compute_mse
 
-# from equivariance.eqmotion_nba import NBADataModule, NBADataset
+from equivariance.eqmotion_nba import NBADataModule, NBADataset
 from dynamic.dnri_ref.dnri import DNRI
 
 dotenv.load_dotenv(dotenv.find_dotenv())
@@ -40,150 +40,6 @@ DATA_DIR = PROJECT_ROOT / "data"
 TEST_DIR = DATA_DIR / "test" / "test"
 SUBMISSION_DIR = PROJECT_ROOT / "submissions"
 SUBMISSION_DIR.mkdir(exist_ok=True)
-
-
-class NBADataset(Dataset):
-    def __init__(self, files, context_size, horizon_size, mu, sigma):
-        super().__init__()
-        self.context_size = context_size
-        self.horizon_size = horizon_size
-        self.window_size = context_size + horizon_size
-        self.load_data(files, mu, sigma)
-
-    def load_data(self, files, mu, sigma):
-        self.sequences = []
-        self.max_start = []
-        for f in files:
-            seq = torch.load(f, weights_only=False)
-            seq[:, :, [0, 1]] = (seq[:, :, [0, 1]].clone() - mu) / sigma
-            vel = torch.zeros_like(seq[:, :, :2])
-            vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
-            # feature layout: [x, y, dx, dy, isplayer, team]
-            seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
-            self.sequences.append(seq)
-            self.max_start.append(max(0, len(seq) - self.window_size))
-
-    def __getitem__(self, index):
-        seq_idx, start = index
-        X = self.sequences[seq_idx][start : start + self.context_size]
-        y = self.sequences[seq_idx][
-            start + self.context_size : start + self.window_size
-        ]
-        return X, y
-
-    def __len__(self):
-        return len(self.sequences)
-
-
-class NBASampler(Sampler):
-    def __init__(self, batch_size, max_start, seed=0, shuffle=True):
-        self.batch_size = batch_size
-        self.max_start = max_start
-        self.epoch = 0
-        self.generator = torch.Generator().manual_seed(seed)
-        self.seed = seed
-        self.shuffle = shuffle
-
-    def set_epoch(self, epoch):
-        self.epoch = epoch
-        self.generator.manual_seed(self.seed + epoch)
-
-    def __iter__(self):
-        n = len(self)
-        perm = (
-            torch.randperm(n, generator=self.generator).tolist()
-            if self.shuffle
-            else list(range(n))
-        )
-        perm_start = [(i, self.max_start[i]) for i in perm]
-        for k in range(0, n, self.batch_size):
-            for idx, max_start in perm_start[k : k + self.batch_size]:
-                start = torch.randint(
-                    0, max_start + 1, size=(), generator=self.generator
-                )
-                yield idx, start
-
-    def __len__(self):
-        return len(self.max_start)
-
-
-class NBADataModule(L.LightningDataModule):
-    def __init__(
-        self, split_path, batch_size=64, context_size=8, horizon_size=12, seed=0
-    ):
-        super().__init__()
-        self.split_path = split_path
-        self.batch_size = batch_size
-        self.context_size = context_size
-        self.horizon_size = horizon_size
-        self.seed = seed
-        self.mu = None
-        self.sigma = None
-
-    def setup(self, stage=None):
-        manifest = json.loads(Path(self.split_path).read_text())
-        data_dir = PROJECT_ROOT / manifest["data_dir"]
-        train_files = [data_dir / f for f in manifest["train"]]
-        val_files = [data_dir / f for f in manifest["val"]]
-        self.mu, self.sigma = self._compute_normalization_statistics(train_files)
-        self.train_dataset = NBADataset(
-            train_files, self.context_size, self.horizon_size, self.mu, self.sigma
-        )
-        self.val_dataset = NBADataset(
-            val_files, self.context_size, self.horizon_size, self.mu, self.sigma
-        )
-
-    def _compute_normalization_statistics(self, files):
-        all_pos = []
-        for f in files:
-            seq = torch.load(f, weights_only=False)
-            all_pos.append(seq[:, :, [0, 1]])
-        all_pos = torch.cat(all_pos, dim=0)
-        return all_pos.mean(dim=(0, 1)), all_pos.std(dim=(0, 1))
-
-    def train_dataloader(self):
-        sampler = NBASampler(
-            self.batch_size, self.train_dataset.max_start, seed=self.seed, shuffle=True
-        )
-        return DataLoader(
-            self.train_dataset, batch_size=self.batch_size, sampler=sampler
-        )
-
-    def val_dataloader(self):
-        sampler = NBASampler(
-            self.batch_size, self.val_dataset.max_start, seed=self.seed, shuffle=False
-        )
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, sampler=sampler)
-
-    def get_kaggle_submission(self, model, test_dir: str, target_dir: str):
-        all_traj = []
-        for f in sorted(os.listdir(test_dir)):
-            if not f.endswith(".pt"):
-                continue
-            seq = torch.load(os.path.join(test_dir, f), weights_only=False)
-            seq[:, :, [0, 1]] = (seq[:, :, [0, 1]].clone() - self.mu) / self.sigma
-            vel = torch.zeros_like(seq[:, :, :2])
-            vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
-            seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
-            traj = model.get_trajectory(seq, self.mu, self.sigma)
-            traj = traj[8:, :, :2].reshape(-1)
-            all_traj.append([int(f.removesuffix(".pt"))] + traj.tolist())
-        df = (
-            pd.DataFrame(
-                all_traj,
-                columns=["id"]
-                + [
-                    f"entity_{i}_time_{t}_{axis}"
-                    for t in range(12)
-                    for i in range(11)
-                    for axis in ["x", "y"]
-                ],
-            )
-            .set_index("id")
-            .sort_index()
-        )
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        df.to_csv(os.path.join(target_dir, f"solution_{timestamp}.csv"))
 
 
 def default_dnri_params(num_vars: int, num_edge_types: int, input_size: int) -> dict:
@@ -298,10 +154,47 @@ class NBADNRILightningModel(L.LightningModule):
     def _full_window(self, X: Tensor, y: Tensor) -> Tensor:
         return torch.cat([self._strip_static(X), self._strip_static(y)], dim=1)
 
+        # def training_step(self, batch, batch_idx):
+        #     X, y = batch
+        #     inputs = self._full_window(X, y)  # [B, C+H, N, 4]
+        #     loss, loss_nll, loss_kl = self.net.training_loss(inputs)
+        #     self.log("train/loss", loss, on_epoch=True, prog_bar=True)
+        #     self.log("train/nll", loss_nll.mean(), on_epoch=True)
+        #     self.log("train/kl", loss_kl.mean(), on_epoch=True)
+        # return loss
+
     def training_step(self, batch, batch_idx):
         X, y = batch
+
+        # Feature layout: [x, y, dx, dy, isplayer, team]
+        B = X.shape[0]
+
+        # Generate independent instance-level masks for X and Y flips
+        flip_x_mask = torch.rand(B, device=self.device) < 0.5
+        flip_y_mask = torch.rand(B, device=self.device) < 0.5
+
+        if flip_x_mask.any() or flip_y_mask.any():
+            # Clone once to prevent PyTorch in-place autograd errors
+            X = X.clone()
+            y = y.clone()
+
+            # Apply X-axis flip (Lengthwise court flip)
+            # Targets X-position (0) and X-velocity (2)
+            if flip_x_mask.any():
+                X[flip_x_mask, :, :, 0] *= -1
+                X[flip_x_mask, :, :, 2] *= -1
+                y[flip_x_mask, :, :, 0] *= -1
+                y[flip_x_mask, :, :, 2] *= -1
+
+            if flip_y_mask.any():
+                X[flip_y_mask, :, :, 1] *= -1
+                X[flip_y_mask, :, :, 3] *= -1
+                y[flip_y_mask, :, :, 1] *= -1
+                y[flip_y_mask, :, :, 3] *= -1
+
         inputs = self._full_window(X, y)  # [B, C+H, N, 4]
         loss, loss_nll, loss_kl = self.net.training_loss(inputs)
+
         self.log("train/loss", loss, on_epoch=True, prog_bar=True)
         self.log("train/nll", loss_nll.mean(), on_epoch=True)
         self.log("train/kl", loss_kl.mean(), on_epoch=True)
