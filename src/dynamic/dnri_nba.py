@@ -25,10 +25,12 @@ import torch.nn as nn
 from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.loggers import WandbLogger
 from torch import Tensor
+from torch.utils.data import Dataset, DataLoader, Sampler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from utils.metrics import compute_ade, compute_fde, compute_mse
-from equivariance.eqmotion_nba import NBADataModule, NBADataset
+
+# from equivariance.eqmotion_nba import NBADataModule, NBADataset
 from dynamic.dnri_ref.dnri import DNRI
 
 dotenv.load_dotenv(dotenv.find_dotenv())
@@ -40,7 +42,148 @@ SUBMISSION_DIR = PROJECT_ROOT / "submissions"
 SUBMISSION_DIR.mkdir(exist_ok=True)
 
 
-# ── DNRI params ───────────────────────────────────────────────────────────────
+class NBADataset(Dataset):
+    def __init__(self, files, context_size, horizon_size, mu, sigma):
+        super().__init__()
+        self.context_size = context_size
+        self.horizon_size = horizon_size
+        self.window_size = context_size + horizon_size
+        self.load_data(files, mu, sigma)
+
+    def load_data(self, files, mu, sigma):
+        self.sequences = []
+        self.max_start = []
+        for f in files:
+            seq = torch.load(f, weights_only=False)
+            seq[:, :, [0, 1]] = (seq[:, :, [0, 1]].clone() - mu) / sigma
+            vel = torch.zeros_like(seq[:, :, :2])
+            vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
+            # feature layout: [x, y, dx, dy, isplayer, team]
+            seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
+            self.sequences.append(seq)
+            self.max_start.append(max(0, len(seq) - self.window_size))
+
+    def __getitem__(self, index):
+        seq_idx, start = index
+        X = self.sequences[seq_idx][start : start + self.context_size]
+        y = self.sequences[seq_idx][
+            start + self.context_size : start + self.window_size
+        ]
+        return X, y
+
+    def __len__(self):
+        return len(self.sequences)
+
+
+class NBASampler(Sampler):
+    def __init__(self, batch_size, max_start, seed=0, shuffle=True):
+        self.batch_size = batch_size
+        self.max_start = max_start
+        self.epoch = 0
+        self.generator = torch.Generator().manual_seed(seed)
+        self.seed = seed
+        self.shuffle = shuffle
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+        self.generator.manual_seed(self.seed + epoch)
+
+    def __iter__(self):
+        n = len(self)
+        perm = (
+            torch.randperm(n, generator=self.generator).tolist()
+            if self.shuffle
+            else list(range(n))
+        )
+        perm_start = [(i, self.max_start[i]) for i in perm]
+        for k in range(0, n, self.batch_size):
+            for idx, max_start in perm_start[k : k + self.batch_size]:
+                start = torch.randint(
+                    0, max_start + 1, size=(), generator=self.generator
+                )
+                yield idx, start
+
+    def __len__(self):
+        return len(self.max_start)
+
+
+class NBADataModule(L.LightningDataModule):
+    def __init__(
+        self, split_path, batch_size=64, context_size=8, horizon_size=12, seed=0
+    ):
+        super().__init__()
+        self.split_path = split_path
+        self.batch_size = batch_size
+        self.context_size = context_size
+        self.horizon_size = horizon_size
+        self.seed = seed
+        self.mu = None
+        self.sigma = None
+
+    def setup(self, stage=None):
+        manifest = json.loads(Path(self.split_path).read_text())
+        data_dir = PROJECT_ROOT / manifest["data_dir"]
+        train_files = [data_dir / f for f in manifest["train"]]
+        val_files = [data_dir / f for f in manifest["val"]]
+        self.mu, self.sigma = self._compute_normalization_statistics(train_files)
+        self.train_dataset = NBADataset(
+            train_files, self.context_size, self.horizon_size, self.mu, self.sigma
+        )
+        self.val_dataset = NBADataset(
+            val_files, self.context_size, self.horizon_size, self.mu, self.sigma
+        )
+
+    def _compute_normalization_statistics(self, files):
+        all_pos = []
+        for f in files:
+            seq = torch.load(f, weights_only=False)
+            all_pos.append(seq[:, :, [0, 1]])
+        all_pos = torch.cat(all_pos, dim=0)
+        return all_pos.mean(dim=(0, 1)), all_pos.std(dim=(0, 1))
+
+    def train_dataloader(self):
+        sampler = NBASampler(
+            self.batch_size, self.train_dataset.max_start, seed=self.seed, shuffle=True
+        )
+        return DataLoader(
+            self.train_dataset, batch_size=self.batch_size, sampler=sampler
+        )
+
+    def val_dataloader(self):
+        sampler = NBASampler(
+            self.batch_size, self.val_dataset.max_start, seed=self.seed, shuffle=False
+        )
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, sampler=sampler)
+
+    def get_kaggle_submission(self, model, test_dir: str, target_dir: str):
+        all_traj = []
+        for f in sorted(os.listdir(test_dir)):
+            if not f.endswith(".pt"):
+                continue
+            seq = torch.load(os.path.join(test_dir, f), weights_only=False)
+            seq[:, :, [0, 1]] = (seq[:, :, [0, 1]].clone() - self.mu) / self.sigma
+            vel = torch.zeros_like(seq[:, :, :2])
+            vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
+            seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
+            traj = model.get_trajectory(seq, self.mu, self.sigma)
+            traj = traj[8:, :, :2].reshape(-1)
+            all_traj.append([int(f.removesuffix(".pt"))] + traj.tolist())
+        df = (
+            pd.DataFrame(
+                all_traj,
+                columns=["id"]
+                + [
+                    f"entity_{i}_time_{t}_{axis}"
+                    for t in range(12)
+                    for i in range(11)
+                    for axis in ["x", "y"]
+                ],
+            )
+            .set_index("id")
+            .sort_index()
+        )
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        df.to_csv(os.path.join(target_dir, f"solution_{timestamp}.csv"))
 
 
 def default_dnri_params(num_vars: int, num_edge_types: int, input_size: int) -> dict:
@@ -118,9 +261,6 @@ class NBADNRIModel(nn.Module):
         return self.dnri.predict_future(context, prediction_steps=self.horizon_size)
 
 
-# ── Lightning wrapper ─────────────────────────────────────────────────────────
-
-
 class NBADNRILightningModel(L.LightningModule):
     def __init__(
         self,
@@ -180,9 +320,24 @@ class NBADNRILightningModel(L.LightningModule):
         pred_real = pred_flat * self.sigma + self.mu
         target_real = target_flat * self.sigma + self.mu
         self.log("val/loss", loss, on_epoch=True, prog_bar=True)
-        self.log("val/ade_ft", compute_ade(pred_real, target_real), on_epoch=True, prog_bar=True)
-        self.log("val/fde_ft", compute_fde(pred_real, target_real), on_epoch=True, prog_bar=True)
-        self.log("val/mse_ft", compute_mse(pred_real, target_real), on_epoch=True, prog_bar=True)
+        self.log(
+            "val/ade_ft",
+            compute_ade(pred_real, target_real),
+            on_epoch=True,
+            prog_bar=True,
+        )
+        self.log(
+            "val/fde_ft",
+            compute_fde(pred_real, target_real),
+            on_epoch=True,
+            prog_bar=True,
+        )
+        self.log(
+            "val/mse_ft",
+            compute_mse(pred_real, target_real),
+            on_epoch=True,
+            prog_bar=True,
+        )
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
@@ -208,7 +363,9 @@ class NBADNRILightningModel(L.LightningModule):
         pred_pos = pred[0, :, :, :2] * sigma + mu  # [H, N, 2]
         X_cpu = X.cpu()
         X_pos = X_cpu[:, :, :2] * sigma + mu  # [C, N, 2]
-        static = X_cpu[-1, :, 4:].unsqueeze(0).repeat(pred_pos.size(0), 1, 1)  # [H, N, 2]
+        static = (
+            X_cpu[-1, :, 4:].unsqueeze(0).repeat(pred_pos.size(0), 1, 1)
+        )  # [H, N, 2]
         pred_full = torch.cat([pred_pos, static], dim=-1)  # [H, N, 4]
         X_display = torch.cat([X_pos, X_cpu[:, :, 4:]], dim=-1)  # [C, N, 4]
         return torch.cat([X_display, pred_full], dim=0).detach()
@@ -295,7 +452,9 @@ def smoke_test():
     test_files = sorted(os.listdir(TEST_DIR))[:2]
     for f in test_files:
         seq = torch.load(TEST_DIR / f, weights_only=False)  # [8, 11, 4]
-        seq[:, :, [0, 1]] = (seq[:, :, [0, 1]].clone() - data_module.mu) / data_module.sigma
+        seq[:, :, [0, 1]] = (
+            seq[:, :, [0, 1]].clone() - data_module.mu
+        ) / data_module.sigma
         vel = torch.zeros_like(seq[:, :, :2])
         vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
         seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)  # [8, 11, 6]
@@ -307,12 +466,14 @@ def smoke_test():
     # Mini Kaggle submission to /tmp
     tmp_dir = Path("/tmp/dnri_smoke_sub")
     tmp_dir.mkdir(exist_ok=True)
+
     # restrict to a few test files for speed
     class _ScopedTestDir:
         def __init__(self, src, n):
             self.src = src
             self.n = n
             self.dst = Path("/tmp/dnri_smoke_test")
+
         def __enter__(self):
             self.dst.mkdir(exist_ok=True)
             for f in sorted(os.listdir(self.src))[: self.n]:
@@ -321,6 +482,7 @@ def smoke_test():
                 if not dst_path.exists():
                     dst_path.symlink_to(src_path)
             return str(self.dst)
+
         def __exit__(self, *a):
             pass
 
@@ -380,7 +542,9 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--smoke", action="store_true", help="Run smoke tests and exit.")
+    parser.add_argument(
+        "--smoke", action="store_true", help="Run smoke tests and exit."
+    )
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=5e-4)
@@ -388,7 +552,9 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--run-name", type=str, default=None)
-    parser.add_argument("--submit", action="store_true", help="Write Kaggle submission after training.")
+    parser.add_argument(
+        "--submit", action="store_true", help="Write Kaggle submission after training."
+    )
     args = parser.parse_args()
 
     if args.smoke:
