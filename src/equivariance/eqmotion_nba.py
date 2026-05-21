@@ -39,6 +39,8 @@ class NBADataset(Dataset):
     def load_data(self, files, mu, sigma):
         self.sequences = []
         self.max_start = []
+        raw_hoops = torch.tensor([[5.25, 25.0], [88.75, 25.0]])
+        norm_hoops = (raw_hoops - mu) / sigma
         for f in files:
             seq = torch.load(f, weights_only=False)
             seq[:, :, [0, 1]] = (seq[:, :, [0, 1]].clone() - mu) / sigma
@@ -46,6 +48,17 @@ class NBADataset(Dataset):
             vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
             # feature layout: [x, y, dx, dy, isplayer, team]
             seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
+            T = seq.shape[0]
+            hoop_nodes = torch.zeros((T, 2, 6), dtype=seq.dtype)
+            hoop_nodes[:, :, :2] = norm_hoops  # Broadcast normalized X, Y
+            hoop_nodes[:, :, 2:4] = 0.0  # Static: Velocity is zero
+            hoop_nodes[:, :, 4] = 0.0  # isplayer = 0
+            hoop_nodes[:, :, 5] = 3.0  # Assign a unique "team" ID for landmarks
+
+            # Concatenate to the N dimension (dim=1)
+            # Changes shape from [T, 11, 6] to [T, 13, 6]
+            seq = torch.cat([seq, hoop_nodes], dim=1)
+
             self.sequences.append(seq)
             self.max_start.append(max(0, len(seq) - self.window_size))
 
@@ -310,8 +323,19 @@ class NBADataModule(L.LightningDataModule):
             vel = torch.zeros_like(seq[:, :, :2])
             vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
             seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
+
+            T = seq.shape[0]
+            raw_hoops = torch.tensor([[5.25, 25.0], [88.75, 25.0]])
+            norm_hoops = (raw_hoops - self.mu) / self.sigma
+            hoop_nodes = torch.zeros((T, 2, 6), dtype=seq.dtype)
+            hoop_nodes[:, :, :2] = norm_hoops
+            hoop_nodes[:, :, 4] = 0.0
+            hoop_nodes[:, :, 5] = 3.0
+            seq = torch.cat([seq, hoop_nodes], dim=1)
+
             traj = model.get_trajectory(seq, self.mu, self.sigma)
-            traj = traj[8:, :, :2].reshape(-1)
+            # traj = traj[8:, :, :2].reshape(-1)
+            traj = traj[8:, :11, :2].reshape(-1)
             all_traj.append([int(f.removesuffix(".pt"))] + traj.tolist())
         df = (
             pd.DataFrame(
