@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=dnri_nba
+#SBATCH --job-name=nml_train
 #SBATCH --output=/home/rgautam/network_ml_project/jobs/out/%x_%j.out
 #SBATCH --error=/home/rgautam/network_ml_project/jobs/out/%x_%j.err
 #SBATCH --time=08:00:00

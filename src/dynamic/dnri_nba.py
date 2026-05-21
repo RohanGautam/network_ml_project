@@ -239,7 +239,7 @@ class NBADNRILightningModel(L.LightningModule):
             weight_decay=self.hparams.weight_decay,
         )
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=8, min_lr=1e-5
+            optimizer, mode="min", factor=0.5, patience=18, min_lr=1e-6
         )
         return {
             "optimizer": optimizer,
@@ -414,7 +414,7 @@ def train(args):
         weight_decay=args.weight_decay,
     )
 
-    callbacks = [EarlyStopping(monitor="val/loss", patience=20, mode="min")]
+    callbacks = [EarlyStopping(monitor="val/loss", patience=100, mode="min")]
     if args.wandb:
         logger = WandbLogger(project="NML_base", name=args.run_name or "dnri")
     else:
@@ -439,7 +439,7 @@ if __name__ == "__main__":
         "--smoke", action="store_true", help="Run smoke tests and exit."
     )
     parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
