@@ -39,7 +39,10 @@ class NBADataset(Dataset):
     def load_data(self, files, mu, sigma):
         self.sequences = []
         self.max_start = []
-        raw_hoops = torch.tensor([[5.25, 25.0], [88.75, 25.0]])
+        # Data is in a court-centered frame (origin at center, x in [-48,48]=length,
+        # y in [-26,26]=width). Hoops sit 5.25 ft in from each baseline (x=+-47) at
+        # center width: x = +-(47-5.25) = +-41.75, y = 0.
+        raw_hoops = torch.tensor([[-41.75, 0.0], [41.75, 0.0]])
         norm_hoops = (raw_hoops - mu) / sigma
         for f in files:
             seq = torch.load(f, weights_only=False)
@@ -243,12 +246,12 @@ class NBAEqMotionLightningModel(L.LightningModule):
             lr=self.hparams.lr,
             weight_decay=self.hparams.weight_decay,
         )
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=8, min_lr=1e-5
-        )
+        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        #     optimizer, mode="min", factor=0.5, patience=8, min_lr=1e-5
+        # )
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "monitor": "val/loss"},
+            # "lr_scheduler": {"scheduler": scheduler, "monitor": "val/loss"},
         }
 
     def get_trajectory(self, X: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
@@ -325,7 +328,8 @@ class NBADataModule(L.LightningDataModule):
             seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
 
             T = seq.shape[0]
-            raw_hoops = torch.tensor([[5.25, 25.0], [88.75, 25.0]])
+            # Court-centered frame: hoops at x=+-41.75 (5.25 ft in from baselines), y=0.
+            raw_hoops = torch.tensor([[-41.75, 0.0], [41.75, 0.0]])
             norm_hoops = (raw_hoops - self.mu) / self.sigma
             hoop_nodes = torch.zeros((T, 2, 6), dtype=seq.dtype)
             hoop_nodes[:, :, :2] = norm_hoops
@@ -360,21 +364,21 @@ if __name__ == "__main__":
 
     data_module = NBADataModule(
         split_path=str(PROJECT_ROOT / "splits" / "fold0.json"),
-        batch_size=64,
+        batch_size=256,
     )
 
-    model = NBAEqMotionLightningModel(lr=1e-3)
+    model = NBAEqMotionLightningModel(lr=1e-4)
 
     wandb_logger = WandbLogger(project="NML_base", name="eqmotion")
 
     early_stop = EarlyStopping(monitor="val/loss", patience=20, mode="min")
 
     trainer = L.Trainer(
-        max_epochs=200,
+        max_epochs=500,
         logger=wandb_logger,
         accelerator="auto",
         gradient_clip_val=1.0,
-        callbacks=[early_stop],
+        # callbacks=[early_stop],
     )
 
     trainer.fit(model, data_module)
