@@ -9,8 +9,8 @@ class HyperGraphTransformer(nn.Module):
     def __init__(self, hidden_size):
         super(HyperGraphTransformer, self).__init__()
         self.hidden_size    = hidden_size
-        self.node_aggr_tf   = CrossHGT(in_dim=hidden_size, out_dim=hidden_size, num_types=6, num_relations=1, n_heads=8)
-        self.edge_to_node_tf = CrossHGT(in_dim=hidden_size, out_dim=hidden_size, num_types=6, num_relations=1, n_heads=8)
+        self.node_aggr_tf   = CrossHGT(in_dim=hidden_size, out_dim=hidden_size, num_types=3, num_relations=3, n_heads=8)
+        self.edge_to_node_tf = CrossHGT(in_dim=hidden_size, out_dim=hidden_size, num_types=3, num_relations=3, n_heads=8)
         self.to_edge_feat   = MLP(hidden_size=hidden_size)
 
     def forward(self, node_feat, node_type_now, edge_pair_now, edge_type_now):
