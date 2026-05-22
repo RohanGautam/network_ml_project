@@ -1,9 +1,14 @@
+import sys
 import os
 import json
 import torch
 import csv
 from pathlib import Path
 from datetime import datetime
+
+# Add the 'src' directory to the python path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from stgcnn.model import Social_STGCNN
 
 def generate_submission(model_path: str, test_dir: str, output_csv: str):
@@ -82,7 +87,8 @@ def generate_submission(model_path: str, test_dir: str, output_csv: str):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, default="best_model.pt")
+    default_model = str(Path(__file__).resolve().parent / "best_model.pt")
+    parser.add_argument("--model_path", type=str, default=default_model)
     parser.add_argument("--test_dir", type=str, default="data/test/test")
     parser.add_argument("--output_csv", type=str, default="submissions/submission_stgcnn.csv")
     args = parser.parse_args()

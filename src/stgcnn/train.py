@@ -1,6 +1,12 @@
+import sys
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from pathlib import Path
+
+# Add the 'src' directory to the python path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from stgcnn.dataset import NBADataset
 from stgcnn.model import Social_STGCNN
 from stgcnn.loss import bivariate_loss
@@ -13,7 +19,7 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, epochs, d
     
     best_val_mse = float('inf')
     best_val_ade = float('inf')
-    checkpoint_path = "best_model.pt"
+    checkpoint_path = str(Path(__file__).resolve().parent / "best_model.pt")
     
     for epoch in range(epochs):
         model.train()
