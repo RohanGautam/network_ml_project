@@ -29,11 +29,12 @@ COURT_IMAGE = PROJECT_ROOT / "src" / "img" / "basketball_court.png"
 
 
 class NBADataset(Dataset):
-    def __init__(self, files, context_size, horizon_size, mu, sigma):
+    def __init__(self, files, context_size, horizon_size, mu, sigma, add_hoops=False):
         super().__init__()
         self.context_size = context_size
         self.horizon_size = horizon_size
         self.window_size = context_size + horizon_size
+        self.add_hoops = add_hoops
         self.load_data(files, mu, sigma)
 
     def load_data(self, files, mu, sigma):
@@ -51,16 +52,16 @@ class NBADataset(Dataset):
             vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
             # feature layout: [x, y, dx, dy, isplayer, team]
             seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
-            T = seq.shape[0]
-            hoop_nodes = torch.zeros((T, 2, 6), dtype=seq.dtype)
-            hoop_nodes[:, :, :2] = norm_hoops  # Broadcast normalized X, Y
-            hoop_nodes[:, :, 2:4] = 0.0  # Static: Velocity is zero
-            hoop_nodes[:, :, 4] = 0.0  # isplayer = 0
-            hoop_nodes[:, :, 5] = 3.0  # Assign a unique "team" ID for landmarks
 
-            # Concatenate to the N dimension (dim=1)
-            # Changes shape from [T, 11, 6] to [T, 13, 6]
-            seq = torch.cat([seq, hoop_nodes], dim=1)
+            if self.add_hoops:
+                # Append 2 static landmark nodes: [T, 11, 6] -> [T, 13, 6]
+                T = seq.shape[0]
+                hoop_nodes = torch.zeros((T, 2, 6), dtype=seq.dtype)
+                hoop_nodes[:, :, :2] = norm_hoops  # Broadcast normalized X, Y
+                hoop_nodes[:, :, 2:4] = 0.0  # Static: Velocity is zero
+                hoop_nodes[:, :, 4] = 0.0  # isplayer = 0
+                hoop_nodes[:, :, 5] = 3.0  # Unique "team" ID for landmarks
+                seq = torch.cat([seq, hoop_nodes], dim=1)
 
             self.sequences.append(seq)
             self.max_start.append(max(0, len(seq) - self.window_size))
@@ -268,7 +269,13 @@ class NBAEqMotionLightningModel(L.LightningModule):
 
 class NBADataModule(L.LightningDataModule):
     def __init__(
-        self, split_path, batch_size=64, context_size=8, horizon_size=12, seed=0
+        self,
+        split_path,
+        batch_size=64,
+        context_size=8,
+        horizon_size=12,
+        seed=0,
+        add_hoops=False,
     ):
         super().__init__()
         self.split_path = split_path
@@ -276,6 +283,7 @@ class NBADataModule(L.LightningDataModule):
         self.context_size = context_size
         self.horizon_size = horizon_size
         self.seed = seed
+        self.add_hoops = add_hoops
         self.mu = None
         self.sigma = None
 
@@ -286,10 +294,12 @@ class NBADataModule(L.LightningDataModule):
         val_files = [data_dir / f for f in manifest["val"]]
         self.mu, self.sigma = self._compute_normalization_statistics(train_files)
         self.train_dataset = NBADataset(
-            train_files, self.context_size, self.horizon_size, self.mu, self.sigma
+            train_files, self.context_size, self.horizon_size, self.mu, self.sigma,
+            add_hoops=self.add_hoops,
         )
         self.val_dataset = NBADataset(
-            val_files, self.context_size, self.horizon_size, self.mu, self.sigma
+            val_files, self.context_size, self.horizon_size, self.mu, self.sigma,
+            add_hoops=self.add_hoops,
         )
 
     def _compute_normalization_statistics(self, files):
@@ -327,15 +337,16 @@ class NBADataModule(L.LightningDataModule):
             vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
             seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
 
-            T = seq.shape[0]
-            # Court-centered frame: hoops at x=+-41.75 (5.25 ft in from baselines), y=0.
-            raw_hoops = torch.tensor([[-41.75, 0.0], [41.75, 0.0]])
-            norm_hoops = (raw_hoops - self.mu) / self.sigma
-            hoop_nodes = torch.zeros((T, 2, 6), dtype=seq.dtype)
-            hoop_nodes[:, :, :2] = norm_hoops
-            hoop_nodes[:, :, 4] = 0.0
-            hoop_nodes[:, :, 5] = 3.0
-            seq = torch.cat([seq, hoop_nodes], dim=1)
+            if self.add_hoops:
+                T = seq.shape[0]
+                # Court-centered frame: hoops at x=+-41.75 (5.25 ft in), y=0.
+                raw_hoops = torch.tensor([[-41.75, 0.0], [41.75, 0.0]])
+                norm_hoops = (raw_hoops - self.mu) / self.sigma
+                hoop_nodes = torch.zeros((T, 2, 6), dtype=seq.dtype)
+                hoop_nodes[:, :, :2] = norm_hoops
+                hoop_nodes[:, :, 4] = 0.0
+                hoop_nodes[:, :, 5] = 3.0
+                seq = torch.cat([seq, hoop_nodes], dim=1)
 
             traj = model.get_trajectory(seq, self.mu, self.sigma)
             # traj = traj[8:, :, :2].reshape(-1)
