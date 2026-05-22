@@ -21,7 +21,7 @@ source $HOME/network_ml_project/.venv/bin/activate
 
 # python src/dynamic/dnri_nba.py --smoke
 # Full training run with W&B logging + Kaggle submission:
-python src/dynamic/dnri_nba.py --wandb --submit --run-name dnri_v1
+python src/dynamic/dnri_nba.py --wandb --submit --run-name dnri_simple
 
 # Copy any new submissions back to $HOME so they survive /scratch wipes
 rsync -av $SCRATCH/network_ml_project/submissions/ $HOME/network_ml_project/submissions/

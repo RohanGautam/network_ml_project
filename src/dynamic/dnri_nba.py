@@ -125,7 +125,7 @@ class NBADNRILightningModel(L.LightningModule):
         num_vars: int = 11,
         num_edge_types: int = 2,
         input_size: int = 4,
-        lr: float = 5e-4,
+        lr: float = 1e-4,
         weight_decay: float = 0.0,
         clip_grad_norm: float = 1.0,
         **model_overrides,
@@ -238,12 +238,12 @@ class NBADNRILightningModel(L.LightningModule):
             lr=self.hparams.lr,
             weight_decay=self.hparams.weight_decay,
         )
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=18, min_lr=1e-6
-        )
+        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        #     optimizer, mode="min", factor=0.5, patience=18, min_lr=1e-6
+        # )
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "monitor": "val/loss"},
+            # "lr_scheduler": {"scheduler": scheduler, "monitor": "val/loss"},
         }
 
     @torch.no_grad()
@@ -410,11 +410,12 @@ def train(args):
     model = NBADNRILightningModel(
         context_size=8,
         horizon_size=12,
+        num_vars=13,  # 11 entities (10 players + ball) + 2 hoop landmark nodes
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
 
-    callbacks = [EarlyStopping(monitor="val/loss", patience=100, mode="min")]
+    # callbacks = [EarlyStopping(monitor="val/loss", patience=100, mode="min")]
     if args.wandb:
         logger = WandbLogger(project="NML_base", name=args.run_name or "dnri")
     else:
@@ -425,7 +426,7 @@ def train(args):
         logger=logger,
         accelerator="auto",
         gradient_clip_val=1.0,
-        callbacks=callbacks,
+        # callbacks=callbacks,
     )
     trainer.fit(model, data_module)
 
@@ -438,8 +439,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--smoke", action="store_true", help="Run smoke tests and exit."
     )
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
