@@ -1,21 +1,35 @@
 """
-Social-STGCNN for NBA trajectory prediction — consolidated Lightning + W&B pipeline.
+Social-STGCNN for NBA trajectory prediction — faithful reference baseline.
 
-Mirrors src/equivariance/eqmotion_nba.py: a single file holding the dataset,
-sampler, Lightning module, datamodule and Kaggle submission helper, wired to
-Weights & Biases. The Social-STGCNN architecture (Social_STGCNN) and the
-bivariate-Gaussian NLL loss are imported from their existing modules.
+This is a faithful port of the official Social-STGCNN pipeline
+(https://github.com/abduallahmohamed/Social-STGCNN) to our NBA Lightning + W&B
+setup, kept deliberately close to the reference so it can serve as a starting
+point before any custom changes. The reference's key design choices are
+reproduced here (see src/stgcnn/ref_code/):
 
-The model is *stochastic*: it predicts a per-step bivariate Gaussian over each
-agent's position rather than a point. We therefore log both the deterministic
-(mean-prediction) metrics — ADE/FDE/MSE, comparable to the EqMotion run — and the
-stochastic best-of-K metrics (minADE/minFDE/minMSE) which reward the model for
-placing probability mass near the ground truth.
+  * Graph (ref_code/utils.py: anorm + seq_to_graph):
+      per observed frame, the adjacency is reciprocal distance 1/‖·‖ computed in
+      *relative* (velocity / displacement) space, with a unit self-loop, then
+      converted to the normalized graph Laplacian L = I − D^{-1/2} A D^{-1/2}.
+  * Targets (ref_code/test.py: nodes_rel_to_nodes_abs):
+      the model predicts per-step *displacements*; absolute positions are
+      recovered by cumulative-summing from the last observed position.
+  * Backbone (ref_code/model.py): the official `social_stgcnn` — one ST-GCN
+      layer (2→5 channels) followed by `n_txpcnn` temporal-extrapolation convs.
+      The graph-conv einsum is the only change: it now carries a batch index so
+      we can train with batched, per-sample graphs instead of batch_size=1.
+  * Loss (ref_code/metrics.py: bivariate_loss): per-step bivariate-Gaussian NLL
+      over displacements (σ via exp, ρ via tanh applied inside the loss).
+  * No coordinate normalization — the reference works directly in raw units; in
+      displacement space the values are already small, so we keep feet.
+
+The one deliberate deviation is the sampler: we keep the project's
+NBASampler (one random window per sequence per epoch) instead of enumerating
+every sliding window, so runs stay comparable to the EqMotion pipeline.
 """
 
 import sys
 import os
-import json
 from datetime import datetime
 from pathlib import Path
 
@@ -24,9 +38,10 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.utils.data import Dataset, DataLoader, Sampler
+import json
 import lightning as L
 from lightning.pytorch.loggers import WandbLogger
-from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.callbacks import ModelCheckpoint
 import dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -38,8 +53,6 @@ from utils.metrics import (
     compute_min_fde,
     compute_min_mse,
 )
-from stgcnn.model import Social_STGCNN
-from stgcnn.loss import bivariate_loss
 
 dotenv.load_dotenv(dotenv.find_dotenv())
 
@@ -49,37 +62,212 @@ TEST_DIR = DATA_DIR / "test" / "test"
 SUBMISSION_DIR = PROJECT_ROOT / "submissions"
 SUBMISSION_DIR.mkdir(exist_ok=True)
 
+N_ENTITIES = 11  # 10 players + ball
 
-# ── Data ────────────────────────────────────────────────────────────────────
+
+# ── Model (faithful port of ref_code/model.py, batched-einsum fix) ─────────────
+
+
+class ConvTemporalGraphical(nn.Module):
+    """Graph convolution: 1×1 temporal conv then neighbor aggregation via A.
+
+    Reference einsum was ``'nctv,tvw->nctw'`` (one shared graph per batch, hence
+    the original batch_size=1). Here A carries a batch axis — ``'nctv,ntvw->nctw'``
+    — so each sample uses its own per-frame graph.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, t_kernel_size=1):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size=(t_kernel_size, 1)
+        )
+
+    def forward(self, x, A):
+        # x: [B, C, T, V]   A: [B, T, V, V]
+        x = self.conv(x)
+        x = torch.einsum("nctv,ntvw->nctw", (x, A))
+        return x.contiguous(), A
+
+
+class st_gcn(nn.Module):
+    """Spatial-temporal graph conv block: graph conv + temporal conv + residual."""
+
+    def __init__(
+        self, in_channels, out_channels, kernel_size, use_mdn=False, stride=1,
+        dropout=0, residual=True,
+    ):
+        super().__init__()
+        assert len(kernel_size) == 2
+        assert kernel_size[0] % 2 == 1
+        padding = ((kernel_size[0] - 1) // 2, 0)
+        self.use_mdn = use_mdn
+
+        self.gcn = ConvTemporalGraphical(in_channels, out_channels, kernel_size[1])
+        self.tcn = nn.Sequential(
+            nn.BatchNorm2d(out_channels),
+            nn.PReLU(),
+            nn.Conv2d(out_channels, out_channels, (kernel_size[0], 1), (stride, 1), padding),
+            nn.BatchNorm2d(out_channels),
+            nn.Dropout(dropout, inplace=True),
+        )
+
+        if not residual:
+            self.residual = lambda x: 0
+        elif (in_channels == out_channels) and (stride == 1):
+            self.residual = lambda x: x
+        else:
+            self.residual = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=(stride, 1)),
+                nn.BatchNorm2d(out_channels),
+            )
+        self.prelu = nn.PReLU()
+
+    def forward(self, x, A):
+        res = self.residual(x)
+        x, A = self.gcn(x, A)
+        x = self.tcn(x) + res
+        if not self.use_mdn:
+            x = self.prelu(x)
+        return x, A
+
+
+class social_stgcnn(nn.Module):
+    def __init__(
+        self, n_stgcnn=1, n_txpcnn=1, input_feat=2, output_feat=5,
+        seq_len=8, pred_seq_len=12, kernel_size=3,
+    ):
+        super().__init__()
+        self.n_stgcnn = n_stgcnn
+        self.n_txpcnn = n_txpcnn
+
+        self.st_gcns = nn.ModuleList()
+        self.st_gcns.append(st_gcn(input_feat, output_feat, (kernel_size, seq_len)))
+        for _ in range(1, self.n_stgcnn):
+            self.st_gcns.append(st_gcn(output_feat, output_feat, (kernel_size, seq_len)))
+
+        self.tpcnns = nn.ModuleList()
+        self.tpcnns.append(nn.Conv2d(seq_len, pred_seq_len, 3, padding=1))
+        for _ in range(1, self.n_txpcnn):
+            self.tpcnns.append(nn.Conv2d(pred_seq_len, pred_seq_len, 3, padding=1))
+        self.tpcnn_ouput = nn.Conv2d(pred_seq_len, pred_seq_len, 3, padding=1)
+
+        self.prelus = nn.ModuleList([nn.PReLU() for _ in range(self.n_txpcnn)])
+
+    def forward(self, v, a):
+        for k in range(self.n_stgcnn):
+            v, a = self.st_gcns[k](v, a)
+
+        # Reference's view-based reshuffle of (channels ↔ time): [B,C,T,V] -> [B,T,C,V]
+        # so the TXP convs treat the time axis as channels. (A reshape, not a
+        # transpose — kept exactly as the reference does it.)
+        v = v.view(v.shape[0], v.shape[2], v.shape[1], v.shape[3])
+
+        v = self.prelus[0](self.tpcnns[0](v))
+        for k in range(1, self.n_txpcnn - 1):
+            v = self.prelus[k](self.tpcnns[k](v)) + v
+        v = self.tpcnn_ouput(v)
+        v = v.view(v.shape[0], v.shape[2], v.shape[1], v.shape[3])
+        return v, a
+
+
+# ── Graph + loss helpers (faithful to ref_code/utils.py & metrics.py) ──────────
+
+
+def build_graph(rel_obs: Tensor) -> Tensor:
+    """Per-frame normalized-Laplacian graph from relative coords.
+
+    rel_obs: [T, N, 2] displacement features. Returns A: [T, N, N].
+    Edge weight = 1/‖relᵢ − relⱼ‖ (0 if coincident), unit self-loop, then
+    L = I − D^{-1/2} A D^{-1/2} — matching anorm + nx.normalized_laplacian_matrix.
+    """
+    T, N, _ = rel_obs.shape
+    dist = torch.cdist(rel_obs, rel_obs)  # [T, N, N]
+    A = torch.where(dist > 0, 1.0 / dist, torch.zeros_like(dist))
+    eye = torch.eye(N, dtype=torch.bool)
+    A[:, eye] = 1.0  # unit self-loops
+    deg = A.sum(-1)  # [T, N]
+    d_inv_sqrt = deg.pow(-0.5)
+    d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.0
+    D_inv = torch.diag_embed(d_inv_sqrt)  # [T, N, N]
+    eye_T = torch.eye(N).expand(T, N, N)
+    return eye_T - D_inv @ A @ D_inv
+
+
+def bivariate_loss(V_pred: Tensor, V_trgt: Tensor) -> Tensor:
+    """Bivariate-Gaussian NLL over displacements (ref_code/metrics.py).
+
+    V_pred: [..., 5] raw params [mux, muy, log σx, log σy, ρ-pre-tanh]
+    V_trgt: [..., 2] target displacements
+    """
+    normx = V_trgt[..., 0] - V_pred[..., 0]
+    normy = V_trgt[..., 1] - V_pred[..., 1]
+    sx = torch.exp(V_pred[..., 2])
+    sy = torch.exp(V_pred[..., 3])
+    corr = torch.tanh(V_pred[..., 4])
+
+    sxsy = sx * sy
+    z = (normx / sx) ** 2 + (normy / sy) ** 2 - 2 * ((corr * normx * normy) / sxsy)
+    negRho = 1 - corr ** 2
+
+    result = torch.exp(-z / (2 * negRho))
+    denom = 2 * torch.pi * (sxsy * torch.sqrt(negRho))
+    result = result / denom
+    result = -torch.log(torch.clamp(result, min=1e-20))
+    return torch.mean(result)
+
+
+def gaussian_params(V_pred: Tensor):
+    """Split raw model output [..., 5] into (mean[...,2], sx, sy, corr)."""
+    mean = V_pred[..., 0:2]
+    sx = torch.exp(V_pred[..., 2])
+    sy = torch.exp(V_pred[..., 3])
+    corr = torch.tanh(V_pred[..., 4])
+    return mean, sx, sy, corr
+
+
+def sample_displacements(V_pred: Tensor, k: int) -> Tensor:
+    """Draw K displacement samples from the per-step bivariate Gaussian.
+
+    V_pred: [B, T, N, 5] -> samples [K, B, T, N, 2] via the 2×2 Cholesky factor.
+    """
+    mean, sx, sy, corr = gaussian_params(V_pred)
+    l11 = sx
+    l21 = corr * sy
+    l22 = sy * torch.sqrt(torch.clamp(1 - corr ** 2, min=1e-6))
+    eps = torch.randn((k,) + mean.shape, device=V_pred.device)  # [K, B, T, N, 2]
+    s_x = l11 * eps[..., 0]
+    s_y = l21 * eps[..., 0] + l22 * eps[..., 1]
+    return mean.unsqueeze(0) + torch.stack([s_x, s_y], dim=-1)
+
+
+def rel_to_abs(disp: Tensor, last_pos: Tensor, time_dim: int) -> Tensor:
+    """Integrate displacements to absolute positions from the last observed pos."""
+    return disp.cumsum(dim=time_dim) + last_pos.unsqueeze(time_dim)
+
+
+# ── Data ───────────────────────────────────────────────────────────────────────
 
 
 class NBADataset(Dataset):
-    """
-    Holds raw per-sequence coordinates and produces windows on demand.
+    """Yields windows as (X, A, V_tr, last_pos, abs_target).
 
-    Unlike the original stgcnn/dataset.py — which materialized every sliding
-    window up front — windows are cut lazily so the sampler can draw a fresh
-    random start per sequence each epoch (matching the EqMotion pipeline). The
-    interaction adjacency A is built from *raw* (un-normalized) distances, as in
-    the original Social-STGCNN, then positions are normalized for the network.
-
-    __getitem__ returns:
-      X [2, obs_len, N]        — normalized coords, channel-first for the GCN
-      Y [pred_len, N, 2]       — normalized target coords
-      A [obs_len, N, N]        — exp(-pairwise distance) interaction graph
+    X         [2, obs, N]   relative (displacement) features, channel-first
+    A         [obs, N, N]   per-frame normalized-Laplacian graph (rel space)
+    V_tr      [pred, N, 2]  target displacements (NLL target)
+    last_pos  [N, 2]        last observed absolute position (integration anchor)
+    abs_target[pred, N, 2]  absolute future positions (metric ground truth)
     """
 
-    def __init__(self, files, context_size, horizon_size, mu, sigma):
+    def __init__(self, files, context_size, horizon_size):
         super().__init__()
         self.context_size = context_size
         self.horizon_size = horizon_size
         self.window_size = context_size + horizon_size
-        self.mu = mu.float()
-        self.sigma = sigma.float()
         self.load_data(files)
 
     def load_data(self, files):
-        self.sequences = []  # raw coords [T, N, 2]
+        self.sequences = []  # absolute coords [T, N, 2], raw feet
         self.max_start = []
         for f in files:
             seq = torch.load(f, weights_only=False).float()
@@ -88,17 +276,19 @@ class NBADataset(Dataset):
 
     def __getitem__(self, index):
         seq_idx, start = index
-        coords = self.sequences[seq_idx][start : start + self.window_size]  # [W, N, 2]
-        obs_raw = coords[: self.context_size]  # [obs, N, 2]
+        c = self.context_size
+        abs_win = self.sequences[seq_idx][start : start + self.window_size]  # [W, N, 2]
 
-        # Interaction graph from raw distances (per observed frame).
-        dist = torch.cdist(obs_raw, obs_raw)  # [obs, N, N]
-        A = torch.exp(-dist)
+        rel = torch.zeros_like(abs_win)
+        rel[1:] = abs_win[1:] - abs_win[:-1]  # displacement; rel[0]=0
 
-        coords_norm = (coords - self.mu) / self.sigma
-        X = coords_norm[: self.context_size].permute(2, 0, 1)  # [2, obs, N]
-        Y = coords_norm[self.context_size :]  # [pred, N, 2]
-        return X, Y, A
+        rel_obs = rel[:c]  # [obs, N, 2]
+        V_tr = rel[c:]  # [pred, N, 2]
+        A = build_graph(rel_obs)  # [obs, N, N]
+        X = rel_obs.permute(2, 0, 1)  # [2, obs, N]
+        last_pos = abs_win[c - 1]  # [N, 2]
+        abs_target = abs_win[c:]  # [pred, N, 2]
+        return X, A, V_tr, last_pos, abs_target
 
     def __len__(self):
         return len(self.sequences)
@@ -129,49 +319,14 @@ class NBASampler(Sampler):
         perm_start = [(i, self.max_start[i]) for i in perm]
         for k in range(0, n, self.batch_size):
             for idx, max_start in perm_start[k : k + self.batch_size]:
-                start = torch.randint(
-                    0, max_start + 1, size=(), generator=self.generator
-                )
+                start = torch.randint(0, max_start + 1, size=(), generator=self.generator)
                 yield idx, start
 
     def __len__(self):
         return len(self.max_start)
 
 
-# ── Gaussian helpers ──────────────────────────────────────────────────────────
-
-
-def gaussian_mean(pred) -> Tensor:
-    """Point prediction (distribution mean) → [pred, B*N, 2], reshaped for metrics."""
-    mu_x, mu_y, _, _, _ = pred
-    mu = torch.stack([mu_x, mu_y], dim=-1)  # [B, T, N, 2]
-    B, T, N, _ = mu.shape
-    return mu.permute(1, 0, 2, 3).reshape(T, B * N, 2)
-
-
-def gaussian_sample(pred, k: int) -> Tensor:
-    """
-    Draw K samples from the per-step bivariate Gaussian.
-
-    Returns [K, T, B*N, 2]. Uses the Cholesky form of the 2x2 covariance built
-    from (sig_x, sig_y, rho) so samples respect the predicted correlation.
-    """
-    mu_x, mu_y, sig_x, sig_y, rho = pred
-    B, T, N = mu_x.shape
-    mean = torch.stack([mu_x, mu_y], dim=-1)  # [B, T, N, 2]
-    # Cholesky of [[sx^2, rho sx sy], [rho sx sy, sy^2]].
-    one_minus = torch.clamp(1 - rho**2, min=1e-6)
-    l11 = sig_x
-    l21 = rho * sig_y
-    l22 = sig_y * torch.sqrt(one_minus)
-    eps = torch.randn(k, B, T, N, 2, device=mu_x.device)
-    s_x = l11 * eps[..., 0]
-    s_y = l21 * eps[..., 0] + l22 * eps[..., 1]
-    samples = mean.unsqueeze(0) + torch.stack([s_x, s_y], dim=-1)  # [K, B, T, N, 2]
-    return samples.permute(0, 2, 1, 3, 4).reshape(k, T, B * N, 2)
-
-
-# ── Lightning module ───────────────────────────────────────────────────────────
+# ── Lightning module ────────────────────────────────────────────────────────────
 
 
 class NBASTGCNNLightningModel(L.LightningModule):
@@ -179,149 +334,107 @@ class NBASTGCNNLightningModel(L.LightningModule):
         self,
         context_size: int = 8,
         horizon_size: int = 12,
-        hidden_dim: int = 64,
-        lr: float = 1e-3,
-        weight_decay: float = 0.0,
-        lr_step: int = 10,
-        lr_gamma: float = 0.5,
+        n_stgcnn: int = 1,
+        n_txpcnn: int = 5,
+        kernel_size: int = 3,
+        lr: float = 0.01,
+        lr_step: int = 150,
+        lr_gamma: float = 0.2,
         n_samples: int = 20,
     ):
         super().__init__()
         self.save_hyperparameters()
-        self.net = Social_STGCNN(
-            in_channels=2,
-            hidden_dim=hidden_dim,
-            obs_len=context_size,
-            pred_len=horizon_size,
+        self.net = social_stgcnn(
+            n_stgcnn=n_stgcnn,
+            n_txpcnn=n_txpcnn,
+            input_feat=2,
+            output_feat=5,
+            seq_len=context_size,
+            pred_seq_len=horizon_size,
+            kernel_size=kernel_size,
         )
 
-    def on_fit_start(self):
-        dm = self.trainer.datamodule
-        self.register_buffer("mu", dm.mu.to(self.device))
-        self.register_buffer("sigma", dm.sigma.to(self.device))
-
-    def forward(self, X: Tensor, A: Tensor):
-        return self.net(X, A)
+    def forward(self, X: Tensor, A: Tensor) -> Tensor:
+        # X [B,2,obs,N], A [B,obs,N,N] -> V_pred [B, pred, N, 5]
+        v, _ = self.net(X, A)  # [B, 5, pred, N]
+        return v.permute(0, 2, 3, 1)
 
     def training_step(self, batch, batch_idx):
-        X, Y, A = batch
-        pred = self(X, A)
-        loss = bivariate_loss(pred, Y)
+        X, A, V_tr, _, _ = batch
+        V_pred = self(X, A)
+        B = V_pred.shape[0]
+        loss = bivariate_loss(V_pred.reshape(B, -1, 5), V_tr.reshape(B, -1, 2))
         self.log("train/loss", loss, on_epoch=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        X, Y, A = batch
-        pred = self(X, A)
-        loss = bivariate_loss(pred, Y)
+        X, A, V_tr, last_pos, abs_target = batch
+        V_pred = self(X, A)  # [B, pred, N, 5]
+        B, T, N, _ = V_pred.shape
+        loss = bivariate_loss(V_pred.reshape(B, -1, 5), V_tr.reshape(B, -1, 2))
 
-        B, T, N, _ = Y.shape
-        target = Y.permute(1, 0, 2, 3).reshape(T, B * N, 2)
-        target_real = target * self.sigma + self.mu
+        # Mean-prediction metrics: integrate predicted mean displacement to abs.
+        mean_disp = V_pred[..., :2]  # [B, T, N, 2]
+        abs_pred = rel_to_abs(mean_disp, last_pos, time_dim=1)  # [B, T, N, 2]
+        pred_flat = abs_pred.permute(1, 0, 2, 3).reshape(T, B * N, 2)
+        target_flat = abs_target.permute(1, 0, 2, 3).reshape(T, B * N, 2)
 
-        # Deterministic (mean-prediction) metrics — comparable to EqMotion.
-        mean_pred = gaussian_mean(pred) * self.sigma + self.mu
         self.log("val/loss", loss, on_epoch=True, prog_bar=True)
-        self.log(
-            "val/ade_ft",
-            compute_ade(mean_pred, target_real),
-            on_epoch=True,
-            prog_bar=True,
-        )
-        self.log(
-            "val/fde_ft",
-            compute_fde(mean_pred, target_real),
-            on_epoch=True,
-            prog_bar=True,
-        )
-        self.log(
-            "val/mse_ft",
-            compute_mse(mean_pred, target_real),
-            on_epoch=True,
-            prog_bar=True,
-        )
+        self.log("val/ade_ft", compute_ade(pred_flat, target_flat), on_epoch=True, prog_bar=True)
+        self.log("val/fde_ft", compute_fde(pred_flat, target_flat), on_epoch=True, prog_bar=True)
+        self.log("val/mse_ft", compute_mse(pred_flat, target_flat), on_epoch=True, prog_bar=True)
 
-        # Stochastic best-of-K metrics — specific to this probabilistic model.
+        # Best-of-K metrics: sample displacements, integrate each, take the min.
         k = self.hparams.n_samples
-        samples = gaussian_sample(pred, k) * self.sigma + self.mu  # [K, T, B*N, 2]
-        self.log(
-            f"val/min_ade_ft_k{k}", compute_min_ade(samples, target_real), on_epoch=True
-        )
-        self.log(
-            f"val/min_fde_ft_k{k}", compute_min_fde(samples, target_real), on_epoch=True
-        )
-        self.log(
-            f"val/min_mse_ft_k{k}", compute_min_mse(samples, target_real), on_epoch=True
-        )
+        disp_samples = sample_displacements(V_pred, k)  # [K, B, T, N, 2]
+        abs_samples = rel_to_abs(disp_samples, last_pos.unsqueeze(0), time_dim=2)
+        samples_flat = abs_samples.permute(0, 2, 1, 3, 4).reshape(k, T, B * N, 2)
+        self.log(f"val/min_ade_ft_k{k}", compute_min_ade(samples_flat, target_flat), on_epoch=True)
+        self.log(f"val/min_fde_ft_k{k}", compute_min_fde(samples_flat, target_flat), on_epoch=True)
+        self.log(f"val/min_mse_ft_k{k}", compute_min_mse(samples_flat, target_flat), on_epoch=True)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
-            self.parameters(),
-            lr=self.hparams.lr,
-            weight_decay=self.hparams.weight_decay,
-        )
+        # Reference uses SGD + StepLR.
+        optimizer = torch.optim.SGD(self.parameters(), lr=self.hparams.lr)
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer, step_size=self.hparams.lr_step, gamma=self.hparams.lr_gamma
         )
         return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler}}
 
     @torch.no_grad()
-    def predict_mean(self, X: Tensor, A: Tensor) -> Tensor:
-        """Mean trajectory for a single normalized sample → [pred, N, 2] (normalized)."""
+    def predict_abs_mean(self, X: Tensor, A: Tensor, last_pos: Tensor) -> Tensor:
+        """Absolute mean trajectory for a batch → [B, pred, N, 2]."""
         self.eval()
-        mu_x, mu_y, _, _, _ = self(X.to(self.device), A.to(self.device))
-        return torch.stack([mu_x, mu_y], dim=-1).squeeze(0).cpu()
+        V_pred = self(X.to(self.device), A.to(self.device))
+        mean_disp = V_pred[..., :2]
+        return rel_to_abs(mean_disp, last_pos.to(self.device), time_dim=1).cpu()
 
 
-# ── DataModule ─────────────────────────────────────────────────────────────────
+# ── DataModule ──────────────────────────────────────────────────────────────────
 
 
 class NBADataModule(L.LightningDataModule):
-    def __init__(
-        self,
-        split_path,
-        batch_size=128,
-        context_size=8,
-        horizon_size=12,
-        seed=0,
-    ):
+    def __init__(self, split_path, batch_size=128, context_size=8, horizon_size=12, seed=0):
         super().__init__()
         self.split_path = split_path
         self.batch_size = batch_size
         self.context_size = context_size
         self.horizon_size = horizon_size
         self.seed = seed
-        self.mu = None
-        self.sigma = None
 
     def setup(self, stage=None):
         manifest = json.loads(Path(self.split_path).read_text())
         data_dir = PROJECT_ROOT / manifest["data_dir"]
         train_files = [data_dir / f for f in manifest["train"]]
         val_files = [data_dir / f for f in manifest["val"]]
-        self.mu, self.sigma = self._compute_normalization_statistics(train_files)
-        self.train_dataset = NBADataset(
-            train_files, self.context_size, self.horizon_size, self.mu, self.sigma
-        )
-        self.val_dataset = NBADataset(
-            val_files, self.context_size, self.horizon_size, self.mu, self.sigma
-        )
-
-    def _compute_normalization_statistics(self, files):
-        all_pos = []
-        for f in files:
-            seq = torch.load(f, weights_only=False)
-            all_pos.append(seq[:, :, [0, 1]])
-        all_pos = torch.cat(all_pos, dim=0)
-        return all_pos.mean(dim=(0, 1)), all_pos.std(dim=(0, 1))
+        self.train_dataset = NBADataset(train_files, self.context_size, self.horizon_size)
+        self.val_dataset = NBADataset(val_files, self.context_size, self.horizon_size)
 
     def train_dataloader(self):
         sampler = NBASampler(
             self.batch_size, self.train_dataset.max_start, seed=self.seed, shuffle=True
         )
-        return DataLoader(
-            self.train_dataset, batch_size=self.batch_size, sampler=sampler
-        )
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, sampler=sampler)
 
     def val_dataloader(self):
         sampler = NBASampler(
@@ -329,23 +442,23 @@ class NBADataModule(L.LightningDataModule):
         )
         return DataLoader(self.val_dataset, batch_size=self.batch_size, sampler=sampler)
 
-    def get_kaggle_submission(
-        self, model: NBASTGCNNLightningModel, test_dir: str, target_dir: str
-    ):
-        mu, sigma = self.mu, self.sigma
+    def get_kaggle_submission(self, model, test_dir: str, target_dir: str):
+        c = self.context_size
         all_traj = []
         for f in sorted(os.listdir(test_dir)):
             if not f.endswith(".pt"):
                 continue
             seq = torch.load(os.path.join(test_dir, f), weights_only=False).float()
-            coords = seq[:, :, :2]  # [obs, N, 2]
-            dist = torch.cdist(coords, coords)
-            A = torch.exp(-dist).unsqueeze(0)  # [1, obs, N, N]
-            X = ((coords - mu) / sigma).permute(2, 0, 1).unsqueeze(0)  # [1, 2, obs, N]
+            abs_obs = seq[:, :, :2]  # [obs, N, 2]
+            rel_obs = torch.zeros_like(abs_obs)
+            rel_obs[1:] = abs_obs[1:] - abs_obs[:-1]
 
-            pred = model.predict_mean(X, A)  # [pred, N, 2] (normalized)
-            pred = pred * sigma + mu  # denormalize → feet
-            traj = pred[:, :11, :2].reshape(-1)
+            A = build_graph(rel_obs).unsqueeze(0)  # [1, obs, N, N]
+            X = rel_obs.permute(2, 0, 1).unsqueeze(0)  # [1, 2, obs, N]
+            last_pos = abs_obs[c - 1].unsqueeze(0)  # [1, N, 2]
+
+            abs_pred = model.predict_abs_mean(X, A, last_pos)[0]  # [pred, N, 2]
+            traj = abs_pred[:, :N_ENTITIES, :2].reshape(-1)
             all_traj.append([int(f.removesuffix(".pt"))] + traj.tolist())
 
         df = (
@@ -355,7 +468,7 @@ class NBADataModule(L.LightningDataModule):
                 + [
                     f"entity_{i}_time_{t}_{axis}"
                     for t in range(12)
-                    for i in range(11)
+                    for i in range(N_ENTITIES)
                     for axis in ["x", "y"]
                 ],
             )
@@ -377,18 +490,15 @@ if __name__ == "__main__":
         batch_size=128,
     )
 
-    model = NBASTGCNNLightningModel(lr=1e-3)
+    model = NBASTGCNNLightningModel()
 
     wandb_logger = WandbLogger(project="NML_base", name="stgcnn")
-
     checkpoint = ModelCheckpoint(monitor="val/mse_ft", mode="min", save_top_k=1)
-    early_stop = EarlyStopping(monitor="val/mse_ft", patience=20, mode="min")
 
     trainer = L.Trainer(
-        max_epochs=100,
+        max_epochs=250,
         logger=wandb_logger,
         accelerator="auto",
-        gradient_clip_val=1.0,
         callbacks=[checkpoint],
     )
 
