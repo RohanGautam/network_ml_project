@@ -180,6 +180,69 @@ class social_stgcnn(nn.Module):
         return v, a
 
 
+class GraphGRUDecoder(nn.Module):
+    """Autoregressive rollout with a live position-space graph.
+
+    At each future step: (1) rebuild the proximity graph from the current
+    predicted positions, (2) aggregate neighbour hidden states over it,
+    (3) update a per-node GRU cell, (4) emit the next displacement, (5) step
+    the position forward and feed it back. Each step is conditioned on the
+    previous one (the fix for one-shot drift) and interactions stay live as the
+    play evolves. The graph is built from detached positions for stability —
+    gradients still flow through the GRU and the displacement feedback.
+    """
+
+    def __init__(self, hidden, pred_len, output_feat=5):
+        super().__init__()
+        self.pred_len = pred_len
+        self.hidden = hidden
+        self.disp_embed = nn.Linear(2, hidden)
+        self.graph_lin = nn.Linear(hidden, hidden)
+        self.gru = nn.GRUCell(hidden, hidden)
+        self.head = nn.Linear(hidden, output_feat)
+
+    def forward(self, h0, pos0, vel0):
+        # h0 [B,N,H]  pos0 [B,N,2]  vel0 [B,N,2]
+        B, N, H = h0.shape
+        h, pos, d_prev = h0, pos0, vel0
+        outs = []
+        for _ in range(self.pred_len):
+            A = _laplacian_from(pos.detach())  # [B, N, N]
+            msg = torch.einsum("bnm,bmh->bnh", A, self.graph_lin(h))  # neighbour mix
+            inp = msg + self.disp_embed(d_prev)  # [B, N, H]
+            h = self.gru(inp.reshape(B * N, H), h.reshape(B * N, H)).reshape(B, N, H)
+            out = self.head(h)  # [B, N, output_feat]
+            outs.append(out)
+            d = out[..., :2]  # mean displacement
+            pos = pos + d
+            d_prev = d
+        return torch.stack(outs, dim=1)  # [B, pred, N, output_feat]
+
+
+class stgcnn_autoreg(nn.Module):
+    """ST-GCN encoder over the observed window + autoregressive graph decoder."""
+
+    def __init__(
+        self, n_stgcnn=2, input_feat=4, hidden_feat=64, output_feat=5,
+        seq_len=8, pred_seq_len=12, kernel_size=3, n_relations=1,
+    ):
+        super().__init__()
+        self.st_gcns = nn.ModuleList()
+        self.st_gcns.append(st_gcn(input_feat, hidden_feat, (kernel_size, n_relations)))
+        for _ in range(1, n_stgcnn):
+            self.st_gcns.append(st_gcn(hidden_feat, hidden_feat, (kernel_size, n_relations)))
+        self.decoder = GraphGRUDecoder(hidden_feat, pred_seq_len, output_feat)
+
+    def forward(self, X, A, last_pos):
+        # X [B, C, obs, N]   A [B, R, obs, N, N]   last_pos [B, N, 2]
+        v = X
+        for gcn in self.st_gcns:
+            v, A = gcn(v, A)  # [B, hidden, obs, N]
+        h0 = v[:, :, -1, :].permute(0, 2, 1)  # [B, N, hidden] — last observed frame
+        vel0 = X[:, :2, -1, :].permute(0, 2, 1)  # [B, N, 2] — last observed velocity
+        return self.decoder(h0, last_pos, vel0)  # [B, pred, N, output_feat]
+
+
 # ── Graph + loss helpers (faithful to ref_code/utils.py & metrics.py) ──────────
 
 
@@ -190,15 +253,16 @@ def _laplacian_from(coords: Tensor) -> Tensor:
     unit self-loop, then L = I − D^{-1/2} A D^{-1/2} (anorm + normalized Laplacian).
     """
     T, N, _ = coords.shape
+    dev = coords.device
     dist = torch.cdist(coords, coords)  # [T, N, N]
     A = torch.where(dist > 0, 1.0 / dist, torch.zeros_like(dist))
-    eye = torch.eye(N, dtype=torch.bool)
+    eye = torch.eye(N, dtype=torch.bool, device=dev)
     A[:, eye] = 1.0  # unit self-loops
     deg = A.sum(-1)  # [T, N]
     d_inv_sqrt = deg.pow(-0.5)
     d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.0
     D_inv = torch.diag_embed(d_inv_sqrt)  # [T, N, N]
-    eye_T = torch.eye(N).expand(T, N, N)
+    eye_T = torch.eye(N, device=dev).expand(T, N, N)
     return eye_T - D_inv @ A @ D_inv
 
 
@@ -379,15 +443,16 @@ class NBASTGCNNLightningModel(L.LightningModule):
         n_samples: int = 20,
         loss_mode: str = "mse",   # "mse" | "nll" | "nll+mse"
         mse_weight: float = 1.0,  # λ on the MSE term in "nll+mse"
+        decoder: str = "autoreg",  # "txp" (one-shot) | "autoreg" (graph rollout)
     ):
         assert loss_mode in ("mse", "nll", "nll+mse")
         assert optimizer in ("adam", "sgd")
         assert graph_space in ("pos", "vel", "both")
+        assert decoder in ("txp", "autoreg")
         super().__init__()
         self.save_hyperparameters()
-        self.net = social_stgcnn(
+        common = dict(
             n_stgcnn=n_stgcnn,
-            n_txpcnn=n_txpcnn,
             input_feat=4 if use_identity else 2,
             hidden_feat=hidden_feat,
             output_feat=5,
@@ -396,11 +461,17 @@ class NBASTGCNNLightningModel(L.LightningModule):
             kernel_size=kernel_size,
             n_relations=n_relations_for(graph_space),
         )
+        if decoder == "autoreg":
+            self.net = stgcnn_autoreg(**common)
+        else:
+            self.net = social_stgcnn(n_txpcnn=n_txpcnn, **common)
 
-    def forward(self, X: Tensor, A: Tensor) -> Tensor:
-        # X [B,4,obs,N], A [B,obs,N,N] -> V_pred [B, pred, N, 5]
+    def forward(self, X: Tensor, A: Tensor, last_pos: Tensor) -> Tensor:
+        # X [B,4,obs,N], A [B,R,obs,N,N], last_pos [B,N,2] -> V_pred [B, pred, N, 5]
         if not self.hparams.use_identity:
             X = X[:, :2]  # drop [isplayer, team] channels
+        if self.hparams.decoder == "autoreg":
+            return self.net(X, A, last_pos)  # [B, pred, N, 5]
         v, _ = self.net(X, A)  # [B, 5, pred, N]
         return v.permute(0, 2, 3, 1)
 
@@ -433,7 +504,7 @@ class NBASTGCNNLightningModel(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         X, A, V_tr, last_pos, abs_target = batch
-        V_pred = self(X, A)
+        V_pred = self(X, A, last_pos)
         loss, comps = self._losses(V_pred, V_tr, last_pos, abs_target)
         self.log("train/loss", loss, on_epoch=True, prog_bar=True)
         for name, val in comps.items():
@@ -442,7 +513,7 @@ class NBASTGCNNLightningModel(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         X, A, V_tr, last_pos, abs_target = batch
-        V_pred = self(X, A)  # [B, pred, N, 5]
+        V_pred = self(X, A, last_pos)  # [B, pred, N, 5]
         B, T, N, _ = V_pred.shape
         loss, _ = self._losses(V_pred, V_tr, last_pos, abs_target)
 
@@ -508,9 +579,10 @@ class NBASTGCNNLightningModel(L.LightningModule):
     def predict_abs_mean(self, X: Tensor, A: Tensor, last_pos: Tensor) -> Tensor:
         """Absolute mean trajectory for a batch → [B, pred, N, 2]."""
         self.eval()
-        V_pred = self(X.to(self.device), A.to(self.device))
+        last_pos = last_pos.to(self.device)
+        V_pred = self(X.to(self.device), A.to(self.device), last_pos)
         mean_disp = V_pred[..., :2]
-        return rel_to_abs(mean_disp, last_pos.to(self.device), time_dim=1).cpu()
+        return rel_to_abs(mean_disp, last_pos, time_dim=1).cpu()
 
 
 # ── DataModule ──────────────────────────────────────────────────────────────────
@@ -597,7 +669,7 @@ class NBADataModule(L.LightningDataModule):
 if __name__ == "__main__":
     L.seed_everything(0)
 
-    GRAPH_SPACE = "both"  # "pos" | "vel" | "both" — keep model & datamodule in sync
+    GRAPH_SPACE = "pos"  # "pos" | "vel" | "both" — keep model & datamodule in sync
 
     data_module = NBADataModule(
         split_path=str(PROJECT_ROOT / "splits" / "fold0.json"),
@@ -606,14 +678,14 @@ if __name__ == "__main__":
     )
 
     model = NBASTGCNNLightningModel(
-        loss_mode="mse", optimizer="adam", graph_space=GRAPH_SPACE
+        loss_mode="mse", optimizer="adam", graph_space=GRAPH_SPACE, decoder="autoreg"
     )
 
     h = model.hparams
     wandb_logger = WandbLogger(
         project="NML_base",
-        name=f"stgcnn_{h.loss_mode}_{h.optimizer}_h{h.hidden_feat}_st{h.n_stgcnn}"
-        + f"_{h.graph_space}"
+        name=f"stgcnn_{h.decoder}_{h.loss_mode}_{h.optimizer}_h{h.hidden_feat}"
+        + f"_st{h.n_stgcnn}_{h.graph_space}"
         + ("_id" if h.use_identity else ""),
     )
     checkpoint = ModelCheckpoint(monitor="val/mse_ft", mode="min", save_top_k=1)
