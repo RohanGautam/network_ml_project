@@ -444,6 +444,7 @@ class NBASTGCNNLightningModel(L.LightningModule):
         loss_mode: str = "mse",   # "mse" | "nll" | "nll+mse"
         mse_weight: float = 1.0,  # λ on the MSE term in "nll+mse"
         decoder: str = "autoreg",  # "txp" (one-shot) | "autoreg" (graph rollout)
+        augment: bool = True,  # random court-symmetry reflections (train only)
     ):
         assert loss_mode in ("mse", "nll", "nll+mse")
         assert optimizer in ("adam", "sgd")
@@ -502,8 +503,31 @@ class NBASTGCNNLightningModel(L.LightningModule):
             total = comps["nll"] + self.hparams.mse_weight * comps["mse"]
         return total, comps
 
+    def _augment(self, X, V_tr, last_pos, abs_target):
+        """Random court-symmetry reflections, per instance (training only).
+
+        The court is centered at the origin in raw feet, so a reflection is a
+        coordinate negation. Reflections are isometries → pairwise distances are
+        unchanged → the graph A is invariant and needs no flipping. Identity
+        channels [isplayer, team] are unaffected. X is [B,4,obs,N] with channel
+        0,1 = dx,dy; V_tr/abs_target are [B,*,N,2]; last_pos is [B,N,2].
+        """
+        B = X.shape[0]
+        fx = torch.rand(B, device=X.device) < 0.5  # reflect across court's y-axis
+        fy = torch.rand(B, device=X.device) < 0.5  # reflect across court's x-axis
+        X, V_tr = X.clone(), V_tr.clone()
+        last_pos, abs_target = last_pos.clone(), abs_target.clone()
+        for mask, c in ((fx, 0), (fy, 1)):
+            X[mask, c] = -X[mask, c]
+            V_tr[mask, :, :, c] = -V_tr[mask, :, :, c]
+            last_pos[mask, :, c] = -last_pos[mask, :, c]
+            abs_target[mask, :, :, c] = -abs_target[mask, :, :, c]
+        return X, V_tr, last_pos, abs_target
+
     def training_step(self, batch, batch_idx):
         X, A, V_tr, last_pos, abs_target = batch
+        if self.hparams.augment:
+            X, V_tr, last_pos, abs_target = self._augment(X, V_tr, last_pos, abs_target)
         V_pred = self(X, A, last_pos)
         loss, comps = self._losses(V_pred, V_tr, last_pos, abs_target)
         self.log("train/loss", loss, on_epoch=True, prog_bar=True)
@@ -686,7 +710,8 @@ if __name__ == "__main__":
         project="NML_base",
         name=f"stgcnn_{h.decoder}_{h.loss_mode}_{h.optimizer}_h{h.hidden_feat}"
         + f"_st{h.n_stgcnn}_{h.graph_space}"
-        + ("_id" if h.use_identity else ""),
+        + ("_id" if h.use_identity else "")
+        + ("_aug" if h.augment else ""),
     )
     checkpoint = ModelCheckpoint(monitor="val/mse_ft", mode="min", save_top_k=1)
 
