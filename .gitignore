@@ -5,6 +5,7 @@ NML_base
 wandb
 optuna_studies
 models
+checkpoints
 # *.ckpt
 screen_results
 # Byte-compiled / optimized / DLL files

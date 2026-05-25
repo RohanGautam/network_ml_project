@@ -608,6 +608,27 @@ class NBASTGCNNLightningModel(L.LightningModule):
         mean_disp = V_pred[..., :2]
         return rel_to_abs(mean_disp, last_pos, time_dim=1).cpu()
 
+    @torch.no_grad()
+    def tta_abs_pred(self, X, A, last_pos):
+        """Batched 4-way court-symmetry TTA → [B, pred, N, 2] (on device).
+
+        A is reflection-invariant (distances unchanged), so only the velocity
+        channels of X and last_pos are flipped; predictions are un-flipped and
+        averaged. X channels 0,1 = dx,dy.
+        """
+        self.eval()
+        preds = []
+        for axes in [(), (0,), (1,), (0, 1)]:
+            Xf, lp = X.clone(), last_pos.clone()
+            for ax in axes:
+                Xf[:, ax] = -Xf[:, ax]
+                lp[:, :, ax] = -lp[:, :, ax]
+            ap = self._abs_mean(self(Xf, A, lp), lp)  # [B, pred, N, 2] in reflected frame
+            for ax in axes:
+                ap[..., ax] = -ap[..., ax]
+            preds.append(ap)
+        return torch.stack(preds).mean(0)
+
 
 # ── DataModule ──────────────────────────────────────────────────────────────────
 
@@ -647,25 +668,41 @@ class NBADataModule(L.LightningDataModule):
         )
         return DataLoader(self.val_dataset, batch_size=self.batch_size, sampler=sampler)
 
-    def get_kaggle_submission(self, model, test_dir: str, target_dir: str):
+    def _predict_abs(self, model, abs_obs, static):
+        """Predict absolute future positions for one sequence's observed window.
+
+        abs_obs [obs, N, 2] (court-frame), static [N, 2] (isplayer, team)."""
         c = self.context_size
+        rel_obs = torch.zeros_like(abs_obs)
+        rel_obs[1:] = abs_obs[1:] - abs_obs[:-1]
+        A = build_graph(abs_obs, rel_obs, self.graph_space).unsqueeze(0)  # [1, R, obs, N, N]
+        static_obs = static.unsqueeze(0).expand(rel_obs.shape[0], -1, -1)  # [obs, N, 2]
+        X = torch.cat([rel_obs, static_obs], dim=-1).permute(2, 0, 1).unsqueeze(0)  # [1,4,obs,N]
+        last_pos = abs_obs[c - 1].unsqueeze(0)  # [1, N, 2]
+        return model.predict_abs_mean(X, A, last_pos)[0]  # [pred, N, 2]
+
+    def get_kaggle_submission(self, model, test_dir: str, target_dir: str, tta: bool = False):
+        # Court-symmetry reflections (negate coord(s)); reflection is an isometry
+        # so this is exact. For TTA we average the un-reflected predictions.
+        flips = [(), (0,), (1,), (0, 1)] if tta else [()]
         all_traj = []
         for f in sorted(os.listdir(test_dir)):
             if not f.endswith(".pt"):
                 continue
             seq = torch.load(os.path.join(test_dir, f), weights_only=False).float()
             abs_obs = seq[:, :, :2]  # [obs, N, 2]
-            static = seq[c - 1, :, 2:4]  # [N, 2] isplayer, team
-            rel_obs = torch.zeros_like(abs_obs)
-            rel_obs[1:] = abs_obs[1:] - abs_obs[:-1]
+            static = seq[self.context_size - 1, :, 2:4]  # [N, 2] isplayer, team
 
-            A = build_graph(abs_obs, rel_obs, self.graph_space).unsqueeze(0)  # [1, R, obs, N, N]
-            static_obs = static.unsqueeze(0).expand(rel_obs.shape[0], -1, -1)  # [obs, N, 2]
-            feat = torch.cat([rel_obs, static_obs], dim=-1)  # [obs, N, 4]
-            X = feat.permute(2, 0, 1).unsqueeze(0)  # [1, 4, obs, N]
-            last_pos = abs_obs[c - 1].unsqueeze(0)  # [1, N, 2]
-
-            abs_pred = model.predict_abs_mean(X, A, last_pos)[0]  # [pred, N, 2]
+            preds = []
+            for axes in flips:
+                ao = abs_obs.clone()
+                for ax in axes:
+                    ao[..., ax] = -ao[..., ax]  # reflect input
+                pred = self._predict_abs(model, ao, static)  # [pred, N, 2]
+                for ax in axes:
+                    pred[..., ax] = -pred[..., ax]  # un-reflect output
+                preds.append(pred)
+            abs_pred = torch.stack(preds).mean(0)  # [pred, N, 2]
             traj = abs_pred[:, :N_ENTITIES, :2].reshape(-1)
             all_traj.append([int(f.removesuffix(".pt"))] + traj.tolist())
 
@@ -690,10 +727,52 @@ class NBADataModule(L.LightningDataModule):
         return out
 
 
+def eval_tta_and_submit(model, data_module, logger=None):
+    """Compare plain vs 4-way TTA on val, then write the better submission."""
+    model.eval()
+    dev = model.device
+    se_plain = se_tta = n = 0.0
+    for X, A, V_tr, last_pos, abs_target in data_module.val_dataloader():
+        X, A, last_pos, abs_target = (t.to(dev) for t in (X, A, last_pos, abs_target))
+        plain = model._abs_mean(model(X, A, last_pos), last_pos)
+        tta = model.tta_abs_pred(X, A, last_pos)
+        se_plain += ((plain - abs_target) ** 2).sum().item()
+        se_tta += ((tta - abs_target) ** 2).sum().item()
+        n += abs_target.numel()
+    use_tta = (se_tta / n) < (se_plain / n)
+    print(f"[val] mse_ft plain={se_plain / n:.4f}  tta={se_tta / n:.4f}  -> submit tta={use_tta}")
+    if logger is not None:
+        logger.experiment.summary["val/mse_ft_tta"] = se_tta / n
+    data_module.get_kaggle_submission(model, str(TEST_DIR), str(SUBMISSION_DIR), tta=use_tta)
+
+
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--ckpt", type=str, default=None,
+        help="Eval-only: load this checkpoint, run plain-vs-TTA val comparison + submission (no training).",
+    )
+    args = parser.parse_args()
+
     L.seed_everything(0)
 
     GRAPH_SPACE = "pos"  # "pos" | "vel" | "both" — keep model & datamodule in sync
+
+    if args.ckpt:
+        # Reuse a trained model; reproduce its graph_space so inputs match.
+        model = NBASTGCNNLightningModel.load_from_checkpoint(args.ckpt)
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        model.to(dev)
+        data_module = NBADataModule(
+            split_path=str(PROJECT_ROOT / "splits" / "fold0.json"),
+            batch_size=128,
+            graph_space=model.hparams.graph_space,
+        )
+        data_module.setup()
+        eval_tta_and_submit(model, data_module)
+        sys.exit(0)
 
     data_module = NBADataModule(
         split_path=str(PROJECT_ROOT / "splits" / "fold0.json"),
@@ -702,7 +781,8 @@ if __name__ == "__main__":
     )
 
     model = NBASTGCNNLightningModel(
-        loss_mode="mse", optimizer="adam", graph_space=GRAPH_SPACE, decoder="autoreg"
+        loss_mode="mse", optimizer="adam", graph_space=GRAPH_SPACE,
+        decoder="autoreg", augment=False,  # aug didn't help (not overfitting)
     )
 
     h = model.hparams
@@ -724,4 +804,4 @@ if __name__ == "__main__":
 
     trainer.fit(model, data_module)
 
-    data_module.get_kaggle_submission(model, str(TEST_DIR), str(SUBMISSION_DIR))
+    eval_tta_and_submit(model, data_module, logger=wandb_logger)
