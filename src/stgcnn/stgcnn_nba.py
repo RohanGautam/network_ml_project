@@ -134,17 +134,20 @@ class st_gcn(nn.Module):
 
 class social_stgcnn(nn.Module):
     def __init__(
-        self, n_stgcnn=1, n_txpcnn=1, input_feat=2, output_feat=5,
+        self, n_stgcnn=1, n_txpcnn=1, input_feat=2, hidden_feat=5, output_feat=5,
         seq_len=8, pred_seq_len=12, kernel_size=3,
     ):
         super().__init__()
         self.n_stgcnn = n_stgcnn
         self.n_txpcnn = n_txpcnn
 
+        # ST-GCN stack runs at hidden_feat width (reference tied this to the
+        # 5-param output, leaving no hidden representation); a 1×1 conv at the
+        # very end projects hidden_feat -> output_feat (the Gaussian params).
         self.st_gcns = nn.ModuleList()
-        self.st_gcns.append(st_gcn(input_feat, output_feat, (kernel_size, seq_len)))
+        self.st_gcns.append(st_gcn(input_feat, hidden_feat, (kernel_size, seq_len)))
         for _ in range(1, self.n_stgcnn):
-            self.st_gcns.append(st_gcn(output_feat, output_feat, (kernel_size, seq_len)))
+            self.st_gcns.append(st_gcn(hidden_feat, hidden_feat, (kernel_size, seq_len)))
 
         self.tpcnns = nn.ModuleList()
         self.tpcnns.append(nn.Conv2d(seq_len, pred_seq_len, 3, padding=1))
@@ -153,10 +156,11 @@ class social_stgcnn(nn.Module):
         self.tpcnn_ouput = nn.Conv2d(pred_seq_len, pred_seq_len, 3, padding=1)
 
         self.prelus = nn.ModuleList([nn.PReLU() for _ in range(self.n_txpcnn)])
+        self.output_proj = nn.Conv2d(hidden_feat, output_feat, 1)
 
     def forward(self, v, a):
         for k in range(self.n_stgcnn):
-            v, a = self.st_gcns[k](v, a)
+            v, a = self.st_gcns[k](v, a)  # [B, hidden, obs, N]
 
         # Reference's view-based reshuffle of (channels ↔ time): [B,C,T,V] -> [B,T,C,V]
         # so the TXP convs treat the time axis as channels. (A reshape, not a
@@ -167,7 +171,8 @@ class social_stgcnn(nn.Module):
         for k in range(1, self.n_txpcnn - 1):
             v = self.prelus[k](self.tpcnns[k](v)) + v
         v = self.tpcnn_ouput(v)
-        v = v.view(v.shape[0], v.shape[2], v.shape[1], v.shape[3])
+        v = v.view(v.shape[0], v.shape[2], v.shape[1], v.shape[3])  # [B, hidden, pred, N]
+        v = self.output_proj(v)  # [B, output_feat, pred, N]
         return v, a
 
 
@@ -267,17 +272,19 @@ class NBADataset(Dataset):
         self.load_data(files)
 
     def load_data(self, files):
-        self.sequences = []  # absolute coords [T, N, 2], raw feet
+        self.sequences = []  # full features [T, N, 4]: x, y, isplayer, team
         self.max_start = []
         for f in files:
             seq = torch.load(f, weights_only=False).float()
-            self.sequences.append(seq[:, :, :2])
+            self.sequences.append(seq[:, :, :4])
             self.max_start.append(max(0, len(seq) - self.window_size))
 
     def __getitem__(self, index):
         seq_idx, start = index
         c = self.context_size
-        abs_win = self.sequences[seq_idx][start : start + self.window_size]  # [W, N, 2]
+        win = self.sequences[seq_idx][start : start + self.window_size]  # [W, N, 4]
+        abs_win = win[:, :, :2]
+        static = win[c - 1, :, 2:4]  # [N, 2] isplayer, team — static over time
 
         rel = torch.zeros_like(abs_win)
         rel[1:] = abs_win[1:] - abs_win[:-1]  # displacement; rel[0]=0
@@ -285,7 +292,10 @@ class NBADataset(Dataset):
         rel_obs = rel[:c]  # [obs, N, 2]
         V_tr = rel[c:]  # [pred, N, 2]
         A = build_graph(rel_obs)  # [obs, N, N]
-        X = rel_obs.permute(2, 0, 1)  # [2, obs, N]
+        # Node features [dx, dy, isplayer, team]; static feats broadcast over time.
+        static_obs = static.unsqueeze(0).expand(c, -1, -1)  # [obs, N, 2]
+        feat = torch.cat([rel_obs, static_obs], dim=-1)  # [obs, N, 4]
+        X = feat.permute(2, 0, 1)  # [4, obs, N]
         last_pos = abs_win[c - 1]  # [N, 2]
         abs_target = abs_win[c:]  # [pred, N, 2]
         return X, A, V_tr, last_pos, abs_target
@@ -334,9 +344,11 @@ class NBASTGCNNLightningModel(L.LightningModule):
         self,
         context_size: int = 8,
         horizon_size: int = 12,
-        n_stgcnn: int = 1,
+        n_stgcnn: int = 2,
         n_txpcnn: int = 5,
+        hidden_feat: int = 64,
         kernel_size: int = 3,
+        use_identity: bool = True,  # feed [isplayer, team] as node features
         optimizer: str = "adam",  # "adam" | "sgd"
         lr: float = 1e-3,
         weight_decay: float = 0.0,
@@ -351,7 +363,8 @@ class NBASTGCNNLightningModel(L.LightningModule):
         self.net = social_stgcnn(
             n_stgcnn=n_stgcnn,
             n_txpcnn=n_txpcnn,
-            input_feat=2,
+            input_feat=4 if use_identity else 2,
+            hidden_feat=hidden_feat,
             output_feat=5,
             seq_len=context_size,
             pred_seq_len=horizon_size,
@@ -359,7 +372,9 @@ class NBASTGCNNLightningModel(L.LightningModule):
         )
 
     def forward(self, X: Tensor, A: Tensor) -> Tensor:
-        # X [B,2,obs,N], A [B,obs,N,N] -> V_pred [B, pred, N, 5]
+        # X [B,4,obs,N], A [B,obs,N,N] -> V_pred [B, pred, N, 5]
+        if not self.hparams.use_identity:
+            X = X[:, :2]  # drop [isplayer, team] channels
         v, _ = self.net(X, A)  # [B, 5, pred, N]
         return v.permute(0, 2, 3, 1)
 
@@ -425,6 +440,33 @@ class NBASTGCNNLightningModel(L.LightningModule):
             self.log(f"val/min_fde_ft_k{k}", compute_min_fde(samples_flat, target_flat), on_epoch=True)
             self.log(f"val/min_mse_ft_k{k}", compute_min_mse(samples_flat, target_flat), on_epoch=True)
 
+        self._log_diagnostics(X, last_pos, abs_pred, abs_target)
+
+    def _log_diagnostics(self, X, last_pos, abs_pred, abs_target):
+        """Where does the error live? Ball-vs-players, per-step, and the
+        constant-velocity baseline — logged so we can read them off W&B."""
+        B, T, N, _ = abs_pred.shape
+        sq = ((abs_pred - abs_target) ** 2).mean(-1)  # [B, T, N] (mean over x,y)
+
+        # Ball vs players. Dataset packs node features [dx,dy,isplayer,team];
+        # the ball is the entity with isplayer == 0.
+        isplayer = X[:, 2, 0, :]  # [B, N] at first observed frame
+        ball = (isplayer == 0).unsqueeze(1).expand(B, T, N)  # [B, T, N]
+        self.log("val/mse_ball", sq[ball].mean(), on_epoch=True)
+        self.log("val/mse_players", sq[~ball].mean(), on_epoch=True)
+
+        # Error growth across the horizon (first / middle / last step).
+        per_t = sq.mean(dim=(0, 2))  # [T]
+        self.log("val/mse_t1", per_t[0], on_epoch=True)
+        self.log("val/mse_tmid", per_t[T // 2], on_epoch=True)
+        self.log("val/mse_tlast", per_t[-1], on_epoch=True)
+
+        # Constant-velocity baseline: extrapolate the last observed velocity.
+        last_vel = X[:, :2, -1, :].permute(0, 2, 1)  # [B, N, 2]
+        steps = torch.arange(1, T + 1, device=X.device).view(1, T, 1, 1)
+        abs_cv = last_pos.unsqueeze(1) + steps * last_vel.unsqueeze(1)  # [B, T, N, 2]
+        self.log("val/cv_mse", ((abs_cv - abs_target) ** 2).mean(), on_epoch=True)
+
     def configure_optimizers(self):
         if self.hparams.optimizer == "adam":
             return torch.optim.Adam(
@@ -485,11 +527,14 @@ class NBADataModule(L.LightningDataModule):
                 continue
             seq = torch.load(os.path.join(test_dir, f), weights_only=False).float()
             abs_obs = seq[:, :, :2]  # [obs, N, 2]
+            static = seq[c - 1, :, 2:4]  # [N, 2] isplayer, team
             rel_obs = torch.zeros_like(abs_obs)
             rel_obs[1:] = abs_obs[1:] - abs_obs[:-1]
 
             A = build_graph(rel_obs).unsqueeze(0)  # [1, obs, N, N]
-            X = rel_obs.permute(2, 0, 1).unsqueeze(0)  # [1, 2, obs, N]
+            static_obs = static.unsqueeze(0).expand(rel_obs.shape[0], -1, -1)  # [obs, N, 2]
+            feat = torch.cat([rel_obs, static_obs], dim=-1)  # [obs, N, 4]
+            X = feat.permute(2, 0, 1).unsqueeze(0)  # [1, 4, obs, N]
             last_pos = abs_obs[c - 1].unsqueeze(0)  # [1, N, 2]
 
             abs_pred = model.predict_abs_mean(X, A, last_pos)[0]  # [pred, N, 2]
@@ -527,9 +572,11 @@ if __name__ == "__main__":
 
     model = NBASTGCNNLightningModel(loss_mode="mse", optimizer="adam")
 
+    h = model.hparams
     wandb_logger = WandbLogger(
         project="NML_base",
-        name=f"stgcnn_{model.hparams.loss_mode}_{model.hparams.optimizer}",
+        name=f"stgcnn_{h.loss_mode}_{h.optimizer}_h{h.hidden_feat}_st{h.n_stgcnn}"
+        + ("_id" if h.use_identity else ""),
     )
     checkpoint = ModelCheckpoint(monitor="val/mse_ft", mode="min", save_top_k=1)
 
