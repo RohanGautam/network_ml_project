@@ -178,18 +178,25 @@ class NBADNRILightningModel(L.LightningModule):
             X = X.clone()
             y = y.clone()
 
-            # Apply X-axis flip (Lengthwise court flip)
-            # Targets X-position (0) and X-velocity (2)
+            # Reflect about the COURT CENTER (raw origin), not the data mean.
+            # Positions are normalized as n = (raw - mu)/sigma; reflecting raw about 0
+            # maps n -> -n - 2*mu/sigma. Velocities are position differences
+            # (translation-invariant), so they simply negate.
+            cx = 2.0 * self.mu[0] / self.sigma[0]
+            cy = 2.0 * self.mu[1] / self.sigma[1]
+
+            # X-axis flip (reflection across the court's vertical center line)
             if flip_x_mask.any():
-                X[flip_x_mask, :, :, 0] *= -1
+                X[flip_x_mask, :, :, 0] = -X[flip_x_mask, :, :, 0] - cx
+                y[flip_x_mask, :, :, 0] = -y[flip_x_mask, :, :, 0] - cx
                 X[flip_x_mask, :, :, 2] *= -1
-                y[flip_x_mask, :, :, 0] *= -1
                 y[flip_x_mask, :, :, 2] *= -1
 
+            # Y-axis flip (reflection across the court's horizontal center line)
             if flip_y_mask.any():
-                X[flip_y_mask, :, :, 1] *= -1
+                X[flip_y_mask, :, :, 1] = -X[flip_y_mask, :, :, 1] - cy
+                y[flip_y_mask, :, :, 1] = -y[flip_y_mask, :, :, 1] - cy
                 X[flip_y_mask, :, :, 3] *= -1
-                y[flip_y_mask, :, :, 1] *= -1
                 y[flip_y_mask, :, :, 3] *= -1
 
         inputs = self._full_window(X, y)  # [B, C+H, N, 4]
@@ -405,12 +412,16 @@ def train(args):
         split_path=str(PROJECT_ROOT / "splits" / "fold0.json"),
         batch_size=args.batch_size,
         seed=args.seed,
+        add_hoops=args.add_hoops,
     )
+
+    # 11 entities (10 players + ball), plus 2 hoop landmark nodes when enabled.
+    num_vars = 13 if args.add_hoops else 11
 
     model = NBADNRILightningModel(
         context_size=8,
         horizon_size=12,
-        num_vars=13,  # 11 entities (10 players + ball) + 2 hoop landmark nodes
+        num_vars=num_vars,
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
@@ -445,6 +456,11 @@ if __name__ == "__main__":
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--wandb", action="store_true")
+    parser.add_argument(
+        "--add-hoops",
+        action="store_true",
+        help="Append 2 static hoop landmark nodes (N=11 -> 13).",
+    )
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument(
         "--submit", action="store_true", help="Write Kaggle submission after training."
