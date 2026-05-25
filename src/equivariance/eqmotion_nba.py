@@ -29,16 +29,22 @@ COURT_IMAGE = PROJECT_ROOT / "src" / "img" / "basketball_court.png"
 
 
 class NBADataset(Dataset):
-    def __init__(self, files, context_size, horizon_size, mu, sigma):
+    def __init__(self, files, context_size, horizon_size, mu, sigma, add_hoops=False):
         super().__init__()
         self.context_size = context_size
         self.horizon_size = horizon_size
         self.window_size = context_size + horizon_size
+        self.add_hoops = add_hoops
         self.load_data(files, mu, sigma)
 
     def load_data(self, files, mu, sigma):
         self.sequences = []
         self.max_start = []
+        # Data is in a court-centered frame (origin at center, x in [-48,48]=length,
+        # y in [-26,26]=width). Hoops sit 5.25 ft in from each baseline (x=+-47) at
+        # center width: x = +-(47-5.25) = +-41.75, y = 0.
+        raw_hoops = torch.tensor([[-41.75, 0.0], [41.75, 0.0]])
+        norm_hoops = (raw_hoops - mu) / sigma
         for f in files:
             seq = torch.load(f, weights_only=False)
             seq[:, :, [0, 1]] = (seq[:, :, [0, 1]].clone() - mu) / sigma
@@ -46,6 +52,17 @@ class NBADataset(Dataset):
             vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
             # feature layout: [x, y, dx, dy, isplayer, team]
             seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
+
+            if self.add_hoops:
+                # Append 2 static landmark nodes: [T, 11, 6] -> [T, 13, 6]
+                T = seq.shape[0]
+                hoop_nodes = torch.zeros((T, 2, 6), dtype=seq.dtype)
+                hoop_nodes[:, :, :2] = norm_hoops  # Broadcast normalized X, Y
+                hoop_nodes[:, :, 2:4] = 0.0  # Static: Velocity is zero
+                hoop_nodes[:, :, 4] = 0.0  # isplayer = 0
+                hoop_nodes[:, :, 5] = 3.0  # Unique "team" ID for landmarks
+                seq = torch.cat([seq, hoop_nodes], dim=1)
+
             self.sequences.append(seq)
             self.max_start.append(max(0, len(seq) - self.window_size))
 
@@ -230,12 +247,12 @@ class NBAEqMotionLightningModel(L.LightningModule):
             lr=self.hparams.lr,
             weight_decay=self.hparams.weight_decay,
         )
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=8, min_lr=1e-5
-        )
+        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        #     optimizer, mode="min", factor=0.5, patience=8, min_lr=1e-5
+        # )
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "monitor": "val/loss"},
+            # "lr_scheduler": {"scheduler": scheduler, "monitor": "val/loss"},
         }
 
     def get_trajectory(self, X: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
@@ -252,7 +269,13 @@ class NBAEqMotionLightningModel(L.LightningModule):
 
 class NBADataModule(L.LightningDataModule):
     def __init__(
-        self, split_path, batch_size=64, context_size=8, horizon_size=12, seed=0
+        self,
+        split_path,
+        batch_size=64,
+        context_size=8,
+        horizon_size=12,
+        seed=0,
+        add_hoops=False,
     ):
         super().__init__()
         self.split_path = split_path
@@ -260,6 +283,7 @@ class NBADataModule(L.LightningDataModule):
         self.context_size = context_size
         self.horizon_size = horizon_size
         self.seed = seed
+        self.add_hoops = add_hoops
         self.mu = None
         self.sigma = None
 
@@ -270,10 +294,12 @@ class NBADataModule(L.LightningDataModule):
         val_files = [data_dir / f for f in manifest["val"]]
         self.mu, self.sigma = self._compute_normalization_statistics(train_files)
         self.train_dataset = NBADataset(
-            train_files, self.context_size, self.horizon_size, self.mu, self.sigma
+            train_files, self.context_size, self.horizon_size, self.mu, self.sigma,
+            add_hoops=self.add_hoops,
         )
         self.val_dataset = NBADataset(
-            val_files, self.context_size, self.horizon_size, self.mu, self.sigma
+            val_files, self.context_size, self.horizon_size, self.mu, self.sigma,
+            add_hoops=self.add_hoops,
         )
 
     def _compute_normalization_statistics(self, files):
@@ -310,8 +336,21 @@ class NBADataModule(L.LightningDataModule):
             vel = torch.zeros_like(seq[:, :, :2])
             vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
             seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
+
+            if self.add_hoops:
+                T = seq.shape[0]
+                # Court-centered frame: hoops at x=+-41.75 (5.25 ft in), y=0.
+                raw_hoops = torch.tensor([[-41.75, 0.0], [41.75, 0.0]])
+                norm_hoops = (raw_hoops - self.mu) / self.sigma
+                hoop_nodes = torch.zeros((T, 2, 6), dtype=seq.dtype)
+                hoop_nodes[:, :, :2] = norm_hoops
+                hoop_nodes[:, :, 4] = 0.0
+                hoop_nodes[:, :, 5] = 3.0
+                seq = torch.cat([seq, hoop_nodes], dim=1)
+
             traj = model.get_trajectory(seq, self.mu, self.sigma)
-            traj = traj[8:, :, :2].reshape(-1)
+            # traj = traj[8:, :, :2].reshape(-1)
+            traj = traj[8:, :11, :2].reshape(-1)
             all_traj.append([int(f.removesuffix(".pt"))] + traj.tolist())
         df = (
             pd.DataFrame(
@@ -336,21 +375,21 @@ if __name__ == "__main__":
 
     data_module = NBADataModule(
         split_path=str(PROJECT_ROOT / "splits" / "fold0.json"),
-        batch_size=64,
+        batch_size=256,
     )
 
-    model = NBAEqMotionLightningModel(lr=1e-3)
+    model = NBAEqMotionLightningModel(lr=1e-4)
 
     wandb_logger = WandbLogger(project="NML_base", name="eqmotion")
 
     early_stop = EarlyStopping(monitor="val/loss", patience=20, mode="min")
 
     trainer = L.Trainer(
-        max_epochs=200,
+        max_epochs=500,
         logger=wandb_logger,
         accelerator="auto",
         gradient_clip_val=1.0,
-        callbacks=[early_stop],
+        # callbacks=[early_stop],
     )
 
     trainer.fit(model, data_module)
