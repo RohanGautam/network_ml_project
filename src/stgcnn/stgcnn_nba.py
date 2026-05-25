@@ -597,7 +597,7 @@ class NBADataModule(L.LightningDataModule):
 if __name__ == "__main__":
     L.seed_everything(0)
 
-    GRAPH_SPACE = "pos"  # "pos" | "vel" | "both" — keep model & datamodule in sync
+    GRAPH_SPACE = "both"  # "pos" | "vel" | "both" — keep model & datamodule in sync
 
     data_module = NBADataModule(
         split_path=str(PROJECT_ROOT / "splits" / "fold0.json"),
