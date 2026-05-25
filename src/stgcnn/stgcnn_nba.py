@@ -337,11 +337,15 @@ class NBASTGCNNLightningModel(L.LightningModule):
         n_stgcnn: int = 1,
         n_txpcnn: int = 5,
         kernel_size: int = 3,
-        lr: float = 0.01,
-        lr_step: int = 150,
-        lr_gamma: float = 0.2,
+        optimizer: str = "adam",  # "adam" | "sgd"
+        lr: float = 1e-3,
+        weight_decay: float = 0.0,
         n_samples: int = 20,
+        loss_mode: str = "mse",   # "mse" | "nll" | "nll+mse"
+        mse_weight: float = 1.0,  # λ on the MSE term in "nll+mse"
     ):
+        assert loss_mode in ("mse", "nll", "nll+mse")
+        assert optimizer in ("adam", "sgd")
         super().__init__()
         self.save_hyperparameters()
         self.net = social_stgcnn(
@@ -359,23 +363,50 @@ class NBASTGCNNLightningModel(L.LightningModule):
         v, _ = self.net(X, A)  # [B, 5, pred, N]
         return v.permute(0, 2, 3, 1)
 
-    def training_step(self, batch, batch_idx):
-        X, A, V_tr, _, _ = batch
-        V_pred = self(X, A)
+    def _abs_mean(self, V_pred: Tensor, last_pos: Tensor) -> Tensor:
+        """Integrate the predicted mean displacement to absolute positions."""
+        return rel_to_abs(V_pred[..., :2], last_pos, time_dim=1)  # [B, T, N, 2]
+
+    def _losses(self, V_pred, V_tr, last_pos, abs_target):
+        """Return (total_loss, components dict) per the configured loss_mode.
+
+        MSE is computed on the *integrated absolute* trajectory, matching the
+        Kaggle metric exactly (so early-step errors are penalized through drift).
+        NLL is the reference bivariate-Gaussian loss on per-step displacements.
+        """
         B = V_pred.shape[0]
-        loss = bivariate_loss(V_pred.reshape(B, -1, 5), V_tr.reshape(B, -1, 2))
+        comps = {}
+        if self.hparams.loss_mode in ("nll", "nll+mse"):
+            comps["nll"] = bivariate_loss(V_pred.reshape(B, -1, 5), V_tr.reshape(B, -1, 2))
+        if self.hparams.loss_mode in ("mse", "nll+mse"):
+            abs_pred = self._abs_mean(V_pred, last_pos)
+            comps["mse"] = ((abs_pred - abs_target) ** 2).mean()
+
+        if self.hparams.loss_mode == "mse":
+            total = comps["mse"]
+        elif self.hparams.loss_mode == "nll":
+            total = comps["nll"]
+        else:
+            total = comps["nll"] + self.hparams.mse_weight * comps["mse"]
+        return total, comps
+
+    def training_step(self, batch, batch_idx):
+        X, A, V_tr, last_pos, abs_target = batch
+        V_pred = self(X, A)
+        loss, comps = self._losses(V_pred, V_tr, last_pos, abs_target)
         self.log("train/loss", loss, on_epoch=True, prog_bar=True)
+        for name, val in comps.items():
+            self.log(f"train/{name}", val, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         X, A, V_tr, last_pos, abs_target = batch
         V_pred = self(X, A)  # [B, pred, N, 5]
         B, T, N, _ = V_pred.shape
-        loss = bivariate_loss(V_pred.reshape(B, -1, 5), V_tr.reshape(B, -1, 2))
+        loss, _ = self._losses(V_pred, V_tr, last_pos, abs_target)
 
         # Mean-prediction metrics: integrate predicted mean displacement to abs.
-        mean_disp = V_pred[..., :2]  # [B, T, N, 2]
-        abs_pred = rel_to_abs(mean_disp, last_pos, time_dim=1)  # [B, T, N, 2]
+        abs_pred = self._abs_mean(V_pred, last_pos)  # [B, T, N, 2]
         pred_flat = abs_pred.permute(1, 0, 2, 3).reshape(T, B * N, 2)
         target_flat = abs_target.permute(1, 0, 2, 3).reshape(T, B * N, 2)
 
@@ -384,22 +415,26 @@ class NBASTGCNNLightningModel(L.LightningModule):
         self.log("val/fde_ft", compute_fde(pred_flat, target_flat), on_epoch=True, prog_bar=True)
         self.log("val/mse_ft", compute_mse(pred_flat, target_flat), on_epoch=True, prog_bar=True)
 
-        # Best-of-K metrics: sample displacements, integrate each, take the min.
-        k = self.hparams.n_samples
-        disp_samples = sample_displacements(V_pred, k)  # [K, B, T, N, 2]
-        abs_samples = rel_to_abs(disp_samples, last_pos.unsqueeze(0), time_dim=2)
-        samples_flat = abs_samples.permute(0, 2, 1, 3, 4).reshape(k, T, B * N, 2)
-        self.log(f"val/min_ade_ft_k{k}", compute_min_ade(samples_flat, target_flat), on_epoch=True)
-        self.log(f"val/min_fde_ft_k{k}", compute_min_fde(samples_flat, target_flat), on_epoch=True)
-        self.log(f"val/min_mse_ft_k{k}", compute_min_mse(samples_flat, target_flat), on_epoch=True)
+        # Best-of-K metrics only make sense when the Gaussian head is trained.
+        if "nll" in self.hparams.loss_mode:
+            k = self.hparams.n_samples
+            disp_samples = sample_displacements(V_pred, k)  # [K, B, T, N, 2]
+            abs_samples = rel_to_abs(disp_samples, last_pos.unsqueeze(0), time_dim=2)
+            samples_flat = abs_samples.permute(0, 2, 1, 3, 4).reshape(k, T, B * N, 2)
+            self.log(f"val/min_ade_ft_k{k}", compute_min_ade(samples_flat, target_flat), on_epoch=True)
+            self.log(f"val/min_fde_ft_k{k}", compute_min_fde(samples_flat, target_flat), on_epoch=True)
+            self.log(f"val/min_mse_ft_k{k}", compute_min_mse(samples_flat, target_flat), on_epoch=True)
 
     def configure_optimizers(self):
-        # Reference uses SGD + StepLR.
-        optimizer = torch.optim.SGD(self.parameters(), lr=self.hparams.lr)
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=self.hparams.lr_step, gamma=self.hparams.lr_gamma
+        if self.hparams.optimizer == "adam":
+            return torch.optim.Adam(
+                self.parameters(), lr=self.hparams.lr,
+                weight_decay=self.hparams.weight_decay,
+            )
+        return torch.optim.SGD(
+            self.parameters(), lr=self.hparams.lr,
+            weight_decay=self.hparams.weight_decay,
         )
-        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler}}
 
     @torch.no_grad()
     def predict_abs_mean(self, X: Tensor, A: Tensor, last_pos: Tensor) -> Tensor:
@@ -490,9 +525,12 @@ if __name__ == "__main__":
         batch_size=128,
     )
 
-    model = NBASTGCNNLightningModel()
+    model = NBASTGCNNLightningModel(loss_mode="mse", optimizer="adam")
 
-    wandb_logger = WandbLogger(project="NML_base", name="stgcnn")
+    wandb_logger = WandbLogger(
+        project="NML_base",
+        name=f"stgcnn_{model.hparams.loss_mode}_{model.hparams.optimizer}",
+    )
     checkpoint = ModelCheckpoint(monitor="val/mse_ft", mode="min", save_top_k=1)
 
     trainer = L.Trainer(
