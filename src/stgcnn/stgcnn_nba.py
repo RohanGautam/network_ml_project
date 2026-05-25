@@ -69,24 +69,27 @@ N_ENTITIES = 11  # 10 players + ball
 
 
 class ConvTemporalGraphical(nn.Module):
-    """Graph convolution: 1×1 temporal conv then neighbor aggregation via A.
+    """Multi-relation graph convolution.
 
-    Reference einsum was ``'nctv,tvw->nctw'`` (one shared graph per batch, hence
-    the original batch_size=1). Here A carries a batch axis — ``'nctv,ntvw->nctw'``
-    — so each sample uses its own per-frame graph.
+    `kernel_size` is the number of relation types K (e.g. position + velocity).
+    A 1×1 conv produces K separate feature blocks; each is aggregated with its
+    own relation graph and the results are summed — the standard ST-GCN spatial
+    partition, here repurposed for relation types. A carries a batch axis so each
+    sample uses its own per-frame graphs.
     """
 
-    def __init__(self, in_channels, out_channels, kernel_size, t_kernel_size=1):
+    def __init__(self, in_channels, out_channels, kernel_size):
         super().__init__()
-        self.kernel_size = kernel_size
-        self.conv = nn.Conv2d(
-            in_channels, out_channels, kernel_size=(t_kernel_size, 1)
-        )
+        self.kernel_size = kernel_size  # number of relations K
+        self.out_channels = out_channels
+        self.conv = nn.Conv2d(in_channels, out_channels * kernel_size, kernel_size=(1, 1))
 
     def forward(self, x, A):
-        # x: [B, C, T, V]   A: [B, T, V, V]
+        # x: [B, C_in, T, V]   A: [B, K, T, V, V]
         x = self.conv(x)
-        x = torch.einsum("nctv,ntvw->nctw", (x, A))
+        B, _, T, V = x.shape
+        x = x.view(B, self.kernel_size, self.out_channels, T, V)
+        x = torch.einsum("nkctv,nktvw->nctw", (x, A))
         return x.contiguous(), A
 
 
@@ -135,7 +138,7 @@ class st_gcn(nn.Module):
 class social_stgcnn(nn.Module):
     def __init__(
         self, n_stgcnn=1, n_txpcnn=1, input_feat=2, hidden_feat=5, output_feat=5,
-        seq_len=8, pred_seq_len=12, kernel_size=3,
+        seq_len=8, pred_seq_len=12, kernel_size=3, n_relations=1,
     ):
         super().__init__()
         self.n_stgcnn = n_stgcnn
@@ -144,10 +147,11 @@ class social_stgcnn(nn.Module):
         # ST-GCN stack runs at hidden_feat width (reference tied this to the
         # 5-param output, leaving no hidden representation); a 1×1 conv at the
         # very end projects hidden_feat -> output_feat (the Gaussian params).
+        # The spatial kernel is the number of relation types (n_relations).
         self.st_gcns = nn.ModuleList()
-        self.st_gcns.append(st_gcn(input_feat, hidden_feat, (kernel_size, seq_len)))
+        self.st_gcns.append(st_gcn(input_feat, hidden_feat, (kernel_size, n_relations)))
         for _ in range(1, self.n_stgcnn):
-            self.st_gcns.append(st_gcn(hidden_feat, hidden_feat, (kernel_size, seq_len)))
+            self.st_gcns.append(st_gcn(hidden_feat, hidden_feat, (kernel_size, n_relations)))
 
         self.tpcnns = nn.ModuleList()
         self.tpcnns.append(nn.Conv2d(seq_len, pred_seq_len, 3, padding=1))
@@ -179,15 +183,14 @@ class social_stgcnn(nn.Module):
 # ── Graph + loss helpers (faithful to ref_code/utils.py & metrics.py) ──────────
 
 
-def build_graph(rel_obs: Tensor) -> Tensor:
-    """Per-frame normalized-Laplacian graph from relative coords.
+def _laplacian_from(coords: Tensor) -> Tensor:
+    """Per-frame normalized Laplacian from reciprocal distances in `coords`.
 
-    rel_obs: [T, N, 2] displacement features. Returns A: [T, N, N].
-    Edge weight = 1/‖relᵢ − relⱼ‖ (0 if coincident), unit self-loop, then
-    L = I − D^{-1/2} A D^{-1/2} — matching anorm + nx.normalized_laplacian_matrix.
+    coords: [T, N, 2] -> [T, N, N]. Edge weight = 1/‖·‖ (0 if coincident),
+    unit self-loop, then L = I − D^{-1/2} A D^{-1/2} (anorm + normalized Laplacian).
     """
-    T, N, _ = rel_obs.shape
-    dist = torch.cdist(rel_obs, rel_obs)  # [T, N, N]
+    T, N, _ = coords.shape
+    dist = torch.cdist(coords, coords)  # [T, N, N]
     A = torch.where(dist > 0, 1.0 / dist, torch.zeros_like(dist))
     eye = torch.eye(N, dtype=torch.bool)
     A[:, eye] = 1.0  # unit self-loops
@@ -197,6 +200,25 @@ def build_graph(rel_obs: Tensor) -> Tensor:
     D_inv = torch.diag_embed(d_inv_sqrt)  # [T, N, N]
     eye_T = torch.eye(N).expand(T, N, N)
     return eye_T - D_inv @ A @ D_inv
+
+
+def build_graph(abs_obs: Tensor, rel_obs: Tensor, space: str) -> Tensor:
+    """Stack per-relation graphs -> [R, T, N, N].
+
+    space: "pos" → proximity in absolute position (who is near whom — the ball
+    connects to its nearby handler), "vel" → similarity in velocity (the original
+    reference graph), "both" → two relation channels the model weights separately.
+    """
+    rels = []
+    if space in ("pos", "both"):
+        rels.append(_laplacian_from(abs_obs))
+    if space in ("vel", "both"):
+        rels.append(_laplacian_from(rel_obs))
+    return torch.stack(rels, dim=0)  # [R, T, N, N]
+
+
+def n_relations_for(space: str) -> int:
+    return 2 if space == "both" else 1
 
 
 def bivariate_loss(V_pred: Tensor, V_trgt: Tensor) -> Tensor:
@@ -264,11 +286,12 @@ class NBADataset(Dataset):
     abs_target[pred, N, 2]  absolute future positions (metric ground truth)
     """
 
-    def __init__(self, files, context_size, horizon_size):
+    def __init__(self, files, context_size, horizon_size, graph_space="pos"):
         super().__init__()
         self.context_size = context_size
         self.horizon_size = horizon_size
         self.window_size = context_size + horizon_size
+        self.graph_space = graph_space
         self.load_data(files)
 
     def load_data(self, files):
@@ -291,7 +314,7 @@ class NBADataset(Dataset):
 
         rel_obs = rel[:c]  # [obs, N, 2]
         V_tr = rel[c:]  # [pred, N, 2]
-        A = build_graph(rel_obs)  # [obs, N, N]
+        A = build_graph(abs_win[:c], rel_obs, self.graph_space)  # [R, obs, N, N]
         # Node features [dx, dy, isplayer, team]; static feats broadcast over time.
         static_obs = static.unsqueeze(0).expand(c, -1, -1)  # [obs, N, 2]
         feat = torch.cat([rel_obs, static_obs], dim=-1)  # [obs, N, 4]
@@ -348,6 +371,7 @@ class NBASTGCNNLightningModel(L.LightningModule):
         n_txpcnn: int = 5,
         hidden_feat: int = 64,
         kernel_size: int = 3,
+        graph_space: str = "pos",  # "pos" | "vel" | "both" — must match datamodule
         use_identity: bool = True,  # feed [isplayer, team] as node features
         optimizer: str = "adam",  # "adam" | "sgd"
         lr: float = 1e-3,
@@ -358,6 +382,7 @@ class NBASTGCNNLightningModel(L.LightningModule):
     ):
         assert loss_mode in ("mse", "nll", "nll+mse")
         assert optimizer in ("adam", "sgd")
+        assert graph_space in ("pos", "vel", "both")
         super().__init__()
         self.save_hyperparameters()
         self.net = social_stgcnn(
@@ -369,6 +394,7 @@ class NBASTGCNNLightningModel(L.LightningModule):
             seq_len=context_size,
             pred_seq_len=horizon_size,
             kernel_size=kernel_size,
+            n_relations=n_relations_for(graph_space),
         )
 
     def forward(self, X: Tensor, A: Tensor) -> Tensor:
@@ -491,21 +517,27 @@ class NBASTGCNNLightningModel(L.LightningModule):
 
 
 class NBADataModule(L.LightningDataModule):
-    def __init__(self, split_path, batch_size=128, context_size=8, horizon_size=12, seed=0):
+    def __init__(self, split_path, batch_size=128, context_size=8, horizon_size=12,
+                 seed=0, graph_space="pos"):
         super().__init__()
         self.split_path = split_path
         self.batch_size = batch_size
         self.context_size = context_size
         self.horizon_size = horizon_size
         self.seed = seed
+        self.graph_space = graph_space
 
     def setup(self, stage=None):
         manifest = json.loads(Path(self.split_path).read_text())
         data_dir = PROJECT_ROOT / manifest["data_dir"]
         train_files = [data_dir / f for f in manifest["train"]]
         val_files = [data_dir / f for f in manifest["val"]]
-        self.train_dataset = NBADataset(train_files, self.context_size, self.horizon_size)
-        self.val_dataset = NBADataset(val_files, self.context_size, self.horizon_size)
+        self.train_dataset = NBADataset(
+            train_files, self.context_size, self.horizon_size, self.graph_space
+        )
+        self.val_dataset = NBADataset(
+            val_files, self.context_size, self.horizon_size, self.graph_space
+        )
 
     def train_dataloader(self):
         sampler = NBASampler(
@@ -531,7 +563,7 @@ class NBADataModule(L.LightningDataModule):
             rel_obs = torch.zeros_like(abs_obs)
             rel_obs[1:] = abs_obs[1:] - abs_obs[:-1]
 
-            A = build_graph(rel_obs).unsqueeze(0)  # [1, obs, N, N]
+            A = build_graph(abs_obs, rel_obs, self.graph_space).unsqueeze(0)  # [1, R, obs, N, N]
             static_obs = static.unsqueeze(0).expand(rel_obs.shape[0], -1, -1)  # [obs, N, 2]
             feat = torch.cat([rel_obs, static_obs], dim=-1)  # [obs, N, 4]
             X = feat.permute(2, 0, 1).unsqueeze(0)  # [1, 4, obs, N]
@@ -565,17 +597,23 @@ class NBADataModule(L.LightningDataModule):
 if __name__ == "__main__":
     L.seed_everything(0)
 
+    GRAPH_SPACE = "pos"  # "pos" | "vel" | "both" — keep model & datamodule in sync
+
     data_module = NBADataModule(
         split_path=str(PROJECT_ROOT / "splits" / "fold0.json"),
         batch_size=128,
+        graph_space=GRAPH_SPACE,
     )
 
-    model = NBASTGCNNLightningModel(loss_mode="mse", optimizer="adam")
+    model = NBASTGCNNLightningModel(
+        loss_mode="mse", optimizer="adam", graph_space=GRAPH_SPACE
+    )
 
     h = model.hparams
     wandb_logger = WandbLogger(
         project="NML_base",
         name=f"stgcnn_{h.loss_mode}_{h.optimizer}_h{h.hidden_feat}_st{h.n_stgcnn}"
+        + f"_{h.graph_space}"
         + ("_id" if h.use_identity else ""),
     )
     checkpoint = ModelCheckpoint(monitor="val/mse_ft", mode="min", save_top_k=1)
