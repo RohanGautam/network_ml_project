@@ -110,6 +110,34 @@ class NBASampler(Sampler):
         return len(self.max_start)
 
 
+class NBAEvalSampler(Sampler):
+    """Deterministic validation windows for a stable, low-variance val metric.
+
+    Instead of one *random* window per sequence per epoch (which makes val/mse_ft
+    bounce between epochs and yields a noisy checkpoint-selection signal), this
+    enumerates a fixed set of evenly-spaced windows per sequence. Each sequence
+    contributes the same number of windows (capped at its valid count), so long
+    sequences are not over-weighted — mirroring the test set's one-window-per-id
+    structure while averaging out window-position variance.
+    """
+
+    def __init__(self, max_start, windows_per_seq=8):
+        self.windows = []
+        for i, ms in enumerate(max_start):
+            if ms <= 0:
+                starts = [0]
+            else:
+                k = min(windows_per_seq, ms + 1)
+                starts = sorted({int(round(s)) for s in torch.linspace(0, ms, k).tolist()})
+            self.windows.extend((i, s) for s in starts)
+
+    def __iter__(self):
+        return iter(self.windows)
+
+    def __len__(self):
+        return len(self.windows)
+
+
 class MultiStepMSE:
     def __init__(self):
         self.loss_fn = torch.nn.MSELoss()
@@ -304,6 +332,8 @@ class NBADataModule(L.LightningDataModule):
         seed=0,
         add_hoops=False,
         iso_norm=False,
+        full_val=False,
+        val_windows_per_seq=8,
     ):
         super().__init__()
         self.split_path = split_path
@@ -313,6 +343,8 @@ class NBADataModule(L.LightningDataModule):
         self.seed = seed
         self.add_hoops = add_hoops
         self.iso_norm = iso_norm
+        self.full_val = full_val
+        self.val_windows_per_seq = val_windows_per_seq
         self.mu = None
         self.sigma = None
 
@@ -357,9 +389,16 @@ class NBADataModule(L.LightningDataModule):
         )
 
     def val_dataloader(self):
-        sampler = NBASampler(
-            self.batch_size, self.val_dataset.max_start, seed=self.seed, shuffle=False
-        )
+        if self.full_val:
+            # Deterministic, evenly-spaced windows → stable val/mse_ft for robust
+            # checkpoint selection (no epoch-to-epoch window-draw noise).
+            sampler = NBAEvalSampler(
+                self.val_dataset.max_start, windows_per_seq=self.val_windows_per_seq
+            )
+        else:
+            sampler = NBASampler(
+                self.batch_size, self.val_dataset.max_start, seed=self.seed, shuffle=False
+            )
         return DataLoader(self.val_dataset, batch_size=self.batch_size, sampler=sampler)
 
     def get_kaggle_submission(
@@ -427,6 +466,10 @@ if __name__ == "__main__":
     p.add_argument("--lr-scheduler", default="cosine", choices=["none", "cosine", "plateau"])
     p.add_argument("--warmup-epochs", type=int, default=5)
     p.add_argument("--iso-norm", action="store_true")
+    p.add_argument("--full-val", action="store_true",
+                   help="Deterministic multi-window validation for a stable val/mse_ft.")
+    p.add_argument("--val-windows", type=int, default=8,
+                   help="Windows per sequence for --full-val.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-submit", action="store_true")
     args = p.parse_args()
@@ -438,6 +481,8 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         seed=args.seed,
         iso_norm=args.iso_norm,
+        full_val=args.full_val,
+        val_windows_per_seq=args.val_windows,
     )
 
     model = NBAEqMotionLightningModel(
@@ -476,4 +521,10 @@ if __name__ == "__main__":
     print(f"[{args.run_name}] best val/mse_ft = {ckpt_cb.best_model_score.item():.4f}")
 
     if not args.no_submit:
-        data_module.get_kaggle_submission(model, str(TEST_DIR), str(SUBMISSION_DIR))
+        # Submit from the BEST checkpoint, not the final-epoch model in memory
+        # (final epoch is typically worse than the checkpointed minimum).
+        best = NBAEqMotionLightningModel.load_from_checkpoint(
+            ckpt_cb.best_model_path, strict=False
+        ).to(model.device).eval()
+        data_module.get_kaggle_submission(best, str(TEST_DIR), str(SUBMISSION_DIR))
+        print(f"[{args.run_name}] submission written from {ckpt_cb.best_model_path}")
