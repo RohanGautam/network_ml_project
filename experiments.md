@@ -47,8 +47,17 @@ regime they were measured in.
 | iso_sched_fv | **iso** | cosine | no | full-val | **3.46** | 3.5 | honest; val→Kaggle gap ~0.04 |
 | iso_big_fv | iso | cosine | no | full-val | 3.88 | – | bigger still worse |
 | iso_hoops_fv | iso | cosine | **yes** | full-val (13-node, buggy) | 2.82 | 3.2 | metric deflated by hoops |
-| iso_hoops_fv | iso | cosine | **yes** | full-val (11-entity, honest) | **3.33** | **3.2** | **best single model** |
-| 5-seed ensemble (+TTA) | iso | cosine | yes | full-val (honest) | _in progress_ | – | jobs 2949519 → 2949521 |
+| iso_hoops_fv | iso | cosine | **yes** | full-val (11-entity, honest) | **3.33** | **3.2** | best single model |
+| **5-seed ensemble** | iso | cosine | yes | full-val (honest) | **3.25** | – | mean of 5 seeds; best overall |
+| 5-seed ensemble + TTA | iso | cosine | yes | full-val (honest) | 3.25 | – | TTA = exact no-op (equivariance) |
+
+**5 seeds:** 3.329 / 3.396 / 3.334 / 3.339 / 3.367 → mean 3.353, std 0.025 (low
+variance confirms the metric is now stable). Ensemble averaging: 3.33 → **3.25**.
+
+**Reflection TTA is an exact no-op** (single_plain == single_tta == 3.3294 to 4 dp;
+ensemble_plain == ensemble_tta == 3.2497). This empirically proves EqMotion is
+**exactly O(2)-equivariant** — the 4 court reflections leave predictions unchanged
+(unlike STGCNN, which isn't equivariant and *did* benefit from reflection TTA).
 
 Tuned hparams (Optuna study `eqmotion_v1`, trial #117): `hidden_nf=64,
 hid_channel=64, n_layers=2, lr≈1.8e-3, weight_decay≈2e-6, batch_size=64,
@@ -122,9 +131,9 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
 
 ## 5. Open / next
 
-- **In progress:** 5-seed ensemble + reflection-TTA eval (jobs 2949519 → 2949521).
-  Expectation: ensemble ~3.33 → ~3.1–3.2; TTA ≈ no-op for an equivariant model
-  (a clean empirical equivariance check).
+- **Done:** 5-seed ensemble → val 3.25 (from 3.33); reflection TTA confirmed an
+  exact no-op (EqMotion is exactly O(2)-equivariant). Submission:
+  `submissions/solution_ens5_iso_hoops_val3.25.csv`.
 - **Candidates:** more court landmarks (free-throw lines, 3-pt arc, sidelines) —
   judge on Kaggle, not val (risk of court-frame overfit). Targeted regularization
   HP search now that val is trustworthy. Diverse cross-architecture ensemble.
@@ -136,6 +145,10 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
 
 ## 6. Best submission
 
-`submissions/solution_iso_hoops_fv_kaggle3.2.csv` — EqMotion iso+hoops, from
-`checkpoints/eqmotion/iso_hoops_fv/best.ckpt`. Kaggle 3.2.
-Regenerate any checkpoint's CSV: `sbatch jobs/submit_eqmotion.sh --ckpt <path> --iso-norm`.
+- **`submissions/solution_ens5_iso_hoops_val3.25.csv`** — 5-seed iso+hoops
+  ensemble, honest val 3.25. Best overall; upload this.
+- `submissions/solution_iso_hoops_fv_kaggle3.2.csv` — single iso+hoops model,
+  Kaggle 3.2 (confirmed).
+
+Regenerate a single checkpoint's CSV: `sbatch jobs/submit_eqmotion.sh --ckpt <path> --iso-norm`.
+Rebuild the ensemble CSV: `sbatch jobs/ensemble_eqmotion.sh`.
