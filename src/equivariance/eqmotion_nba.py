@@ -221,6 +221,7 @@ class NBAEqMotionLightningModel(L.LightningModule):
         lr_scheduler: str = "none",  # "none" | "cosine" | "plateau"
         max_epochs: int = 500,
         warmup_epochs: int = 0,
+        n_landmarks: int = 0,  # static court nodes appended last (e.g. 2 hoops)
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -252,6 +253,15 @@ class NBAEqMotionLightningModel(L.LightningModule):
         target_xy = y[:, :, :, :2].permute(1, 0, 2, 3).reshape(T, B * N, 2)
         pred_real = pred * self.sigma + self.mu
         target_real = target_xy * self.sigma + self.mu
+        # Score only the real entities (players + ball); static landmark nodes
+        # (hoops) are appended last and are ~stationary, so including them in the
+        # mean deflates val/mse_ft and breaks comparability with the Kaggle metric
+        # (which is over the 11 real entities only).
+        n_land = self.hparams.n_landmarks
+        if n_land > 0:
+            n_real = N - n_land
+            pred_real = pred_real.view(T, B, N, 2)[:, :, :n_real, :].reshape(T, B * n_real, 2)
+            target_real = target_real.view(T, B, N, 2)[:, :, :n_real, :].reshape(T, B * n_real, 2)
         self.log("val/loss", loss, on_epoch=True, prog_bar=True)
         self.log(
             "val/ade_ft",
@@ -497,6 +507,7 @@ if __name__ == "__main__":
         lr_scheduler=args.lr_scheduler,
         max_epochs=args.max_epochs,
         warmup_epochs=args.warmup_epochs,
+        n_landmarks=2 if args.add_hoops else 0,
     )
 
     wandb_logger = WandbLogger(project="NML_base", name=args.run_name)
