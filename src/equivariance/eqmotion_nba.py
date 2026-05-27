@@ -466,6 +466,8 @@ if __name__ == "__main__":
     p.add_argument("--lr-scheduler", default="cosine", choices=["none", "cosine", "plateau"])
     p.add_argument("--warmup-epochs", type=int, default=5)
     p.add_argument("--iso-norm", action="store_true")
+    p.add_argument("--add-hoops", action="store_true",
+                   help="Inject 2 static basket nodes (court-frame / D2 structure).")
     p.add_argument("--full-val", action="store_true",
                    help="Deterministic multi-window validation for a stable val/mse_ft.")
     p.add_argument("--val-windows", type=int, default=8,
@@ -481,6 +483,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         seed=args.seed,
         iso_norm=args.iso_norm,
+        add_hoops=args.add_hoops,
         full_val=args.full_val,
         val_windows_per_seq=args.val_windows,
     )

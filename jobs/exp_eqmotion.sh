@@ -21,9 +21,11 @@
 # printed best val/mse_ft.
 COMMON="--max-epochs 300 --patience 40 --full-val"
 declare -a RUNS=(
-  "aniso_sched_fv   $COMMON"
-  "iso_sched_fv     $COMMON --iso-norm"
-  "iso_big_fv       $COMMON --iso-norm --hidden-nf 128 --hid-channel 64 --n-layers 4"
+  # Re-test court-frame hoop nodes under the FIXED regime (iso norm + cosine +
+  # full-val). Control is the existing iso_sched_fv=3.46 (same code path/seed,
+  # no hoops). Prior "hoops don't help" verdict was under aniso norm, which
+  # distorted hoop positions per-axis and broke equivariance — confounded.
+  "iso_hoops_fv   $COMMON --iso-norm --add-hoops"
 )
 # ──────────────────────────────────────────────────────────────────────────────
 
