@@ -1,0 +1,34 @@
+# MART config for network_ml_project's .pt NBA data.
+# Past=8 / future=12 matches the Kaggle horizon (and GroupNet adapter's setup).
+
+# model params
+num_layers: 4
+num_heads: 8
+model_dim: 64
+hidden_dim: 128
+decoder_hidden_dim: 128
+dropout: 0.0
+sample_k: 20
+aggregation: 'avg'
+function_type: 2
+hyper_scales: [1, 'adaptive']
+
+# input/output params
+past_length: 8
+future_length: 12
+inputs: ['pos_x', 'pos_y', 'vel_x', 'vel_y']
+pred_rel: False
+
+# Entity-type embedding (mirrors GroupNetWithID). Set use_entity_embed: false
+# to fall back to stock MART for ablation.
+use_entity_embed: true
+embed_dim: 4
+
+# training params
+num_epochs: 100
+lr: 0.0005
+clip_grad: null
+batch_size: 64
+scheduler_type: MultiStepLR
+milestones: [100, 200]
+decay_gamma: 0.5
