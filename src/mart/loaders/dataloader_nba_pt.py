@@ -142,3 +142,33 @@ class WindowSampler(Sampler):
 
     def __len__(self):
         return len(self.max_start)
+
+
+class WindowEvalSampler(Sampler):
+    """Deterministic, multi-window validation sampler (mirrors EqMotion's
+    NBAEvalSampler exactly so val/mse_ft is directly comparable across models).
+
+    Instead of one random window per sequence per epoch (the noisy
+    `WindowSampler` behaviour, which makes val bounce between epochs and gives
+    a lucky-draw checkpoint signal), this enumerates a fixed set of evenly
+    spaced windows per sequence, capped at `windows_per_seq`. Each sequence
+    contributes the same number of windows (no over-weighting of long ones).
+    """
+
+    def __init__(self, max_start, windows_per_seq=8):
+        self.windows = []
+        for i, ms in enumerate(max_start):
+            if ms <= 0:
+                starts = [0]
+            else:
+                k = min(windows_per_seq, ms + 1)
+                starts = sorted(
+                    {int(round(s)) for s in torch.linspace(0, ms, k).tolist()}
+                )
+            self.windows.extend((i, s) for s in starts)
+
+    def __iter__(self):
+        return iter(self.windows)
+
+    def __len__(self):
+        return len(self.windows)

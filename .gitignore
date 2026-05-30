@@ -4,7 +4,10 @@ submissions
 NML_base
 wandb
 optuna_studies
-models
+# Top-level only — `models` at any depth would also ignore src/mart/models/,
+# which IS source code and needs to be committed.
+/models
+# Checkpoints are run output, ignore everywhere (src/<x>/checkpoints/).
 checkpoints
 # *.ckpt
 screen_results

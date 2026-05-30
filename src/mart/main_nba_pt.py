@@ -27,15 +27,15 @@ import os
 import random
 import sys
 
-# wandb auth: replace with your API key from https://wandb.ai/authorize
-os.environ.setdefault(
-    'WANDB_API_KEY',
-    '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',
-)
-
+import dotenv
 import numpy as np
 import torch
 import wandb
+
+# WANDB_API_KEY is loaded from the project's .env (same pattern as the other
+# training scripts in this repo). To override, set the env var before launch
+# or run `wandb login`.
+dotenv.load_dotenv(dotenv.find_dotenv())
 
 from torch import optim
 from torch.optim import lr_scheduler
@@ -49,6 +49,7 @@ from models.mart_id import MART_ID
 from loaders.dataloader_nba_pt import (
     MARTNBAPTDataset,
     WindowSampler,
+    WindowEvalSampler,
     compute_xy_stats,
     load_split_files,
 )
@@ -105,7 +106,7 @@ def parse_args():
     p.add_argument('--aug_court_mirror', action='store_true',
                    help='Random court-symmetry reflection per batch sample at train time.')
     # Logging
-    p.add_argument('--wandb_project', type=str, default='mart_nba_pt')
+    p.add_argument('--wandb_project', type=str, default='NML_base')
     p.add_argument('--wandb_run_name', type=str, default=None)
     p.add_argument('--wandb_mode', type=str, default='online',
                    help='online | offline | disabled')
@@ -264,13 +265,35 @@ def train_one_epoch(epoch, model, optimizer, loader, opts, device, aug_offset=No
 
 
 @torch.no_grad()
-def eval_minADE_minFDE(model, loader, opts, device, split_name):
-    """Compute min-of-K minADE and minFDE over the full future horizon."""
+def eval_minADE_minFDE(model, loader, opts, device, split_name, mu=None, sigma=None):
+    """Validation metrics.
+
+    Reports:
+      * `val/mse_ft` — mean squared error in feet², over real entities (11),
+        on the MEAN-of-K prediction. Matches Kaggle's single-shot mean MSE
+        scoring AND EqMotion's `val/mse_ft` definition exactly, so numbers
+        are directly comparable across architectures. Requires `mu`/`sigma`
+        (the train-split z-score stats) for denormalization.
+      * `minADE` / `minFDE` — min-of-K ADE/FDE in **normalized units** (z-score
+        space). Kept for parity with MART's paper-native loss; NOT comparable
+        to Kaggle or to EqMotion's feet-space metric.
+
+    Uses whatever sampler the caller wires up (we wire `WindowEvalSampler`
+    for deterministic multi-window evaluation, matching EqMotion's full-val).
+    """
     model.eval()
     sum_ade = 0.0
     sum_fde = 0.0
     sum_loss = 0.0
     n_total = 0
+    sse_ft = 0.0   # sum of squared errors, in feet², on real entities only
+    cnt_ft = 0     # element count for the mean below
+
+    use_ft = mu is not None and sigma is not None
+    if use_ft:
+        # Broadcast as [1, 1, 1, 2] over (B, N, T_f, 2) for the mean-of-K pred.
+        mu_b = mu.to(device).view(1, 1, 1, 2).float()
+        sigma_b = sigma.to(device).view(1, 1, 1, 2).float()
 
     for x_abs, y, agent_ids in loader:
         x_abs = x_abs.to(device)
@@ -287,42 +310,58 @@ def eval_minADE_minFDE(model, loader, opts, device, split_name):
 
         y_exp = y[:, :, None, :, :]        # [B, N, 1, T_f, 2]
 
-        # Mask hoops out of val metrics for the same reason as the train loss:
-        # they're static, so their contribution is trivially zero and deflates
-        # minADE/minFDE relative to the original 11-agent setup.
+        # Mask hoops out of all val metrics — they're static so they trivially
+        # zero the loss and inflate apparent quality (this exact bug bit
+        # EqMotion: val 2.82 → real 3.33 once hoops were stripped).
         if opts.get('use_hoops', False):
             y_pred = y_pred[:, :HOOPS_N_REAL_AGENTS]
             y_exp = y_exp[:, :HOOPS_N_REAL_AGENTS]
+            y_real = y[:, :HOOPS_N_REAL_AGENTS]
             N_scored = HOOPS_N_REAL_AGENTS
         else:
+            y_real = y
             N_scored = N
 
-        # min-of-K ADE: norm -> mean over T_f -> min over K -> mean over B,N
+        # min-of-K ADE / FDE (z-score space, kept for parity with paper).
         per_step_err = torch.norm(y_pred - y_exp, dim=-1)            # [B, N, K, T_f]
         ade_perK = per_step_err.mean(dim=3)                          # [B, N, K]
         min_ade = ade_perK.min(dim=2)[0]                             # [B, N]
-
-        # min-of-K FDE (final step only)
         fde_perK = per_step_err[:, :, :, -1]                         # [B, N, K]
         min_fde = fde_perK.min(dim=2)[0]                             # [B, N]
-
-        # min-of-K loss (same form used during training, for parity)
         loss_val = min_ade.mean()
-
         sum_ade += min_ade.sum().item()
         sum_fde += min_fde.sum().item()
         sum_loss += loss_val.item() * B * N_scored
         n_total += B * N_scored
 
+        # val/mse_ft on the MEAN-of-K prediction, denormalized to feet.
+        # Equivalent to what submit_nba_pt.py writes (--reduce mean), so val
+        # tracks Kaggle directly. Matches EqMotion's compute_mse exactly:
+        # mean over (T_f, B, N_real, 2) of squared error in feet².
+        if use_ft:
+            y_mean = y_pred.mean(dim=2)                              # [B, N_real, T_f, 2]
+            y_mean_ft = y_mean * sigma_b + mu_b
+            y_tgt_ft = y_real * sigma_b + mu_b
+            sse_ft += ((y_mean_ft - y_tgt_ft) ** 2).sum().item()
+            cnt_ft += y_mean_ft.numel()
+
     avg_ade = sum_ade / max(n_total, 1)
     avg_fde = sum_fde / max(n_total, 1)
     avg_loss = sum_loss / max(n_total, 1)
+    mse_ft = sse_ft / cnt_ft if use_ft and cnt_ft > 0 else float('nan')
 
-    print(
-        f'[{split_name.upper()}] minADE/minFDE @ {opts.future_length} steps: '
-        f'{avg_ade:.4f} / {avg_fde:.4f}'
-    )
-    return {'loss': avg_loss, 'minADE': avg_ade, 'minFDE': avg_fde}
+    if use_ft:
+        print(
+            f'[{split_name.upper()}] mse_ft = {mse_ft:.4f} ft²  '
+            f'| minADE/minFDE (z-score) @ {opts.future_length} steps: '
+            f'{avg_ade:.4f} / {avg_fde:.4f}'
+        )
+    else:
+        print(
+            f'[{split_name.upper()}] minADE/minFDE @ {opts.future_length} steps: '
+            f'{avg_ade:.4f} / {avg_fde:.4f}'
+        )
+    return {'loss': avg_loss, 'minADE': avg_ade, 'minFDE': avg_fde, 'mse_ft': mse_ft}
 
 
 def main():
@@ -355,7 +394,9 @@ def main():
     # doesn't silently build the model with the wrong embedding size and crash
     # state_dict load. (Training mode uses the CLI flag as authored.)
     if args.test and os.path.isfile(ckpt_path):
-        ckpt_opts = torch.load(ckpt_path, map_location='cpu').get('opts', {})
+        ckpt_opts = torch.load(
+            ckpt_path, map_location='cpu', weights_only=False,
+        ).get('opts', {})
         ckpt_uh = bool(ckpt_opts.get('use_hoops', False))
         if ckpt_uh != opts.use_hoops:
             print(
@@ -393,9 +434,10 @@ def main():
     train_sampler = WindowSampler(
         opts.batch_size, train_set.max_start, seed=args.seed, shuffle=True,
     )
-    val_sampler = WindowSampler(
-        opts.batch_size, val_set.max_start, seed=args.seed, shuffle=False,
-    )
+    # Deterministic multi-window val sampler so val/mse_ft is stable across
+    # epochs and directly comparable to EqMotion's --full-val numbers.
+    val_sampler = WindowEvalSampler(val_set.max_start, windows_per_seq=8)
+    print(f'[INFO] val windows: {len(val_sampler)} (deterministic 8/seq)')
 
     train_loader = DataLoader(
         train_set, batch_size=opts.batch_size, sampler=train_sampler,
@@ -436,15 +478,24 @@ def main():
         scheduler = lr_scheduler.MultiStepLR(
             optimizer, milestones=opts.milestones, gamma=opts.decay_gamma,
         )
+    elif opts.scheduler_type == 'CosineAnnealingLR':
+        # Same shape as EqMotion (eta_min = lr*0.02) so cross-arch comparisons
+        # share an LR schedule. T_max=num_epochs anneals over the full run.
+        scheduler = lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=opts.num_epochs, eta_min=opts.lr * 0.02,
+        )
     else:
         scheduler = None
 
     # ---- Test-only path ----
     if args.test:
         print(f'[INFO] Loading model from: {ckpt_path}')
-        ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt['state_dict'], strict=True)
-        eval_minADE_minFDE(model, val_loader, opts, device, split_name='val')
+        eval_minADE_minFDE(
+            model, val_loader, opts, device, split_name='val',
+            mu=mu, sigma=sigma,
+        )
         return
 
     # ---- Train ----
@@ -468,6 +519,7 @@ def main():
             )
             val_metrics = eval_minADE_minFDE(
                 model, val_loader, opts, device, split_name='val',
+                mu=mu, sigma=sigma,
             )
 
             if scheduler is not None:
@@ -479,6 +531,7 @@ def main():
                 'th': get_th(opts, model),
                 'train/loss': train_loss,
                 'val/loss': val_metrics['loss'],
+                'val/mse_ft': val_metrics['mse_ft'],
                 'val/minADE': val_metrics['minADE'],
                 'val/minFDE': val_metrics['minFDE'],
             }
@@ -486,8 +539,8 @@ def main():
 
             print(
                 f'[INFO] Epoch {epoch:03d} done | train_loss {train_loss:.4f} | '
-                f'val_minADE {val_metrics["minADE"]:.4f} | '
-                f'val_minFDE {val_metrics["minFDE"]:.4f}'
+                f'val/mse_ft {val_metrics["mse_ft"]:.4f} ft² | '
+                f'val_minADE {val_metrics["minADE"]:.4f}'
             )
 
         # ---- After all epochs: save the final checkpoint and report final val ----
@@ -503,13 +556,15 @@ def main():
                 'sigma': sigma,
                 'val_minADE': val_metrics['minADE'],
                 'val_minFDE': val_metrics['minFDE'],
+                'val_mse_ft': val_metrics['mse_ft'],
             },
             ckpt_path,
         )
         print(f'\n[INFO] Training complete. Saved final-epoch checkpoint to {ckpt_path}')
-        print('=== Final val metrics (normalized units, last epoch) ===')
-        print(f'  val/minADE : {val_metrics["minADE"]:.4f}')
-        print(f'  val/minFDE : {val_metrics["minFDE"]:.4f}')
+        print('=== Final val metrics (last epoch) ===')
+        print(f'  val/mse_ft : {val_metrics["mse_ft"]:.4f} ft²  (Kaggle-comparable)')
+        print(f'  val/minADE : {val_metrics["minADE"]:.4f}  (normalized, min-of-K)')
+        print(f'  val/minFDE : {val_metrics["minFDE"]:.4f}  (normalized, min-of-K)')
         print(f'  val/loss   : {val_metrics["loss"]:.4f}')
         print(
             '[INFO] For metrics in feet (denormalized, ADE/FDE/MSE + min-of-K '

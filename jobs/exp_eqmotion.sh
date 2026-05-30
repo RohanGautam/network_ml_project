@@ -21,11 +21,15 @@
 # printed best val/mse_ft.
 COMMON="--max-epochs 300 --patience 40 --full-val"
 declare -a RUNS=(
-  # Re-test court-frame hoop nodes under the FIXED regime (iso norm + cosine +
-  # full-val). Control is the existing iso_sched_fv=3.46 (same code path/seed,
-  # no hoops). Prior "hoops don't help" verdict was under aniso norm, which
-  # distorted hoop positions per-axis and broke equivariance — confounded.
-  "iso_hoops_fv   $COMMON --iso-norm --add-hoops"
+  # Court-landmark sweep. Hoops alone gave honest val 3.33 / Kaggle 3.2 — the
+  # single biggest lever found. Try richer D2-respecting landmark sets to see
+  # whether more court structure pushes further. Each preset is a distinct
+  # team_id so the model's id_embed can specialize per landmark type. Control:
+  # iso_hoops_s0=3.33 (same seed, same code path, hoops only).
+  "iso_l_hoops_ft        $COMMON --iso-norm --landmarks hoops,ft"
+  "iso_l_hoops_3pt       $COMMON --iso-norm --landmarks hoops,3pt"
+  "iso_l_hoops_corners   $COMMON --iso-norm --landmarks hoops,corners"
+  "iso_l_hoops_ft_3pt    $COMMON --iso-norm --landmarks hoops,ft,3pt"
 )
 # ──────────────────────────────────────────────────────────────────────────────
 

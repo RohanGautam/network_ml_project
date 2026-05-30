@@ -77,6 +77,32 @@ hoops) dominate.
 mean MSE, which rewards predicting the *mean* mode. VAE-style models optimise
 best-of-K (minADE), a different objective → they underperform on mean-MSE here.
 
+### MART (fair comparison: 300 ep + cosine, schedule-matched to EqMotion)
+
+Same `WindowEvalSampler` (8 deterministic windows/seq) and same `val/mse_ft`
+definition (denormalized to feet², mean-of-K prediction, 11 real entities) as
+EqMotion, so numbers are **directly comparable** in this row.
+
+| Run | Loss | val/mse_ft | val/minADE (norm) | Notes |
+|---|---|---|---|---|
+| mart_minade_s1 | `min_ade` (paper-native) | **3.79** | 0.039 | fair MART baseline |
+| mart_meanmse_s1 | `mean_mse` | 3.88 | 0.102 | "loss-aligned" — *worse* |
+
+**MART loses to EqMotion by ~0.5 even after schedule alignment** (3.79 vs 3.33
+single / 3.25 ensemble). Two findings worth flagging:
+
+- **Undertraining was a real confound.** 100 ep (min_ade) → 4.22; 300 ep → 3.79.
+  0.43 of the apparent MART deficit was schedule, not architecture.
+- **The "obvious" loss switch backfired.** Swapping to `mean_mse` actually hurt
+  (3.79 → 3.88), and val/minADE *tripled* (0.039 → 0.102). MART's K=20 decoder
+  heads act as an **implicit ensemble**: `min_ade` keeps them *diverse* (each
+  captures a distinct mode), and the mean-of-K prediction averages those modes
+  into a sensible central estimate. `mean_mse` collapses all K to the same
+  target → diversity dies, ensembling benefit vanishes, single mean prediction
+  is worse. **Lesson:** for multimodal architectures with K decoder heads,
+  loss-aligning to the leaderboard's single-shot metric can be counter-productive
+  — the heads-as-ensemble structure was *load-bearing*.
+
 ---
 
 ## 3. What changed in the pipeline (code)
@@ -156,13 +182,14 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
   court information," and tightens the story to *"hoops are the right amount of
   D2 court structure."* Code: `LANDMARK_SETS` + `--landmarks PRESET[,PRESET...]`
   in [src/equivariance/eqmotion_nba.py](src/equivariance/eqmotion_nba.py).
-- **MART baseline (next architecture).** `src/mart/main_nba_pt.py` — a more
-  expressive relational/multiscale transformer than EqMotion. Hardcoded W&B key
-  removed (uses `.env` like the other scripts). Jobs: `jobs/train_mart.sh`
-  (baseline training) and `jobs/submit_mart.sh` (Kaggle CSV from a checkpoint).
-  Watch out: MART's native loss is min-of-K (multimodal) — the Kaggle metric is
-  single-shot mean MSE, so MART may underperform on this leaderboard unless
-  trained with `--loss mean_mse` (CVAE/SocialVAE lost for exactly this reason).
+- **MART baseline — done, loses to EqMotion under fair comparison.** Trained 300
+  ep + cosine, same schedule as EqMotion, with both `min_ade` (paper-native) and
+  `mean_mse` losses. Best MART = **3.79** (min_ade); mean_mse was *worse* (3.88).
+  See the MART results table above for the implicit-K-ensemble lesson. Code
+  alignment: `WindowEvalSampler` (deterministic 8 windows/seq) + denormalized
+  feet² `val/mse_ft` on real entities → MART and EqMotion val numbers are now
+  directly comparable. Submissions: `solution_mart_300ep_minade_val3.79.csv`,
+  `solution_mart_300ep_meanmse_val3.88.csv`.
 - **Other candidates:** targeted regularization HP search now that val is
   trustworthy; diverse cross-architecture ensemble (EqMotion + STGCNN + MART).
 - **Report framing:** "an over-strong O(2) prior + explicit D2 court-frame features
