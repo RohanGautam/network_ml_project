@@ -180,14 +180,36 @@ class NBAEvalSampler(Sampler):
 
 
 class MultiStepMSE:
-    def __init__(self):
-        self.loss_fn = torch.nn.MSELoss()
+    """Mean MSE loss with optional ball-weighting.
+
+    With ball_weight=1.0 this is plain mean MSE over (T, B, N, 2), matching the
+    original behavior. With ball_weight>1, the ball entity (the one with
+    isplayer==0 among the first 11 real agents — landmarks come after) gets
+    that many times more weight in the loss, so the model spends proportionally
+    more capacity on the ball while still seeing all agents as joint context.
+    """
+
+    def __init__(self, ball_weight: float = 1.0):
+        self.ball_weight = float(ball_weight)
 
     def compute(self, pred, target) -> Tensor:
+        # target [B, T, N, 6] (full features, incl. static isplayer at ch 4);
+        # pred [T, B*N, 2] (normalized positions, real-agent ordering preserved).
         B, T, N, _ = target.shape
-        target = target[:, :, :, :2].permute(1, 0, 2, 3).reshape(T, B * N, 2)
-        loss = sum(self.loss_fn(pred[t], target[t]) for t in range(T))
-        return loss / T
+        target_xy = target[:, :, :, :2].permute(1, 0, 2, 3)  # [T, B, N, 2]
+        pred_r = pred.view(T, B, N, 2)
+        sq = (pred_r - target_xy) ** 2  # [T, B, N, 2]
+        if self.ball_weight == 1.0:
+            return sq.mean()
+        # Ball is the entity with isplayer==0 among the first 11 nodes.
+        # Landmarks (positions >=11) also have isplayer=0 by construction, so
+        # we cap the search to the first 11 to avoid weighting hoops as "ball".
+        n_real_cap = min(N, 11)
+        ball_mask = torch.zeros(B, N, dtype=torch.bool, device=target.device)
+        ball_mask[:, :n_real_cap] = target[:, 0, :n_real_cap, 4] == 0
+        ball_mask_4d = ball_mask.view(1, B, N, 1).expand_as(sq)
+        weights = 1.0 + (self.ball_weight - 1.0) * ball_mask_4d.float()
+        return (weights * sq).sum() / weights.sum()
 
 
 # ── EqMotion wrapper ──────────────────────────────────────────────────────────
@@ -263,13 +285,14 @@ class NBAEqMotionLightningModel(L.LightningModule):
         max_epochs: int = 500,
         warmup_epochs: int = 0,
         n_landmarks: int = 0,  # static court nodes appended last (e.g. 2 hoops)
+        ball_weight: float = 1.0,  # >1 trains a ball-specialist; 1.0 = plain MSE
     ):
         super().__init__()
         self.save_hyperparameters()
         self.net = NBAEqMotionModel(
             context_size, horizon_size, hidden_nf, hid_channel, n_layers
         )
-        self.loss_fn = MultiStepMSE()
+        self.loss_fn = MultiStepMSE(ball_weight=ball_weight)
 
     def on_fit_start(self):
         dm = self.trainer.datamodule
@@ -299,8 +322,8 @@ class NBAEqMotionLightningModel(L.LightningModule):
         # mean deflates val/mse_ft and breaks comparability with the Kaggle metric
         # (which is over the 11 real entities only).
         n_land = self.hparams.n_landmarks
+        n_real = N - n_land
         if n_land > 0:
-            n_real = N - n_land
             pred_real = pred_real.view(T, B, N, 2)[:, :, :n_real, :].reshape(
                 T, B * n_real, 2
             )
@@ -326,6 +349,15 @@ class NBAEqMotionLightningModel(L.LightningModule):
             on_epoch=True,
             prog_bar=True,
         )
+        # Per-entity-type breakdown: ball (isplayer==0) vs the 10 players, among
+        # the real entities (hoops already stripped above). Useful for spotting
+        # where residual MSE concentrates and judging ball-specialist training.
+        sq = (pred_real - target_real).view(T, B, n_real, 2) ** 2
+        ball_m = (y[:, 0, :n_real, 4] == 0).view(1, B, n_real, 1).expand_as(sq)
+        if ball_m.any():
+            self.log("val/mse_ball", sq[ball_m].mean(), on_epoch=True)
+        if (~ball_m).any():
+            self.log("val/mse_players", sq[~ball_m].mean(), on_epoch=True)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
@@ -566,6 +598,13 @@ if __name__ == "__main__":
         help="Comma-separated landmark preset names from LANDMARK_SETS "
              "(e.g. 'hoops,ft,3pt'). Overrides --add-hoops if given.",
     )
+    p.add_argument(
+        "--ball-weight",
+        type=float,
+        default=1.0,
+        help="Loss weight on the ball entity (isplayer==0). 1.0 = plain MSE; "
+             ">1 trains a ball-specialist that still sees all agents jointly.",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-submit", action="store_true")
     args = p.parse_args()
@@ -602,6 +641,7 @@ if __name__ == "__main__":
         max_epochs=args.max_epochs,
         warmup_epochs=args.warmup_epochs,
         n_landmarks=len(landmarks),
+        ball_weight=args.ball_weight,
     )
 
     wandb_logger = WandbLogger(project="NML_base", name=args.run_name)
