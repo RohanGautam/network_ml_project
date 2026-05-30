@@ -180,17 +180,33 @@ class NBAEvalSampler(Sampler):
 
 
 class MultiStepMSE:
-    """Mean MSE loss with optional ball-weighting.
+    """Mean MSE loss with optional ball-weighting or ball-only training.
 
-    With ball_weight=1.0 this is plain mean MSE over (T, B, N, 2), matching the
-    original behavior. With ball_weight>1, the ball entity (the one with
-    isplayer==0 among the first 11 real agents — landmarks come after) gets
-    that many times more weight in the loss, so the model spends proportionally
-    more capacity on the ball while still seeing all agents as joint context.
+    - ball_weight=1.0 (default): plain mean MSE over (T, B, N, 2).
+    - ball_weight>1:              soft weighting; the ball element's loss is
+                                  scaled but players still get gradient.
+    - ball_only=True:             hard mask — loss is computed *only* on the
+                                  ball entity. Player and landmark predictions
+                                  get zero gradient. Inputs (all 11 agents +
+                                  any landmarks) are unchanged, so the model
+                                  still uses joint context to predict the ball;
+                                  it just doesn't waste capacity on the players.
+                                  Use with `--monitor val/mse_ball` since
+                                  `val/mse_ft` becomes garbage (players free).
     """
 
-    def __init__(self, ball_weight: float = 1.0):
+    def __init__(self, ball_weight: float = 1.0, ball_only: bool = False):
         self.ball_weight = float(ball_weight)
+        self.ball_only = bool(ball_only)
+
+    def _ball_mask(self, target):
+        # Ball is the entity with isplayer==0 among the first 11 nodes; landmarks
+        # (positions >=11) also have isplayer=0 by construction, so we cap to 11.
+        B, _, N, _ = target.shape
+        n_real_cap = min(N, 11)
+        m = torch.zeros(B, N, dtype=torch.bool, device=target.device)
+        m[:, :n_real_cap] = target[:, 0, :n_real_cap, 4] == 0
+        return m  # [B, N]
 
     def compute(self, pred, target) -> Tensor:
         # target [B, T, N, 6] (full features, incl. static isplayer at ch 4);
@@ -199,16 +215,16 @@ class MultiStepMSE:
         target_xy = target[:, :, :, :2].permute(1, 0, 2, 3)  # [T, B, N, 2]
         pred_r = pred.view(T, B, N, 2)
         sq = (pred_r - target_xy) ** 2  # [T, B, N, 2]
+
+        if self.ball_only:
+            ball_4d = self._ball_mask(target).view(1, B, N, 1).expand_as(sq)
+            return sq[ball_4d].mean()
+
         if self.ball_weight == 1.0:
             return sq.mean()
-        # Ball is the entity with isplayer==0 among the first 11 nodes.
-        # Landmarks (positions >=11) also have isplayer=0 by construction, so
-        # we cap the search to the first 11 to avoid weighting hoops as "ball".
-        n_real_cap = min(N, 11)
-        ball_mask = torch.zeros(B, N, dtype=torch.bool, device=target.device)
-        ball_mask[:, :n_real_cap] = target[:, 0, :n_real_cap, 4] == 0
-        ball_mask_4d = ball_mask.view(1, B, N, 1).expand_as(sq)
-        weights = 1.0 + (self.ball_weight - 1.0) * ball_mask_4d.float()
+
+        ball_4d = self._ball_mask(target).view(1, B, N, 1).expand_as(sq)
+        weights = 1.0 + (self.ball_weight - 1.0) * ball_4d.float()
         return (weights * sq).sum() / weights.sum()
 
 
@@ -286,13 +302,16 @@ class NBAEqMotionLightningModel(L.LightningModule):
         warmup_epochs: int = 0,
         n_landmarks: int = 0,  # static court nodes appended last (e.g. 2 hoops)
         ball_weight: float = 1.0,  # >1 trains a ball-specialist; 1.0 = plain MSE
+        ball_only_loss: bool = False,  # True = loss is ONLY on ball; ignores ball_weight
     ):
         super().__init__()
         self.save_hyperparameters()
         self.net = NBAEqMotionModel(
             context_size, horizon_size, hidden_nf, hid_channel, n_layers
         )
-        self.loss_fn = MultiStepMSE(ball_weight=ball_weight)
+        self.loss_fn = MultiStepMSE(
+            ball_weight=ball_weight, ball_only=ball_only_loss
+        )
 
     def on_fit_start(self):
         dm = self.trainer.datamodule
@@ -605,6 +624,19 @@ if __name__ == "__main__":
         help="Loss weight on the ball entity (isplayer==0). 1.0 = plain MSE; "
              ">1 trains a ball-specialist that still sees all agents jointly.",
     )
+    p.add_argument(
+        "--ball-only-loss",
+        action="store_true",
+        help="Train a TRUE ball specialist: loss is computed ONLY on the ball "
+             "(zero gradient on players). Inputs are unchanged (joint context). "
+             "Pair with --monitor val/mse_ball — val/mse_ft will be garbage.",
+    )
+    p.add_argument(
+        "--monitor",
+        default="val/mse_ft",
+        help="Metric to monitor for ModelCheckpoint + EarlyStopping. Use "
+             "val/mse_ball when training with --ball-only-loss.",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-submit", action="store_true")
     args = p.parse_args()
@@ -642,6 +674,7 @@ if __name__ == "__main__":
         warmup_epochs=args.warmup_epochs,
         n_landmarks=len(landmarks),
         ball_weight=args.ball_weight,
+        ball_only_loss=args.ball_only_loss,
     )
 
     wandb_logger = WandbLogger(project="NML_base", name=args.run_name)
@@ -649,11 +682,11 @@ if __name__ == "__main__":
     ckpt_cb = ModelCheckpoint(
         dirpath=str(PROJECT_ROOT / "checkpoints" / "eqmotion" / args.run_name),
         filename="best",
-        monitor="val/mse_ft",
+        monitor=args.monitor,
         mode="min",
         save_top_k=1,
     )
-    early_stop = EarlyStopping(monitor="val/mse_ft", patience=args.patience, mode="min")
+    early_stop = EarlyStopping(monitor=args.monitor, patience=args.patience, mode="min")
 
     trainer = L.Trainer(
         max_epochs=args.max_epochs,
@@ -664,7 +697,7 @@ if __name__ == "__main__":
     )
 
     trainer.fit(model, data_module)
-    print(f"[{args.run_name}] best val/mse_ft = {ckpt_cb.best_model_score.item():.4f}")
+    print(f"[{args.run_name}] best {args.monitor} = {ckpt_cb.best_model_score.item():.4f}")
 
     if not args.no_submit:
         # Submit from the BEST checkpoint, not the final-epoch model in memory

@@ -21,14 +21,18 @@
 # printed best val/mse_ft.
 COMMON="--max-epochs 300 --patience 40 --full-val"
 declare -a RUNS=(
-  # Ball-weighted loss sweep. Per-entity diagnostic showed ball MSE = 13.86
-  # vs players 2.19 (6.3x harder, ~39% of total MSE). Weighting the ball's loss
-  # term concentrates capacity on the hardest entity while keeping joint
-  # multi-agent context. Control = iso_hoops_s0 (ball_weight=1) at val 3.33.
-  # Same architecture, iso+hoops+cosine+full-val, only --ball-weight differs.
-  "iso_hoops_bw3   $COMMON --iso-norm --add-hoops --ball-weight 3"
-  "iso_hoops_bw5   $COMMON --iso-norm --add-hoops --ball-weight 5"
-  "iso_hoops_bw10  $COMMON --iso-norm --add-hoops --ball-weight 10"
+  # Ball-ONLY specialist sweep. Loss is computed exclusively on the ball
+  # (zero gradient on players), but the model still sees all 11 agents +
+  # 2 hoops as input — joint context preserved for predicting the ball.
+  # Checkpoint selection on val/mse_ball (val/mse_ft is meaningless under
+  # this loss). Three capacities tested to separate "ball at 13.7 is a
+  # capacity floor for the small model" from "13.7 is the task floor":
+  #   bo_small : base arch, isolates loss change from capacity change.
+  #   bo_wide  : 2x wider hidden, same depth.
+  #   bo_big   : wider + deeper, max capacity on a 64-channel DCT.
+  "iso_hoops_bo_small  $COMMON --iso-norm --add-hoops --ball-only-loss --monitor val/mse_ball"
+  "iso_hoops_bo_wide   $COMMON --iso-norm --add-hoops --ball-only-loss --monitor val/mse_ball --hidden-nf 128"
+  "iso_hoops_bo_big    $COMMON --iso-norm --add-hoops --ball-only-loss --monitor val/mse_ball --hidden-nf 128 --n-layers 4"
 )
 # ──────────────────────────────────────────────────────────────────────────────
 

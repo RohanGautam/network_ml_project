@@ -11,8 +11,12 @@ Kaggle. Task: C=8 context → H=12 horizon, 11 entities (10 players + ball).
 > as an exact no-op — empirical proof of O(2) equivariance). Starting point
 > for context: ~3.7 val EqMotion, ~3.8 STGCNN, ~3.8 MART. Ball is the
 > concentrated remaining error source (6.4× harder than players, ~39% of
-> total) but capacity reallocation via loss weighting doesn't break its ~13.7
-> ft² floor — needs a different bias or more capacity, not reweighting.
+> total) with a robust floor at **~13.7 ft²** across every intervention we've
+> tried within EqMotion: ball-weighted loss, true ball-only loss, and larger
+> capacity all converge to the same range. The mechanistic reason is the
+> joint-training dependency — the ball's predictability depends on sharp
+> *player* representations the joint gradient maintains. Breaking the floor
+> would need a non-equivariant ball architecture, not capacity reallocation.
 
 ---
 
@@ -172,11 +176,14 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
   makes capacity reallocation a losing trade.** Total = (10·players + ball)/11.
   Each +0.1 ft² to players costs +0.09 in the total; each −1 to ball saves
   only 0.09. So to *net improve* by ball-weighting, ball must drop ~10× more
-  than players rise. Empirically the ratio comes out closer to 1:5 (ball drops
-  by tenths while players rise by hundredths — small ball gain × 1 < small
-  player loss × 10). Implication: ball improvement needs to come from
-  **adding capacity / changing inductive bias**, not redistributing existing
-  capacity.
+  than players rise. Empirically that ratio doesn't materialize — and the
+  ball-only loss + capacity sweep showed *why*: under pure ball-only loss
+  (no player gradient), ball MSE actually got **worse** (13.97 vs 13.70),
+  and larger capacity didn't help either. The ball's predictability is
+  *bounded by the joint architecture* — it depends on the player gradient
+  to keep player embeddings sharp. So ball improvement isn't a
+  capacity/optimization problem within EqMotion; it's an inductive-bias
+  problem requiring a different architecture for the ball.
 
 ---
 
@@ -261,6 +268,54 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
 
   Lever ranking implied: weight reallocation alone is not the lever; capacity
   or inductive-bias change for the ball would be.
+
+- **Ball-ONLY loss + capacity sweep — TRIED, confirms the floor is robust
+  within EqMotion (and reveals *why*).** Job 2952799. Followed up the bw sweep
+  by going to the limit: train with loss computed *only* on the ball (zero
+  gradient on players), at three capacities. Checkpointed on `val/mse_ball`
+  (since `val/mse_ft` is meaningless with players unconstrained).
+
+  | Run | Arch (hidden / layers) | val/mse_ball |
+  |---|---|---|
+  | iso_hoops_s0 (joint, bw=1) | 64 / 2 | 14.30 |
+  | iso_hoops_bw5 (joint, weighted ×5) | 64 / 2 | **13.70** |
+  | iso_hoops_bo_small (ball-only) | 64 / 2 | 13.97 |
+  | iso_hoops_bo_wide (ball-only) | 128 / 2 | 14.19 |
+  | iso_hoops_bo_big (ball-only) | 128 / 4 | 14.02 |
+
+  Three findings, each load-bearing:
+
+  1. **Ball-only is *worse* than ball-weighted** (13.97 vs 13.70). Removing the
+     player gradient hurts ball prediction.
+  2. **Capacity doesn't help.** All three ball-only variants cluster at
+     13.97–14.19; the smallest is tied for best.
+  3. **The floor across every variant we've tried is 13.7–14.3** — ≤5% spread
+     on every "ball specialist" intervention.
+
+  **Mechanistic interpretation (why ball-only is worse).** The ball's future
+  depends critically on player motion — passes follow handlers, the ball
+  decelerates at the receiver, trajectories bend around player intent. Pure
+  ball-only loss removes the gradient that keeps the *player* representations
+  sharp inside the encoder. Player embeddings drift, and the ball prediction
+  — which depends on them — suffers. **The bw=5 sweet spot is exactly the
+  regime where there's *just enough* player gradient to keep player embeddings
+  useful, with the extra ball weight focusing optimization on the ball.**
+  Joint training is doing real work for the ball; you can't extract it by
+  reweighting alone — the residual player loss is load-bearing.
+
+  Combine math is unchanged: best ball (13.70 from bw5) + ensemble players
+  (2.19) → (10·2.19 + 13.70)/11 = **3.24** vs current 3.25 ensemble. Real but
+  marginal; ball MSE is *bounded* within the EqMotion family.
+
+  **What this implies for next steps.** Capacity reallocation has been ruled
+  out as a lever. Reducing ball error further requires a **non-equivariant
+  architecture** specifically for the ball (the ball's dynamics — fast,
+  abrupt, decision-driven — may genuinely not suit EqMotion's continuous
+  O(2) prior, even with court-frame features). That's a meaningfully bigger
+  build than what we've done so far. Alternative: accept the floor and
+  spend effort on cross-architecture diversity (combine EqMotion ensemble
+  with MART's predictions per-entity, see if MART's ball error is in a
+  different regime).
 
 - **Other candidates:** larger model + ball weighting (isolates capacity from
   optimization); regularization HP search now that val is trustworthy;
