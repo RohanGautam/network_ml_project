@@ -6,9 +6,13 @@ Tracking what we tried, what changed in the pipeline, and the results. Metric is
 Kaggle. Task: C=8 context → H=12 horizon, 11 entities (10 players + ball).
 
 > **Headline:** EqMotion with **isotropic normalization + cosine LR + court-frame
-> hoop nodes** is our best single model — honest val **3.33**, Kaggle **3.2**
-> (from a starting point of ~3.7 val / 3.9 for STGCNN). A multi-seed ensemble +
-> TTA evaluation is in progress.
+> hoop nodes** is our best single model — honest val **3.33**, Kaggle **3.2**.
+> The **5-seed ensemble** improves to val **3.25** (reflection TTA confirmed
+> as an exact no-op — empirical proof of O(2) equivariance). Starting point
+> for context: ~3.7 val EqMotion, ~3.8 STGCNN, ~3.8 MART. Ball is the
+> concentrated remaining error source (6.4× harder than players, ~39% of
+> total) but capacity reallocation via loss weighting doesn't break its ~13.7
+> ft² floor — needs a different bias or more capacity, not reweighting.
 
 ---
 
@@ -128,6 +132,18 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
    ensemble + reflection TTA eval/submit).
 9. Job scripts now rsync **checkpoints and submissions** back to `$HOME` after each
    run (scratch is wiped by the next job's `rsync --delete`).
+10. **Per-entity val diagnostics.** `validation_step` now also logs
+    `val/mse_ball` and `val/mse_players` (ball = isplayer==0 among the first 11
+    real entities; landmarks already stripped). Lets us see where residual MSE
+    concentrates — and tells the ball-vs-players story above.
+11. **Generalized court landmarks.** `LANDMARK_SETS` dict + `landmarks_from_spec()`
+    helper + `--landmarks PRESET[,PRESET...]` CLI (e.g. `hoops,ft,3pt`). Each
+    preset is a list of `(x, y, team_id)` tuples; distinct `team_id`s give each
+    landmark type its own embedding. Back-compat `--add-hoops` kept as a
+    shortcut for `--landmarks hoops`.
+12. **Ball-weighted loss.** `MultiStepMSE(ball_weight=...)` + `--ball-weight`
+    CLI. Weight=1 is plain MSE (matches prior behavior); weight>1 trains a
+    ball-specialist while still seeing all agents as joint context.
 
 ---
 
@@ -152,6 +168,15 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
 - **Bigger ≠ better here.** hidden128/4-layer consistently overfit 4.5k sequences.
 - **Metric hygiene matters.** Two separate measurement artifacts (window noise,
   landmark deflation) each moved the apparent number by 0.2–0.5.
+- **Ball is 6.4× harder than the average player, but the 10:1 entity count
+  makes capacity reallocation a losing trade.** Total = (10·players + ball)/11.
+  Each +0.1 ft² to players costs +0.09 in the total; each −1 to ball saves
+  only 0.09. So to *net improve* by ball-weighting, ball must drop ~10× more
+  than players rise. Empirically the ratio comes out closer to 1:5 (ball drops
+  by tenths while players rise by hundredths — small ball gain × 1 < small
+  player loss × 10). Implication: ball improvement needs to come from
+  **adding capacity / changing inductive bias**, not redistributing existing
+  capacity.
 
 ---
 
@@ -190,11 +215,62 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
   feet² `val/mse_ft` on real entities → MART and EqMotion val numbers are now
   directly comparable. Submissions: `solution_mart_300ep_minade_val3.79.csv`,
   `solution_mart_300ep_meanmse_val3.88.csv`.
-- **Other candidates:** targeted regularization HP search now that val is
-  trustworthy; diverse cross-architecture ensemble (EqMotion + STGCNN + MART).
+- **Per-entity error breakdown (ball is the dominant error source).** Added
+  `val/mse_ball` / `val/mse_players` to `validation_step` and ran the diagnostic
+  on the existing 5-seed iso+hoops ensemble (job 2952743):
+
+  | Config | total | ball | players | ratio |
+  |---|---|---|---|---|
+  | single (iso_hoops_s0) | 3.33 | **14.30** | 2.23 | 6.41× |
+  | 5-seed ensemble | 3.25 | **13.86** | 2.19 | 6.33× |
+
+  Ball is ~6.4× harder than the average player and contributes ~39% of total
+  MSE. *Theoretical* leverage: holding players fixed, cutting ball to 5 would
+  drop total to ~2.45 (well past leaderboard top 2.6). So the ball is where the
+  biggest concentrated headroom is — *if* it can be reduced.
+
+- **Ball-weighted loss — TRIED, doesn't move the needle (single seed).**
+  Added a `ball_weight` parameter to `MultiStepMSE` that weights the ball
+  element's loss term ×N (gradient math verified: bw=5 → 3.8× stronger ball
+  gradient, 0.76× weaker player gradient). Trained three new 300-epoch models
+  with `--ball-weight 3/5/10` (job 2952755), identical to the 3.33 control
+  otherwise. Per-entity table:
+
+  | Run | total | ball | players | vs control |
+  |---|---|---|---|---|
+  | control (bw=1) | **3.33** | 14.30 | 2.23 | — |
+  | iso_hoops_bw3 | 3.40 | 13.96 | 2.35 | ball ↓0.34, players ↑0.12 |
+  | iso_hoops_bw5 | 3.36 | 13.70 | 2.33 | ball ↓0.60, players ↑0.10 |
+  | iso_hoops_bw10 | 3.49 | 13.88 | 2.45 | ball ↓0.42, players ↑0.22 |
+
+  Ball *does* drop slightly under weighting (≤ 4%) but the per-player rise is
+  multiplied by 10 in the total, so the net is always worse. Even the best
+  combined estimate — ball from bw5 specialist (13.70) + players from the 5-seed
+  ensemble (2.19) — gives (10·2.19 + 13.70)/11 = **3.24**, only 0.01 better
+  than the 3.25 ensemble. **The combine math doesn't pay**.
+
+  Verified via wandb run history (300 epochs, 1019 val steps) that this isn't a
+  checkpoint-selection artifact: minimum ball MSE *ever* seen during the bw5 run
+  was 13.67, and the saved best-by-total checkpoint had ball=13.70 — same floor.
+
+  Honest statement of the result: *with this architecture and single-seed
+  weighting, ball MSE has a soft floor around 13.7; reallocating capacity via
+  loss weight doesn't break it.* What's NOT proven: that this is an
+  information-theoretic floor on the task — that would require larger model,
+  ball-only loss, or different (non-equivariant) architecture.
+
+  Lever ranking implied: weight reallocation alone is not the lever; capacity
+  or inductive-bias change for the ball would be.
+
+- **Other candidates:** larger model + ball weighting (isolates capacity from
+  optimization); regularization HP search now that val is trustworthy;
+  diverse cross-architecture ensemble (EqMotion + STGCNN + MART).
 - **Report framing:** "an over-strong O(2) prior + explicit D2 court-frame features
   beats both plain equivariance and learned-via-augmentation," with the
-  normalization and metric-hygiene ablations as supporting evidence.
+  normalization and metric-hygiene ablations as supporting evidence. The ball
+  remains the single concentrated source of irreducible-looking error; making
+  it tractable likely needs a non-equivariant specialist, not capacity
+  reallocation in the joint model.
 
 ---
 
