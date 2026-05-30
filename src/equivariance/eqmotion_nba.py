@@ -110,6 +110,34 @@ class NBASampler(Sampler):
         return len(self.max_start)
 
 
+class NBAEvalSampler(Sampler):
+    """Deterministic validation windows for a stable, low-variance val metric.
+
+    Instead of one *random* window per sequence per epoch (which makes val/mse_ft
+    bounce between epochs and yields a noisy checkpoint-selection signal), this
+    enumerates a fixed set of evenly-spaced windows per sequence. Each sequence
+    contributes the same number of windows (capped at its valid count), so long
+    sequences are not over-weighted — mirroring the test set's one-window-per-id
+    structure while averaging out window-position variance.
+    """
+
+    def __init__(self, max_start, windows_per_seq=8):
+        self.windows = []
+        for i, ms in enumerate(max_start):
+            if ms <= 0:
+                starts = [0]
+            else:
+                k = min(windows_per_seq, ms + 1)
+                starts = sorted({int(round(s)) for s in torch.linspace(0, ms, k).tolist()})
+            self.windows.extend((i, s) for s in starts)
+
+    def __iter__(self):
+        return iter(self.windows)
+
+    def __len__(self):
+        return len(self.windows)
+
+
 class MultiStepMSE:
     def __init__(self):
         self.loss_fn = torch.nn.MSELoss()
@@ -190,6 +218,10 @@ class NBAEqMotionLightningModel(L.LightningModule):
         n_layers: int = 4,
         lr: float = 1e-3,
         weight_decay: float = 5e-4,
+        lr_scheduler: str = "none",  # "none" | "cosine" | "plateau"
+        max_epochs: int = 500,
+        warmup_epochs: int = 0,
+        n_landmarks: int = 0,  # static court nodes appended last (e.g. 2 hoops)
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -221,6 +253,15 @@ class NBAEqMotionLightningModel(L.LightningModule):
         target_xy = y[:, :, :, :2].permute(1, 0, 2, 3).reshape(T, B * N, 2)
         pred_real = pred * self.sigma + self.mu
         target_real = target_xy * self.sigma + self.mu
+        # Score only the real entities (players + ball); static landmark nodes
+        # (hoops) are appended last and are ~stationary, so including them in the
+        # mean deflates val/mse_ft and breaks comparability with the Kaggle metric
+        # (which is over the 11 real entities only).
+        n_land = self.hparams.n_landmarks
+        if n_land > 0:
+            n_real = N - n_land
+            pred_real = pred_real.view(T, B, N, 2)[:, :, :n_real, :].reshape(T, B * n_real, 2)
+            target_real = target_real.view(T, B, N, 2)[:, :, :n_real, :].reshape(T, B * n_real, 2)
         self.log("val/loss", loss, on_epoch=True, prog_bar=True)
         self.log(
             "val/ade_ft",
@@ -247,13 +288,37 @@ class NBAEqMotionLightningModel(L.LightningModule):
             lr=self.hparams.lr,
             weight_decay=self.hparams.weight_decay,
         )
-        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        #     optimizer, mode="min", factor=0.5, patience=8, min_lr=1e-5
-        # )
-        return {
-            "optimizer": optimizer,
-            # "lr_scheduler": {"scheduler": scheduler, "monitor": "val/loss"},
-        }
+        sched = self.hparams.lr_scheduler
+        if sched == "none":
+            return {"optimizer": optimizer}
+        if sched == "plateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode="min", factor=0.5, patience=8, min_lr=1e-5
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {"scheduler": scheduler, "monitor": "val/loss"},
+            }
+        if sched == "cosine":
+            warmup = self.hparams.warmup_epochs
+            total = self.hparams.max_epochs
+            cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max(1, total - warmup), eta_min=self.hparams.lr * 0.02
+            )
+            if warmup > 0:
+                warm = torch.optim.lr_scheduler.LinearLR(
+                    optimizer, start_factor=0.1, total_iters=warmup
+                )
+                scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    optimizer, [warm, cosine], milestones=[warmup]
+                )
+            else:
+                scheduler = cosine
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
+            }
+        raise ValueError(f"unknown lr_scheduler {sched}")
 
     def get_trajectory(self, X: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
         self.eval()
@@ -276,6 +341,9 @@ class NBADataModule(L.LightningDataModule):
         horizon_size=12,
         seed=0,
         add_hoops=False,
+        iso_norm=False,
+        full_val=False,
+        val_windows_per_seq=8,
     ):
         super().__init__()
         self.split_path = split_path
@@ -284,6 +352,9 @@ class NBADataModule(L.LightningDataModule):
         self.horizon_size = horizon_size
         self.seed = seed
         self.add_hoops = add_hoops
+        self.iso_norm = iso_norm
+        self.full_val = full_val
+        self.val_windows_per_seq = val_windows_per_seq
         self.mu = None
         self.sigma = None
 
@@ -308,7 +379,16 @@ class NBADataModule(L.LightningDataModule):
             seq = torch.load(f, weights_only=False)
             all_pos.append(seq[:, :, [0, 1]])
         all_pos = torch.cat(all_pos, dim=0)
-        return all_pos.mean(dim=(0, 1)), all_pos.std(dim=(0, 1))
+        mu = all_pos.mean(dim=(0, 1))
+        if self.iso_norm:
+            # Shared scalar std across x and y so a physical rotation maps to a
+            # rotation in the normalized frame — preserving EqMotion's built-in
+            # rotation/reflection equivariance (anisotropic per-axis std breaks it).
+            s = all_pos.std()
+            sigma = torch.stack([s, s])
+        else:
+            sigma = all_pos.std(dim=(0, 1))
+        return mu, sigma
 
     def train_dataloader(self):
         sampler = NBASampler(
@@ -319,9 +399,16 @@ class NBADataModule(L.LightningDataModule):
         )
 
     def val_dataloader(self):
-        sampler = NBASampler(
-            self.batch_size, self.val_dataset.max_start, seed=self.seed, shuffle=False
-        )
+        if self.full_val:
+            # Deterministic, evenly-spaced windows → stable val/mse_ft for robust
+            # checkpoint selection (no epoch-to-epoch window-draw noise).
+            sampler = NBAEvalSampler(
+                self.val_dataset.max_start, windows_per_seq=self.val_windows_per_seq
+            )
+        else:
+            sampler = NBASampler(
+                self.batch_size, self.val_dataset.max_start, seed=self.seed, shuffle=False
+            )
         return DataLoader(self.val_dataset, batch_size=self.batch_size, sampler=sampler)
 
     def get_kaggle_submission(
@@ -371,27 +458,87 @@ class NBADataModule(L.LightningDataModule):
 
 
 if __name__ == "__main__":
-    L.seed_everything(0)
+    import argparse
+    from lightning.pytorch.callbacks import ModelCheckpoint
+
+    p = argparse.ArgumentParser()
+    p.add_argument("--run-name", default="eqmotion")
+    # tuned-best defaults (optuna #117): hidden_nf=64, hid_channel=64, n_layers=2
+    p.add_argument("--hidden-nf", type=int, default=64)
+    p.add_argument("--hid-channel", type=int, default=64)
+    p.add_argument("--n-layers", type=int, default=2)
+    p.add_argument("--lr", type=float, default=1.8e-3)
+    p.add_argument("--weight-decay", type=float, default=2e-6)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--grad-clip", type=float, default=0.66)
+    p.add_argument("--max-epochs", type=int, default=300)
+    p.add_argument("--patience", type=int, default=40)
+    p.add_argument("--lr-scheduler", default="cosine", choices=["none", "cosine", "plateau"])
+    p.add_argument("--warmup-epochs", type=int, default=5)
+    p.add_argument("--iso-norm", action="store_true")
+    p.add_argument("--add-hoops", action="store_true",
+                   help="Inject 2 static basket nodes (court-frame / D2 structure).")
+    p.add_argument("--full-val", action="store_true",
+                   help="Deterministic multi-window validation for a stable val/mse_ft.")
+    p.add_argument("--val-windows", type=int, default=8,
+                   help="Windows per sequence for --full-val.")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--no-submit", action="store_true")
+    args = p.parse_args()
+
+    L.seed_everything(args.seed, workers=True)
 
     data_module = NBADataModule(
         split_path=str(PROJECT_ROOT / "splits" / "fold0.json"),
-        batch_size=256,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        iso_norm=args.iso_norm,
+        add_hoops=args.add_hoops,
+        full_val=args.full_val,
+        val_windows_per_seq=args.val_windows,
     )
 
-    model = NBAEqMotionLightningModel(lr=1e-4)
+    model = NBAEqMotionLightningModel(
+        hidden_nf=args.hidden_nf,
+        hid_channel=args.hid_channel,
+        n_layers=args.n_layers,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        lr_scheduler=args.lr_scheduler,
+        max_epochs=args.max_epochs,
+        warmup_epochs=args.warmup_epochs,
+        n_landmarks=2 if args.add_hoops else 0,
+    )
 
-    wandb_logger = WandbLogger(project="NML_base", name="eqmotion")
+    wandb_logger = WandbLogger(project="NML_base", name=args.run_name)
 
-    early_stop = EarlyStopping(monitor="val/loss", patience=20, mode="min")
+    ckpt_cb = ModelCheckpoint(
+        dirpath=str(PROJECT_ROOT / "checkpoints" / "eqmotion" / args.run_name),
+        filename="best",
+        monitor="val/mse_ft",
+        mode="min",
+        save_top_k=1,
+    )
+    early_stop = EarlyStopping(
+        monitor="val/mse_ft", patience=args.patience, mode="min"
+    )
 
     trainer = L.Trainer(
-        max_epochs=500,
+        max_epochs=args.max_epochs,
         logger=wandb_logger,
         accelerator="auto",
-        gradient_clip_val=1.0,
-        # callbacks=[early_stop],
+        gradient_clip_val=args.grad_clip,
+        callbacks=[ckpt_cb, early_stop],
     )
 
     trainer.fit(model, data_module)
+    print(f"[{args.run_name}] best val/mse_ft = {ckpt_cb.best_model_score.item():.4f}")
 
-    data_module.get_kaggle_submission(model, str(TEST_DIR), str(SUBMISSION_DIR))
+    if not args.no_submit:
+        # Submit from the BEST checkpoint, not the final-epoch model in memory
+        # (final epoch is typically worse than the checkpointed minimum).
+        best = NBAEqMotionLightningModel.load_from_checkpoint(
+            ckpt_cb.best_model_path, strict=False
+        ).to(model.device).eval()
+        data_module.get_kaggle_submission(best, str(TEST_DIR), str(SUBMISSION_DIR))
+        print(f"[{args.run_name}] submission written from {ckpt_cb.best_model_path}")
