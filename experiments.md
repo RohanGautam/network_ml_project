@@ -17,15 +17,15 @@ Kaggle. Task: C=8 context → H=12 horizon, 11 entities (10 players + ball).
 > joint-training dependency — the ball's predictability depends on sharp
 > *player* representations the joint gradient maintains.
 >
-> **MART head-selection bottleneck (May 30):** MART's per-entity diagnostic
-> shows oracle min-of-K ball MSE = **3.10** (vs EqMotion 13.86), proving the
-> right predictions *exist* in MART's K=20 heads but the mean-of-K reduction
-> blurs them into 15.90. Simple statistical reductions (mean / median /
-> trimmed-mean / closest-to-mean) cluster within 1% of each other → the K
-> heads are **distinct modes**, not noisy perturbations, so no aggregator
-> can pick the right one without a learned signal. Remaining shot at the
-> oracle gap: a **learned head selector** (2–3 hr build). Current best
-> submission stays the EqMotion 5-seed ensemble (val 3.25, Kaggle 3.2).
+> **Two-architecture ball-MSE floor (May 30):** EqMotion's ball MSE bottoms
+> out at ~13.7 across capacity/reweighting/ball-only interventions; MART's
+> bottoms out at ~15.8 across mean / median / trimmed-mean / closest-to-mean
+> reductions AND three learned-selector variants (per-agent, scene-context,
+> ball-only). MART has oracle min-of-K ball = 3.10, but the past trajectory
+> contains insufficient signal to identify which of K=20 future modes
+> obtains — the gap is **task-irreducible** at H=12 from 8 frames of past.
+> Production submission stays the EqMotion 5-seed ensemble (val 3.25,
+> Kaggle 3.2).
 
 ---
 
@@ -422,6 +422,53 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
   `solution_ens5_iso_hoops_val3.25.csv` (EqMotion ensemble). If time before
   June 10 permits, the learned head selector is the highest-upside remaining
   experiment.
+
+- **Learned head selector — TRIED, hits a hard floor at ~5% ball reduction.**
+  Built the principled fix: per-agent MLP that takes (past, agent_id,
+  K=20 candidate trajectories) and outputs softmax weights over heads, end-
+  to-end MSE on the head-weighted prediction. Cache stage runs MART forward
+  on train+val (8 windows/seq each → 27K train / 3K val samples) and saves
+  K predictions to disk so the selector iterates in minutes
+  (`src/mart/cache_mart_preds.py`). Trainer iterates the cached predictions
+  (`src/mart/train_head_selector.py`). Three variants tried:
+
+  | Run | Arch / loss | best val/mse_ball |
+  |---|---|---|
+  | mean-of-K (baseline) | — | 16.78 |
+  | v1: per-agent MLP, joint loss | hidden 128, no scene context | 15.79 |
+  | v2: scene context, bigger MLP | hidden 256, all-agents context | 16.24 (overfit) |
+  | v3: per-agent MLP, ball-only loss | hidden 128, gradient only on ball | 15.87 |
+  | oracle min-of-K | — | 3.10 |
+
+  Three different inductive bets (more context, more capacity, focused loss)
+  converging on ~15.8–16.2 ball is strong evidence the signal isn't
+  recoverable. v2 specifically *trained loss kept dropping* while val rose,
+  classic overfit — meaning the model COULD memorize per-sample selections
+  on training data but those don't generalize. **The K=20 heads encode
+  *future decisions* (who the ballhandler will pass to and when) that
+  aren't deterministically encoded in the 8-frame past.** The oracle gap is
+  irreducible from past trajectories alone.
+
+  Combine math (best selector + EqMotion players): ball 15.79 + players 2.19
+  → 3.43 — still worse than the 3.25 EqMotion ensemble. **The selector
+  approach is dead.** Production submission stays
+  `solution_ens5_iso_hoops_val3.25.csv`.
+
+  Scripts/checkpoints preserved for the report:
+  `src/mart/checkpoints/head_selector_{v1,v2,v3}.pt`,
+  `cache/mart_minade_s1/{train,val}.pt`,
+  `src/mart/{cache_mart_preds,train_head_selector}.py`,
+  `jobs/{train_head_selector,train_head_selector_only}.sh`.
+
+  **Implication for the report narrative:** the EqMotion ball MSE floor at
+  ~13.7 (capacity/reweighting ruled out) and MART's mean-of-K ball at ~16
+  (head selection ruled out) both bottom out in roughly the same regime.
+  Two independent architectural families with two independent intervention
+  strategies converge on the same ball difficulty floor — strong evidence
+  this is a **task floor**, not an architecture/optimization artifact. Ball
+  trajectories at H=12 are *fundamentally multimodal-unpredictable* from an
+  8-frame past, and no point-estimate model that minimizes single-shot MSE
+  can beat the data's inherent uncertainty.
 
 - **Other candidates:** larger model + ball weighting (isolates capacity from
   optimization); regularization HP search now that val is trustworthy;

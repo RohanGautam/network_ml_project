@@ -3,6 +3,7 @@ data
 submissions
 NML_base
 wandb
+cache
 optuna_studies
 # Top-level only — `models` at any depth would also ignore src/mart/models/,
 # which IS source code and needs to be committed.
