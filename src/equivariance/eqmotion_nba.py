@@ -28,23 +28,62 @@ SUBMISSION_DIR.mkdir(exist_ok=True)
 COURT_IMAGE = PROJECT_ROOT / "src" / "img" / "basketball_court.png"
 
 
+# Court-frame landmark presets, each as a list of (x_ft, y_ft, team_id) in the
+# raw court-centered frame. Distinct team_ids let the model's id_embed learn a
+# separate embedding per landmark type. All sets are chosen to respect the
+# court's D2 symmetry (under 180° rotation and the two axis reflections each
+# set maps to itself), so they don't break EqMotion's equivariance.
+LANDMARK_SETS = {
+    "hoops":   [(-41.75, 0.0, 3.0), (41.75, 0.0, 3.0)],
+    "ft":      [(-28.0,  0.0, 4.0), (28.0,  0.0, 4.0)],     # free-throw lines
+    "3pt":     [(-18.0,  0.0, 5.0), (18.0,  0.0, 5.0)],     # 3-pt arc apex
+    "corners": [(-47.0, -25.0, 6.0), (-47.0, 25.0, 6.0),
+                ( 47.0, -25.0, 6.0), ( 47.0, 25.0, 6.0)],
+    "center":  [(0.0, 0.0, 7.0)],
+}
+
+
+def landmarks_from_spec(spec):
+    """Parse 'hoops,ft' → concatenated list of (x,y,team_id). Empty → []."""
+    if not spec or spec == "none":
+        return []
+    out = []
+    for name in spec.split(","):
+        name = name.strip()
+        if name not in LANDMARK_SETS:
+            raise ValueError(
+                f"unknown landmark preset '{name}'; available: {list(LANDMARK_SETS)}"
+            )
+        out.extend(LANDMARK_SETS[name])
+    return out
+
+
 class NBADataset(Dataset):
-    def __init__(self, files, context_size, horizon_size, mu, sigma, add_hoops=False):
+    def __init__(self, files, context_size, horizon_size, mu, sigma,
+                 add_hoops=False, landmarks=None):
         super().__init__()
         self.context_size = context_size
         self.horizon_size = horizon_size
         self.window_size = context_size + horizon_size
-        self.add_hoops = add_hoops
+        # `landmarks` is the general form (list of (x,y,team_id)). `add_hoops` is
+        # kept as a back-compat alias for landmarks=LANDMARK_SETS["hoops"].
+        if landmarks is None:
+            landmarks = LANDMARK_SETS["hoops"] if add_hoops else []
+        self.landmarks = landmarks
         self.load_data(files, mu, sigma)
 
     def load_data(self, files, mu, sigma):
         self.sequences = []
         self.max_start = []
-        # Data is in a court-centered frame (origin at center, x in [-48,48]=length,
-        # y in [-26,26]=width). Hoops sit 5.25 ft in from each baseline (x=+-47) at
-        # center width: x = +-(47-5.25) = +-41.75, y = 0.
-        raw_hoops = torch.tensor([[-41.75, 0.0], [41.75, 0.0]])
-        norm_hoops = (raw_hoops - mu) / sigma
+        # Precompute normalized landmark positions once. Each landmark contributes
+        # one static node appended to the end of the agent axis with [x,y]=normed
+        # position, zero velocity, isplayer=0, team=its preset team_id.
+        if self.landmarks:
+            raw_land = torch.tensor([[x, y] for x, y, _ in self.landmarks],
+                                    dtype=torch.float32)
+            norm_land = (raw_land - mu) / sigma
+            team_ids = torch.tensor([t for _, _, t in self.landmarks],
+                                    dtype=torch.float32)
         for f in files:
             seq = torch.load(f, weights_only=False)
             seq[:, :, [0, 1]] = (seq[:, :, [0, 1]].clone() - mu) / sigma
@@ -53,15 +92,15 @@ class NBADataset(Dataset):
             # feature layout: [x, y, dx, dy, isplayer, team]
             seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
 
-            if self.add_hoops:
-                # Append 2 static landmark nodes: [T, 11, 6] -> [T, 13, 6]
+            if self.landmarks:
+                # Append L static landmark nodes: [T, 11, 6] -> [T, 11+L, 6]
                 T = seq.shape[0]
-                hoop_nodes = torch.zeros((T, 2, 6), dtype=seq.dtype)
-                hoop_nodes[:, :, :2] = norm_hoops  # Broadcast normalized X, Y
-                hoop_nodes[:, :, 2:4] = 0.0  # Static: Velocity is zero
-                hoop_nodes[:, :, 4] = 0.0  # isplayer = 0
-                hoop_nodes[:, :, 5] = 3.0  # Unique "team" ID for landmarks
-                seq = torch.cat([seq, hoop_nodes], dim=1)
+                L = len(self.landmarks)
+                land_nodes = torch.zeros((T, L, 6), dtype=seq.dtype)
+                land_nodes[:, :, :2] = norm_land
+                land_nodes[:, :, 4] = 0.0      # isplayer = 0
+                land_nodes[:, :, 5] = team_ids  # one team_id per landmark type
+                seq = torch.cat([seq, land_nodes], dim=1)
 
             self.sequences.append(seq)
             self.max_start.append(max(0, len(seq) - self.window_size))
@@ -347,6 +386,7 @@ class NBADataModule(L.LightningDataModule):
         horizon_size=12,
         seed=0,
         add_hoops=False,
+        landmarks=None,
         iso_norm=False,
         full_val=False,
         val_windows_per_seq=8,
@@ -357,7 +397,11 @@ class NBADataModule(L.LightningDataModule):
         self.context_size = context_size
         self.horizon_size = horizon_size
         self.seed = seed
-        self.add_hoops = add_hoops
+        # `landmarks` is the general form; `add_hoops` is a back-compat alias.
+        if landmarks is None:
+            landmarks = LANDMARK_SETS["hoops"] if add_hoops else []
+        self.landmarks = landmarks
+        self.add_hoops = add_hoops  # kept for any external readers; prefer landmarks
         self.iso_norm = iso_norm
         self.full_val = full_val
         self.val_windows_per_seq = val_windows_per_seq
@@ -376,7 +420,7 @@ class NBADataModule(L.LightningDataModule):
             self.horizon_size,
             self.mu,
             self.sigma,
-            add_hoops=self.add_hoops,
+            landmarks=self.landmarks,
         )
         self.val_dataset = NBADataset(
             val_files,
@@ -384,7 +428,7 @@ class NBADataModule(L.LightningDataModule):
             self.horizon_size,
             self.mu,
             self.sigma,
-            add_hoops=self.add_hoops,
+            landmarks=self.landmarks,
         )
 
     def _compute_normalization_statistics(self, files):
@@ -441,16 +485,21 @@ class NBADataModule(L.LightningDataModule):
             vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
             seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
 
-            if self.add_hoops:
+            if self.landmarks:
+                # Mirror the dataset's landmark injection so the test input shape
+                # matches training (the model expects the same N landmark nodes).
                 T = seq.shape[0]
-                # Court-centered frame: hoops at x=+-41.75 (5.25 ft in), y=0.
-                raw_hoops = torch.tensor([[-41.75, 0.0], [41.75, 0.0]])
-                norm_hoops = (raw_hoops - self.mu) / self.sigma
-                hoop_nodes = torch.zeros((T, 2, 6), dtype=seq.dtype)
-                hoop_nodes[:, :, :2] = norm_hoops
-                hoop_nodes[:, :, 4] = 0.0
-                hoop_nodes[:, :, 5] = 3.0
-                seq = torch.cat([seq, hoop_nodes], dim=1)
+                L = len(self.landmarks)
+                raw = torch.tensor([[x, y] for x, y, _ in self.landmarks],
+                                   dtype=torch.float32)
+                norm = (raw - self.mu) / self.sigma
+                team_ids = torch.tensor([t for _, _, t in self.landmarks],
+                                        dtype=seq.dtype)
+                land_nodes = torch.zeros((T, L, 6), dtype=seq.dtype)
+                land_nodes[:, :, :2] = norm
+                land_nodes[:, :, 4] = 0.0
+                land_nodes[:, :, 5] = team_ids
+                seq = torch.cat([seq, land_nodes], dim=1)
 
             traj = model.get_trajectory(seq, self.mu, self.sigma)
             # traj = traj[8:, :, :2].reshape(-1)
@@ -511,18 +560,34 @@ if __name__ == "__main__":
         default=8,
         help="Windows per sequence for --full-val.",
     )
+    p.add_argument(
+        "--landmarks",
+        default="",
+        help="Comma-separated landmark preset names from LANDMARK_SETS "
+             "(e.g. 'hoops,ft,3pt'). Overrides --add-hoops if given.",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-submit", action="store_true")
     args = p.parse_args()
 
     L.seed_everything(args.seed, workers=True)
 
+    # Resolve landmarks: explicit --landmarks wins; else fall back to --add-hoops.
+    if args.landmarks:
+        landmarks = landmarks_from_spec(args.landmarks)
+    elif args.add_hoops:
+        landmarks = LANDMARK_SETS["hoops"]
+    else:
+        landmarks = []
+    print(f"[{args.run_name}] landmarks={args.landmarks or ('hoops' if args.add_hoops else 'none')} "
+          f"(n={len(landmarks)})")
+
     data_module = NBADataModule(
         split_path=str(PROJECT_ROOT / "splits" / "fold0.json"),
         batch_size=args.batch_size,
         seed=args.seed,
         iso_norm=args.iso_norm,
-        add_hoops=args.add_hoops,
+        landmarks=landmarks,
         full_val=args.full_val,
         val_windows_per_seq=args.val_windows,
     )
@@ -536,7 +601,7 @@ if __name__ == "__main__":
         lr_scheduler=args.lr_scheduler,
         max_epochs=args.max_epochs,
         warmup_epochs=args.warmup_epochs,
-        n_landmarks=2 if args.add_hoops else 0,
+        n_landmarks=len(landmarks),
     )
 
     wandb_logger = WandbLogger(project="NML_base", name=args.run_name)

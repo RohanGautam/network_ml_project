@@ -134,9 +134,37 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
 - **Done:** 5-seed ensemble → val 3.25 (from 3.33); reflection TTA confirmed an
   exact no-op (EqMotion is exactly O(2)-equivariant). Submission:
   `submissions/solution_ens5_iso_hoops_val3.25.csv`.
-- **Candidates:** more court landmarks (free-throw lines, 3-pt arc, sidelines) —
-  judge on Kaggle, not val (risk of court-frame overfit). Targeted regularization
-  HP search now that val is trustworthy. Diverse cross-architecture ensemble.
+- **More court landmarks — TRIED, all hurt (negative result).** Job 2952604,
+  all under iso + cosine + full-val + honest 11-entity metric, single seed,
+  vs the hoops-only control = **3.33**:
+
+  | Landmark set | n_land | val/mse_ft |
+  |---|---|---|
+  | hoops (control) | 2 | **3.33** |
+  | hoops + free-throw lines (±28, 0) | 4 | 3.358 |
+  | hoops + 3-pt arc apex (±18, 0) | 4 | 3.372 |
+  | hoops + ft + 3-pt | 6 | 3.417 |
+  | hoops + 4 court corners (±47, ±25) | 6 | 3.422 |
+
+  All worse than hoops-only; more nodes → monotonically worse. Plausible reason:
+  ft and 3-pt apex sit on the basket axis already encoded by the two hoops, so
+  distance/bearing to them is a linear function of distance/bearing to hoops —
+  redundant. Corners are far from the action. The extra nodes dilute the
+  message-passing without adding court information.
+
+  Useful for the report: this rules out "hoops worked because of node count, not
+  court information," and tightens the story to *"hoops are the right amount of
+  D2 court structure."* Code: `LANDMARK_SETS` + `--landmarks PRESET[,PRESET...]`
+  in [src/equivariance/eqmotion_nba.py](src/equivariance/eqmotion_nba.py).
+- **MART baseline (next architecture).** `src/mart/main_nba_pt.py` — a more
+  expressive relational/multiscale transformer than EqMotion. Hardcoded W&B key
+  removed (uses `.env` like the other scripts). Jobs: `jobs/train_mart.sh`
+  (baseline training) and `jobs/submit_mart.sh` (Kaggle CSV from a checkpoint).
+  Watch out: MART's native loss is min-of-K (multimodal) — the Kaggle metric is
+  single-shot mean MSE, so MART may underperform on this leaderboard unless
+  trained with `--loss mean_mse` (CVAE/SocialVAE lost for exactly this reason).
+- **Other candidates:** targeted regularization HP search now that val is
+  trustworthy; diverse cross-architecture ensemble (EqMotion + STGCNN + MART).
 - **Report framing:** "an over-strong O(2) prior + explicit D2 court-frame features
   beats both plain equivariance and learned-via-augmentation," with the
   normalization and metric-hygiene ablations as supporting evidence.
