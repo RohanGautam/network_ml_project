@@ -15,8 +15,15 @@ Kaggle. Task: C=8 context → H=12 horizon, 11 entities (10 players + ball).
 > tried within EqMotion: ball-weighted loss, true ball-only loss, and larger
 > capacity all converge to the same range. The mechanistic reason is the
 > joint-training dependency — the ball's predictability depends on sharp
-> *player* representations the joint gradient maintains. Breaking the floor
-> would need a non-equivariant ball architecture, not capacity reallocation.
+> *player* representations the joint gradient maintains.
+>
+> **New direction (May 30):** MART's per-entity diagnostic shows oracle
+> min-of-K ball MSE = **3.10** (vs EqMotion 13.86), proving the right
+> predictions *exist* in MART's K=20 heads but are blurred by the mean-of-K
+> reduction (which sees 15.90). The bottleneck has moved from "ball model
+> capacity" to "K-head selection at inference." Next: K-reduction sweep
+> (median / mode / closest-to-mean / learned selector) on existing MART
+> checkpoints — no retraining required.
 
 ---
 
@@ -316,6 +323,55 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
   spend effort on cross-architecture diversity (combine EqMotion ensemble
   with MART's predictions per-entity, see if MART's ball error is in a
   different regime).
+
+- **MART per-entity diagnostic — HUGE finding, reframes the problem.**
+  Job 2952871, `src/mart/diagnose_per_entity.py` on existing 300-ep MART
+  checkpoints (canonical agent order: TeamA(5)+TeamB(5)+Ball, so ball=idx 10):
+
+  | Run | Reduction | total11 | ball | players |
+  |---|---|---|---|---|
+  | mart_minade_s1 | mean-of-K | 3.67 | 15.90 | 2.44 |
+  | mart_minade_s1 | **oracle min-of-K (=20)** | **0.64** | **3.10** | **0.39** |
+  | mart_meanmse_s1 | mean-of-K | 3.90 | 16.78 | 2.61 |
+  | mart_meanmse_s1 | oracle min-of-K (=20) | 3.47 | 14.67 | 2.35 |
+
+  Three things matter here:
+
+  1. **MART's mean-of-K ball (15.90) is WORSE than EqMotion's (13.86).** So
+     the "MART's ball might be in a different regime" hypothesis was wrong
+     when interpreted naively. *Within the mean-of-K reduction*, MART loses.
+  2. **But MART's oracle ball MSE is 3.10** — 4.5× below EqMotion's 13.7
+     floor. There exists, for every val sample, at least one head among
+     K=20 that nails the ball almost perfectly. The K heads are doing real,
+     diverse work; the mean reduction is destroying it. Oracle players is
+     0.39 (6× below EqMotion's 2.19), and oracle total is 0.64 (5× below
+     the 2.6 leaderboard top).
+  3. **mean_mse training kills the diversity** (min-of-K ball jumps from
+     3.10 → 14.67 vs minade). Re-confirms the earlier MART finding: aligning
+     the loss to single-shot MSE collapses the heads-as-implicit-ensemble
+     structure that produces the diverse modes.
+
+  **This completely reframes the problem.** MART's bottleneck isn't
+  capacity or arch — it's **head selection at inference**. The right modes
+  exist in the K=20 hypotheses; mean-of-K is blurring them. Conditional on
+  *any* reduction better than mean unlocking just a fraction of the oracle
+  gap, MART becomes the architecture to push.
+
+  Next experiments (cheap, no retraining required):
+  - Median-of-K instead of mean-of-K (robust to outlier modes).
+  - Trimmed-mean / mode (cluster K heads, take largest cluster's centroid).
+  - "Closest-to-mean" head selection (pick the head nearest the consensus —
+    the high-density mode rather than the centroid).
+  - Physics-prior head selection (pick the head whose ball trajectory is
+    most consistent with constant-velocity extrapolation).
+  - Eventually: learn a head selector (small MLP on context features),
+    or Gumbel-softmax mixture-of-experts at training.
+
+  Decision: pursue K-reduction first on `mart_minade_s1`. If any simple
+  reduction beats mean's 15.90 ball by even ~50% (i.e., reaches ~8), MART
+  combined with EqMotion's player ensemble dramatically beats the 3.25
+  current best. The combine math: ball at 8 + EqMotion players at 2.19 →
+  (10·2.19 + 8)/11 = **2.72**, well past the leaderboard top.
 
 - **Other candidates:** larger model + ball weighting (isolates capacity from
   optimization); regularization HP search now that val is trustworthy;
