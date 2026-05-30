@@ -17,13 +17,15 @@ Kaggle. Task: C=8 context → H=12 horizon, 11 entities (10 players + ball).
 > joint-training dependency — the ball's predictability depends on sharp
 > *player* representations the joint gradient maintains.
 >
-> **New direction (May 30):** MART's per-entity diagnostic shows oracle
-> min-of-K ball MSE = **3.10** (vs EqMotion 13.86), proving the right
-> predictions *exist* in MART's K=20 heads but are blurred by the mean-of-K
-> reduction (which sees 15.90). The bottleneck has moved from "ball model
-> capacity" to "K-head selection at inference." Next: K-reduction sweep
-> (median / mode / closest-to-mean / learned selector) on existing MART
-> checkpoints — no retraining required.
+> **MART head-selection bottleneck (May 30):** MART's per-entity diagnostic
+> shows oracle min-of-K ball MSE = **3.10** (vs EqMotion 13.86), proving the
+> right predictions *exist* in MART's K=20 heads but the mean-of-K reduction
+> blurs them into 15.90. Simple statistical reductions (mean / median /
+> trimmed-mean / closest-to-mean) cluster within 1% of each other → the K
+> heads are **distinct modes**, not noisy perturbations, so no aggregator
+> can pick the right one without a learned signal. Remaining shot at the
+> oracle gap: a **learned head selector** (2–3 hr build). Current best
+> submission stays the EqMotion 5-seed ensemble (val 3.25, Kaggle 3.2).
 
 ---
 
@@ -372,6 +374,54 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
   combined with EqMotion's player ensemble dramatically beats the 3.25
   current best. The combine math: ball at 8 + EqMotion players at 2.19 →
   (10·2.19 + 8)/11 = **2.72**, well past the leaderboard top.
+
+- **K-reduction sweep — TRIED, simple reductions can't bridge the oracle
+  gap.** Job 2952879, four point-estimate reductions of MART's K=20 heads
+  evaluated on `mart_minade_s1`:
+
+  | Reduction | total11 | ball | players |
+  |---|---|---|---|
+  | mean-of-K (baseline) | 3.67 | 15.90 | 2.44 |
+  | median-of-K | 3.68 | 16.09 | 2.44 |
+  | trimmed-mean (drop top/bottom 2 of 20) | 3.63 | 15.71 | 2.43 |
+  | closest-to-mean (pick head closest to centroid) | 3.83 | 16.81 | 2.53 |
+  | **oracle min-of-K (=20)** | **0.64** | **3.10** | **0.39** |
+
+  All four simple reductions cluster within ±0.5 ball MSE — the best
+  (trimmed-mean) is only 1% better than vanilla mean. "closest-to-mean" is
+  *worse* because the K-centroid it picks against is itself unmoored from
+  any real mode, so the closest-to-it head is the most-boring one.
+
+  **Sharpened interpretation.** The K=20 heads aren't noisy perturbations
+  of a central prediction (a 5× oracle gap would be impossible if they
+  were) — they are **genuinely distinct modes** (pass-to-A vs pass-to-B vs
+  drive vs shoot, etc.). The mean-of-K hurts the *ball* disproportionately
+  because the ball has many discrete futures whose centroid is guaranteed
+  to be far from every one of them; players have fewer modes per agent and
+  averaging is closer to harmless. Bridging the oracle gap requires
+  **predicting which mode obtains given the context** — that's a learning
+  problem in itself, not something statistical aggregation can solve.
+
+  **Real remaining options to bridge the gap:**
+  - **Learned head selector** (the principled fix): small MLP/attention on
+    the past trajectory + the K candidate predictions, outputs a soft
+    distribution over the 20 heads. End-to-end MSE on head-weighted
+    prediction. ~2–3 hour build; works only if past contains enough signal
+    to predict the mode (often yes for basketball — handler identity
+    strongly predicts ball destination).
+  - **Per-head confidence calibration**: MART's min_ade already specializes
+    heads to different samples. Add a confidence head, use confidence-
+    weighted reduction at inference.
+  - **Mode-of-K via clustering**: cheap, but if mean/median/trimmed-mean
+    didn't help, clustering's centroid-of-largest-cluster probably won't
+    either.
+
+  Decision: park MART for now. The K=20 oracle ball of 3.10 is a tantalizing
+  upper bound, but unlocking it needs a learned selector — a real build with
+  uncertain return. Best current submission stays
+  `solution_ens5_iso_hoops_val3.25.csv` (EqMotion ensemble). If time before
+  June 10 permits, the learned head selector is the highest-upside remaining
+  experiment.
 
 - **Other candidates:** larger model + ball weighting (isolates capacity from
   optimization); regularization HP search now that val is trustworthy;

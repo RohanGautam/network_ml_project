@@ -117,9 +117,48 @@ def evaluate(checkpoint_path, split_path, batch_size, num_workers, device):
 
     mu_d = mu.to(device)
     sigma_d = sigma.to(device)
-    # Accumulate sum-of-squared-errors and counts per (entity-group, K-reduction).
-    sse = {('mean', 'ball'): 0.0, ('mean', 'players'): 0.0,
-           ('mink', 'ball'): 0.0, ('mink', 'players'): 0.0}
+
+    # ---- K-head reduction strategies ----
+    # Each takes y_pred_ft [B, 11, K, T, 2] and returns a single trajectory
+    # [B, 11, T, 2]. The goal is to recover MART's diverse-modes signal that
+    # plain mean-of-K destroys by blurring incompatible hypotheses together.
+    def _r_mean(p):
+        # Centroid of all K modes. Smooth but unphysical when modes diverge.
+        return p.mean(dim=2)
+
+    def _r_median(p):
+        # Per-element median over K. Robust to outlier modes but mixes axes
+        # across heads (the resulting trajectory may not match any single head).
+        return p.median(dim=2).values
+
+    def _r_trimmed_mean(p, trim=2):
+        # Drop the `trim` highest and lowest values per element across K, mean
+        # the rest. With K=20 and trim=2, averages the middle 16 values.
+        K = p.shape[2]
+        sorted_p, _ = p.sort(dim=2)
+        return sorted_p[:, :, trim:K - trim].mean(dim=2)
+
+    def _r_closest_to_mean(p):
+        # Per-agent: pick the SINGLE head whose full trajectory is closest to
+        # the K-mean (the high-density mode rather than the centroid). Yields
+        # a physically coherent trajectory from one head.
+        m = p.mean(dim=2, keepdim=True)              # [B, 11, 1, T, 2]
+        dist = ((p - m) ** 2).sum(dim=(3, 4))        # [B, 11, K]
+        best_k = dist.argmin(dim=2)                  # [B, 11]
+        B, N, K, T, _ = p.shape
+        idx = best_k.view(B, N, 1, 1, 1).expand(B, N, 1, T, 2)
+        return p.gather(2, idx).squeeze(2)           # [B, 11, T, 2]
+
+    REDUCTIONS = {
+        'mean':            _r_mean,
+        'median':          _r_median,
+        'trimmed_mean':    _r_trimmed_mean,
+        'closest_to_mean': _r_closest_to_mean,
+    }
+    # Plus oracle min-of-K, which is special (uses ground truth).
+
+    # Accumulators per (reduction, entity-group)
+    sse = {(r, e): 0.0 for r in (list(REDUCTIONS) + ['mink']) for e in ('ball', 'players')}
     cnt = {k: 0 for k in sse}
 
     with torch.no_grad():
@@ -141,45 +180,43 @@ def evaluate(checkpoint_path, split_path, batch_size, num_workers, device):
                 y_ft = y_ft[:, :HOOPS_N_REAL_AGENTS]
             # Now y_pred_ft [B, 11, K, T, 2], y_ft [B, 11, T, 2]
 
-            # Mean-of-K point estimate (the Kaggle submission), per entity.
-            mean_pred = y_pred_ft.mean(dim=2)  # [B, 11, T, 2]
-            sq = (mean_pred - y_ft) ** 2       # [B, 11, T, 2]
+            # Point-estimate reductions (each picks one trajectory per agent).
+            for name, fn in REDUCTIONS.items():
+                pred = fn(y_pred_ft)                          # [B, 11, T, 2]
+                sq = (pred - y_ft) ** 2                       # [B, 11, T, 2]
+                ball_sq = sq[:, BALL_IDX]
+                player_sq = sq[:, :BALL_IDX]
+                sse[(name, 'ball')]    += ball_sq.sum().item();    cnt[(name, 'ball')]    += ball_sq.numel()
+                sse[(name, 'players')] += player_sq.sum().item();  cnt[(name, 'players')] += player_sq.numel()
 
-            # Oracle min-of-K MSE per entity: per-trajectory MSE-per-K then min.
-            #   K view: [B, 11, K, T, 2] -> per-(B,N,K) MSE over (T, axes) -> min over K
+            # Oracle min-of-K (lower bound; uses ground truth to pick best head).
             sq_k = (y_pred_ft - y_ft.unsqueeze(2)) ** 2  # [B, 11, K, T, 2]
             mse_per_k = sq_k.mean(dim=(3, 4))            # [B, 11, K]
             mse_mink = mse_per_k.min(dim=2).values        # [B, 11]
-
-            # Accumulate ball (idx 10) and players (idx 0..9) separately.
-            ball_sq = sq[:, BALL_IDX]           # [B, T, 2]
-            player_sq = sq[:, :BALL_IDX]        # [B, 10, T, 2]
-            sse[('mean', 'ball')]    += ball_sq.sum().item();    cnt[('mean', 'ball')]    += ball_sq.numel()
-            sse[('mean', 'players')] += player_sq.sum().item();  cnt[('mean', 'players')] += player_sq.numel()
-            # For min-of-K, the "MSE" is already a mean over (T, axes), so each
-            # entry counts once per (batch, entity). Accumulate sum and count
-            # of these per-(B,N) MSEs and divide at the end.
-            ball_mink = mse_mink[:, BALL_IDX]           # [B]
-            player_mink = mse_mink[:, :BALL_IDX]        # [B, 10]
+            ball_mink = mse_mink[:, BALL_IDX]
+            player_mink = mse_mink[:, :BALL_IDX]
             sse[('mink', 'ball')]    += ball_mink.sum().item();    cnt[('mink', 'ball')]    += ball_mink.numel()
             sse[('mink', 'players')] += player_mink.sum().item();  cnt[('mink', 'players')] += player_mink.numel()
 
     res = {k: sse[k] / max(cnt[k], 1) for k in sse}
-    res[('mean', 'total11')] = (
-        (10 * res[('mean', 'players')] + res[('mean', 'ball')]) / 11
-    )
-    res[('mink', 'total11')] = (
-        (10 * res[('mink', 'players')] + res[('mink', 'ball')]) / 11
-    )
+    for r in list(REDUCTIONS) + ['mink']:
+        res[(r, 'total11')] = (10 * res[(r, 'players')] + res[(r, 'ball')]) / 11
+
     print('  ----------------- val/mse_ft (denorm, feet²) -----------------')
-    print(f'  {"reduction":12s} {"total11":>10s} {"ball":>10s} {"players":>10s}  ball/players')
-    for red in ('mean', 'mink'):
+    print(f'  {"reduction":18s} {"total11":>10s} {"ball":>10s} {"players":>10s}  ball/players')
+    label = {
+        'mean': 'mean-of-K',
+        'median': 'median-of-K',
+        'trimmed_mean': 'trimmed-mean',
+        'closest_to_mean': 'closest-to-mean',
+        'mink': f'oracle min-of-K(={opts.sample_k})',
+    }
+    for red in list(REDUCTIONS) + ['mink']:
         total = res[(red, 'total11')]
         ball = res[(red, 'ball')]
         play = res[(red, 'players')]
         ratio = ball / max(play, 1e-9)
-        tag = 'mean-of-K' if red == 'mean' else f'min-of-K(={opts.sample_k})'
-        print(f'  {tag:12s} {total:10.4f} {ball:10.4f} {play:10.4f}  {ratio:5.2f}x')
+        print(f'  {label[red]:18s} {total:10.4f} {ball:10.4f} {play:10.4f}  {ratio:5.2f}x')
 
 
 def main():
