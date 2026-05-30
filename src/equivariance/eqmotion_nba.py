@@ -128,7 +128,9 @@ class NBAEvalSampler(Sampler):
                 starts = [0]
             else:
                 k = min(windows_per_seq, ms + 1)
-                starts = sorted({int(round(s)) for s in torch.linspace(0, ms, k).tolist()})
+                starts = sorted(
+                    {int(round(s)) for s in torch.linspace(0, ms, k).tolist()}
+                )
             self.windows.extend((i, s) for s in starts)
 
     def __iter__(self):
@@ -260,8 +262,12 @@ class NBAEqMotionLightningModel(L.LightningModule):
         n_land = self.hparams.n_landmarks
         if n_land > 0:
             n_real = N - n_land
-            pred_real = pred_real.view(T, B, N, 2)[:, :, :n_real, :].reshape(T, B * n_real, 2)
-            target_real = target_real.view(T, B, N, 2)[:, :, :n_real, :].reshape(T, B * n_real, 2)
+            pred_real = pred_real.view(T, B, N, 2)[:, :, :n_real, :].reshape(
+                T, B * n_real, 2
+            )
+            target_real = target_real.view(T, B, N, 2)[:, :, :n_real, :].reshape(
+                T, B * n_real, 2
+            )
         self.log("val/loss", loss, on_epoch=True, prog_bar=True)
         self.log(
             "val/ade_ft",
@@ -365,11 +371,19 @@ class NBADataModule(L.LightningDataModule):
         val_files = [data_dir / f for f in manifest["val"]]
         self.mu, self.sigma = self._compute_normalization_statistics(train_files)
         self.train_dataset = NBADataset(
-            train_files, self.context_size, self.horizon_size, self.mu, self.sigma,
+            train_files,
+            self.context_size,
+            self.horizon_size,
+            self.mu,
+            self.sigma,
             add_hoops=self.add_hoops,
         )
         self.val_dataset = NBADataset(
-            val_files, self.context_size, self.horizon_size, self.mu, self.sigma,
+            val_files,
+            self.context_size,
+            self.horizon_size,
+            self.mu,
+            self.sigma,
             add_hoops=self.add_hoops,
         )
 
@@ -407,7 +421,10 @@ class NBADataModule(L.LightningDataModule):
             )
         else:
             sampler = NBASampler(
-                self.batch_size, self.val_dataset.max_start, seed=self.seed, shuffle=False
+                self.batch_size,
+                self.val_dataset.max_start,
+                seed=self.seed,
+                shuffle=False,
             )
         return DataLoader(self.val_dataset, batch_size=self.batch_size, sampler=sampler)
 
@@ -473,15 +490,27 @@ if __name__ == "__main__":
     p.add_argument("--grad-clip", type=float, default=0.66)
     p.add_argument("--max-epochs", type=int, default=300)
     p.add_argument("--patience", type=int, default=40)
-    p.add_argument("--lr-scheduler", default="cosine", choices=["none", "cosine", "plateau"])
+    p.add_argument(
+        "--lr-scheduler", default="cosine", choices=["none", "cosine", "plateau"]
+    )
     p.add_argument("--warmup-epochs", type=int, default=5)
     p.add_argument("--iso-norm", action="store_true")
-    p.add_argument("--add-hoops", action="store_true",
-                   help="Inject 2 static basket nodes (court-frame / D2 structure).")
-    p.add_argument("--full-val", action="store_true",
-                   help="Deterministic multi-window validation for a stable val/mse_ft.")
-    p.add_argument("--val-windows", type=int, default=8,
-                   help="Windows per sequence for --full-val.")
+    p.add_argument(
+        "--add-hoops",
+        action="store_true",
+        help="Inject 2 static basket nodes (court-frame / D2 structure).",
+    )
+    p.add_argument(
+        "--full-val",
+        action="store_true",
+        help="Deterministic multi-window validation for a stable val/mse_ft.",
+    )
+    p.add_argument(
+        "--val-windows",
+        type=int,
+        default=8,
+        help="Windows per sequence for --full-val.",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-submit", action="store_true")
     args = p.parse_args()
@@ -519,9 +548,7 @@ if __name__ == "__main__":
         mode="min",
         save_top_k=1,
     )
-    early_stop = EarlyStopping(
-        monitor="val/mse_ft", patience=args.patience, mode="min"
-    )
+    early_stop = EarlyStopping(monitor="val/mse_ft", patience=args.patience, mode="min")
 
     trainer = L.Trainer(
         max_epochs=args.max_epochs,
@@ -537,8 +564,12 @@ if __name__ == "__main__":
     if not args.no_submit:
         # Submit from the BEST checkpoint, not the final-epoch model in memory
         # (final epoch is typically worse than the checkpointed minimum).
-        best = NBAEqMotionLightningModel.load_from_checkpoint(
-            ckpt_cb.best_model_path, strict=False
-        ).to(model.device).eval()
+        best = (
+            NBAEqMotionLightningModel.load_from_checkpoint(
+                ckpt_cb.best_model_path, strict=False
+            )
+            .to(model.device)
+            .eval()
+        )
         data_module.get_kaggle_submission(best, str(TEST_DIR), str(SUBMISSION_DIR))
         print(f"[{args.run_name}] submission written from {ckpt_cb.best_model_path}")
