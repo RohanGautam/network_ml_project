@@ -21,15 +21,14 @@
 # printed best val/mse_ft.
 COMMON="--max-epochs 300 --patience 40 --full-val"
 declare -a RUNS=(
-  # Court-landmark sweep. Hoops alone gave honest val 3.33 / Kaggle 3.2 — the
-  # single biggest lever found. Try richer D2-respecting landmark sets to see
-  # whether more court structure pushes further. Each preset is a distinct
-  # team_id so the model's id_embed can specialize per landmark type. Control:
-  # iso_hoops_s0=3.33 (same seed, same code path, hoops only).
-  "iso_l_hoops_ft        $COMMON --iso-norm --landmarks hoops,ft"
-  "iso_l_hoops_3pt       $COMMON --iso-norm --landmarks hoops,3pt"
-  "iso_l_hoops_corners   $COMMON --iso-norm --landmarks hoops,corners"
-  "iso_l_hoops_ft_3pt    $COMMON --iso-norm --landmarks hoops,ft,3pt"
+  # Ball-weighted loss sweep. Per-entity diagnostic showed ball MSE = 13.86
+  # vs players 2.19 (6.3x harder, ~39% of total MSE). Weighting the ball's loss
+  # term concentrates capacity on the hardest entity while keeping joint
+  # multi-agent context. Control = iso_hoops_s0 (ball_weight=1) at val 3.33.
+  # Same architecture, iso+hoops+cosine+full-val, only --ball-weight differs.
+  "iso_hoops_bw3   $COMMON --iso-norm --add-hoops --ball-weight 3"
+  "iso_hoops_bw5   $COMMON --iso-norm --add-hoops --ball-weight 5"
+  "iso_hoops_bw10  $COMMON --iso-norm --add-hoops --ball-weight 10"
 )
 # ──────────────────────────────────────────────────────────────────────────────
 
