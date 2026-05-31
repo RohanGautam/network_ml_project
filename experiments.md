@@ -17,13 +17,18 @@ Kaggle. Task: C=8 context → H=12 horizon, 11 entities (10 players + ball).
 > joint-training dependency — the ball's predictability depends on sharp
 > *player* representations the joint gradient maintains.
 >
-> **Two-architecture ball-MSE floor (May 30):** EqMotion's ball MSE bottoms
-> out at ~13.7 across capacity/reweighting/ball-only interventions; MART's
-> bottoms out at ~15.8 across mean / median / trimmed-mean / closest-to-mean
-> reductions AND three learned-selector variants (per-agent, scene-context,
-> ball-only). MART has oracle min-of-K ball = 3.10, but the past trajectory
-> contains insufficient signal to identify which of K=20 future modes
-> obtains — the gap is **task-irreducible** at H=12 from 8 frames of past.
+> **Task-floor verdict (May 30–31):** the EqMotion ensemble at val 3.25 /
+> Kaggle 3.2 sits at or near the task floor for both entity classes given
+> the 8-frame past at H=12. Ball MSE bottoms out at ~13.7 across every
+> EqMotion intervention (capacity, weighting, ball-only loss) and ~15.8
+> across every MART intervention (mean/median/trimmed-mean/closest-to-mean
+> reductions + three learned-selector variants). Player MSE bottoms out at
+> 2.19 across both `min_ade` and `mean_mse` residual-MART variants —
+> ruling out both multimodal head selection AND deterministic regression on
+> systematic bias. MART's oracle min-of-K total = 0.64 proves the right
+> answers *exist* in K=20 heads but the past doesn't determine which one
+> obtains. The 2.6 leaderboard top is reachable in principle but requires
+> bridging an oracle gap that 8 frames of past cannot identify.
 > Production submission stays the EqMotion 5-seed ensemble (val 3.25,
 > Kaggle 3.2).
 
@@ -469,6 +474,40 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
   trajectories at H=12 are *fundamentally multimodal-unpredictable* from an
   8-frame past, and no point-estimate model that minimizes single-shot MSE
   can beat the data's inherent uncertainty.
+
+- **Residual MART for players — TRIED, both losses fail (final negative
+  result that closes the loop on players too).** Built the boosting-style
+  pipeline (`src/mart/{cache_eqmotion_residuals,train_mart_residual,
+  submit_mart_residual}.py`, `jobs/train_mart_residual.sh`): cache EqMotion
+  5-seed ensemble predictions on train+val+test windows, train fresh MART
+  to predict the player residuals (`target − EqMotion_base`) with ball
+  gradient zeroed, at inference combine `EqMotion_base + MART_residual` for
+  players and keep `EqMotion_base` for ball. Two loss variants tested:
+
+  | Run | Loss | best val/total11 | players |
+  |---|---|---|---|
+  | EqMotion-alone (baseline) | — | **3.292** | 2.217 |
+  | mart_residual_v1 | min_ade (multimodal) | 3.295 (~flat) | 2.222 |
+  | mart_residual_v2 | mean_mse (regression) | 3.357 (worse) | overfits to 2.78 |
+
+  - **v1 (min_ade)** is essentially flat: K=20 heads find valid multimodal
+    residuals but the mean-of-K reduction averages them back to ≈0. Same
+    head-selection bottleneck as before.
+  - **v2 (mean_mse)** overfits hard: training loss collapses 17× (0.066 →
+    0.004) while val total11 climbs from 3.37 → 3.81. Model can fit per-
+    sample training residuals but they're sample-specific noise, not a
+    learnable systematic bias.
+
+  **Together these two losses test orthogonal hypotheses and both fail.**
+  No multimodal mode that's mean-recoverable; no systematic bias that's
+  conditionally-learnable. **Player residuals are conditionally noise given
+  the 8-frame past** — EqMotion's player MSE 2.19 is at the floor.
+
+  Combined with the ball-side findings, the picture is now consistent: the
+  EqMotion ensemble at val 3.25 / Kaggle 3.2 is essentially at the task
+  floor for this dataset and horizon. The 2.6 leaderboard top is reachable
+  in principle (we've seen MART's oracle min-of-K total = 0.64), but that
+  requires bridging an oracle gap that 8 frames of past don't determine.
 
 - **Other candidates:** larger model + ball weighting (isolates capacity from
   optimization); regularization HP search now that val is trustworthy;
