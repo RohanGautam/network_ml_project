@@ -25,12 +25,15 @@ Kaggle. Task: C=8 context → H=12 horizon, 11 entities (10 players + ball).
 > reductions + three learned-selector variants). Player MSE bottoms out at
 > 2.19 across both `min_ade` and `mean_mse` residual-MART variants —
 > ruling out both multimodal head selection AND deterministic regression on
-> systematic bias. MART's oracle min-of-K total = 0.64 proves the right
-> answers *exist* in K=20 heads but the past doesn't determine which one
-> obtains. The 2.6 leaderboard top is reachable in principle but requires
-> bridging an oracle gap that 8 frames of past cannot identify.
-> Production submission stays the EqMotion 5-seed ensemble (val 3.25,
-> Kaggle 3.2).
+> systematic bias. **Direct empirical closer**: EqMotion ↔ MART error
+> correlation is ρ ≈ 0.93 (same across ball/players/total), so no
+> cross-architecture averaging can bridge the gap — the two completely
+> different inductive biases produce the same errors on the same samples,
+> meaning the residual error is about the data, not the model. The 2.6
+> leaderboard top is reachable in principle (MART oracle = 0.64) but
+> requires identifying future modes that 8 frames of past cannot
+> determine. Production submission stays the EqMotion 5-seed ensemble
+> (val 3.25, Kaggle 3.2).
 
 ---
 
@@ -508,6 +511,37 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
   floor for this dataset and horizon. The 2.6 leaderboard top is reachable
   in principle (we've seen MART's oracle min-of-K total = 0.64), but that
   requires bridging an oracle gap that 8 frames of past don't determine.
+
+- **Cross-architecture ensemble correlation diagnostic — the closing
+  evidence for the task-floor claim.** Used the existing val caches
+  (EqMotion 5-seed ensemble predictions + MART mean-of-K predictions on
+  the same 3078 deterministic windows) to compute per-entity error
+  correlation between the two architectures. Results:
+
+  | Slice | MSE EqM | MSE MART | ρ | MSE 50/50 avg | MSE optimal avg | optimal MART weight |
+  |---|---|---|---|---|---|---|
+  | All 11 | 3.29 | 3.79 | **0.929** | 3.41 | 3.29 | 2.2% |
+  | Ball | 14.04 | 16.78 | **0.928** | 14.83 | 14.02 | **−9.0%** |
+  | Players | 2.22 | 2.49 | **0.929** | 2.27 | 2.21 | 9.8% |
+
+  Three structural conclusions:
+
+  1. **ρ ≈ 0.93 is consistent across all three slices.** EqMotion and MART
+     are making the same errors on the same samples regardless of which
+     entities you slice on.
+  2. **50/50 averaging is worse than EqMotion alone**; optimal weighting
+     drives MART's weight to near zero (and *negative* on the ball).
+  3. Two architectures with completely different inductive biases
+     (continuous O(2) equivariance vs relational transformer attention)
+     converging to the same errors on the same samples is direct empirical
+     evidence that **the residual error is about the data, not the model**.
+
+  This closes the case on cross-architecture averaging for this task: with
+  ρ this high, no statistical combination of these two predictors can
+  bridge the 3.25 → 2.6 gap. The 2.6 leaderboard top likely involves
+  techniques outside the single-prediction MSE-trained regime —
+  stochastic/multimodal submission strategies that exploit sample-specific
+  structure not identifiable from the 8-frame past.
 
 - **Other candidates:** larger model + ball weighting (isolates capacity from
   optimization); regularization HP search now that val is trustworthy;
