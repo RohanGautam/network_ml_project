@@ -259,6 +259,29 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
   paid* (costs capacity, only sampled angles). With ~4.5k sequences the
   variance-reduction dominates the small bias. At H=12 the misspecified part
   (basket-directed flow) barely bites — local kinematics dominate.
+- **Three groups, don't conflate them (terminology — applies to both models).**
+  It's tempting to say "we have D2 equivariance," but there are *three distinct*
+  things:
+  1. **The task's true symmetry is D2** (order 4: identity, reflect-length,
+     reflect-width, 180° rot). A 37° rotation is NOT a court symmetry (it moves
+     the baskets off-axis).
+  2. **What we impose/augment with is O(2)** — the *full continuous circle* of
+     rotations + reflections, *deliberately over-strong* vs the true D2.
+     `--aug_rot_deg 180` draws θ ~ U(−180°,+180°) continuously (90° is just one
+     of infinitely many sampled angles), NOT discrete 90°/180° flips.
+  3. **What aug-MART actually ends up with is *approximate, learned* O(2)
+     INVARIANCE — not equivariance.** It has zero architectural symmetry; the
+     augmentation teaches soft invariance, paid in capacity/samples, exact only
+     at sampled angles. Contrast EqMotion, which is *exactly* O(2)-EQUIVARIANT by
+     construction (the reflection-TTA no-op proves predictions are identical
+     under the group, for free). So "aug-MART is D2/O(2)-equivariant" is wrong on
+     two counts: we impose the bigger O(2) (not D2), and it's approximate
+     invariance (not exact equivariance). Why over-impose O(2) when truth is D2:
+     local kinematics are genuinely rotation-isotropic (only the court *frame*
+     breaks rotation symmetry), so the O(2) prior is right for the dynamics; the
+     hoop nodes then re-inject the D2 court frame as *features*. Over-strong
+     rotation buys variance reduction (why the 7.5M model trains 5000 ep at
+     train≈val); the small D2↔O(2) bias is dominated by that win at H=12.
 - **Anisotropic normalization silently breaks equivariance.** Per-axis std distorts
   rotations/reflections in the normalized frame the model operates in. Making it
   isotropic was a prerequisite for everything downstream.
