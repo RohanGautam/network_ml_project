@@ -84,8 +84,14 @@ class MyTraj(nn.Module):
             pair_now  = edge_pair[(left, right)][0]
             if len(pair_now) != 0:
                 edge_pair_now  = pair_now.transpose(0, 1).to(device).long()
-                edge_type_now  = torch.zeros(edge_pair_now.size(-1), device=device)
                 node_type_now  = batch_class[left:right].long()
+                src_t = node_type_now[edge_pair_now[0]]
+                tgt_t = node_type_now[edge_pair_now[1]]
+                ball_edge  = (src_t == 0) | (tgt_t == 0)          # type 0: ball involved
+                same_team  = (src_t == tgt_t) & ~ball_edge         # type 1: same-team players
+                edge_type_now = torch.where(ball_edge, torch.zeros_like(src_t),
+                                torch.where(same_team, torch.ones_like(src_t),
+                                            torch.full_like(src_t, 2))).long()
                 hidden_now     = hidden_state_unsplited[left:right]
                 cn_now         = cn[left:right]
 

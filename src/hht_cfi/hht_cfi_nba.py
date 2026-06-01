@@ -124,20 +124,27 @@ class NBASampler(Sampler):
 
 
 class NBADataModule(L.LightningDataModule):
-    def __init__(self, split_path, batch_size=16, context_size=8, horizon_size=12, seed=0):
+    def __init__(self, split_path, batch_size=16, context_size=8, horizon_size=12, seed=0,
+                 data_fraction=1.0):
         super().__init__()
-        self.split_path   = split_path
-        self.batch_size   = batch_size
-        self.context_size = context_size
-        self.horizon_size = horizon_size
-        self.seed         = seed
+        self.split_path    = split_path
+        self.batch_size    = batch_size
+        self.context_size  = context_size
+        self.horizon_size  = horizon_size
+        self.seed          = seed
+        self.data_fraction = data_fraction
         self.mu = self.sigma = None
 
     def setup(self, stage=None):
+        import random
         manifest    = json.loads(Path(self.split_path).read_text())
         data_dir    = _ROOT / manifest["data_dir"]
         train_files = [data_dir / f for f in manifest["train"]]
         val_files   = [data_dir / f for f in manifest["val"]]
+        if self.data_fraction < 1.0:
+            rng = random.Random(self.seed)
+            k   = max(1, int(len(train_files) * self.data_fraction))
+            train_files = rng.sample(train_files, k)
         self.mu, self.sigma = self._norm_stats(train_files)
         self.train_ds = NBADataset(train_files, self.context_size, self.horizon_size, self.mu, self.sigma)
         self.val_ds   = NBADataset(val_files,   self.context_size, self.horizon_size, self.mu, self.sigma)
@@ -246,13 +253,19 @@ def _to_hht_inputs(X: Tensor, y: Tensor, mu: Tensor, sigma: Tensor):
 
 
 # ── Inference toggles ───────────────────────────────────────────────────────────
-# To disable an improvement: set its flag to False, or comment out the True line.
-_USE_MIN_SCALE = True   # pick most confident mode (min total output scale) — no dummy_y needed
-_USE_TTA       = True   # y-flip test-time augmentation (2× forward passes, averaged)
-_USE_CLAMP     = True  # clip predictions to NBA court bounds
+# Mode selection — exactly ONE should be True (first True wins in priority order):
+_USE_MIN_SCALE      = True   # most confident mode (min total Laplace scale)
+_USE_SIGMA_WEIGHTED = False  # precision-weighted mean over all K modes
+_USE_PER_AGENT_TYPE = False   # velocity-continuity for players, equal-mean for ball
+_USE_NMS            = False  # NMS: centroid of densest endpoint cluster
 
-_COURT_HALF_LEN = 47.5     # ft  (x-axis: baseline to baseline)
-_COURT_HALF_WID = 25.0     # ft  (y-axis: sideline to sideline)
+# Other toggles — independent, can stack freely:
+_USE_TTA   = True   # 4-way test-time augmentation (orig + y-flip + x-flip + both)
+_USE_CLAMP = True    # clip predictions to NBA court bounds
+
+_NMS_RADIUS     = 0.5   # neighbor radius in HHT-normalised space for NMS
+_COURT_HALF_LEN = 47.5  # ft  (x-axis: baseline to baseline)
+_COURT_HALF_WID = 25.0  # ft  (y-axis: sideline to sideline)
 
 
 # ── Model wrapper ───────────────────────────────────────────────────────────────
@@ -280,57 +293,114 @@ class NBAHHTCFIModel(nn.Module):
         return loss1 + loss2, full_pre_tra
 
     def _forward_single(self, X_obs: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
-        """Single forward pass → denormalized absolute positions [T_pred, B*N, 2]."""
+        """Single forward pass with mode selection → absolute positions [T_pred, B*N, 2]."""
         B, _, N, _ = X_obs.shape
-        # Dummy future: last-frame CV (only needed for the training loss path; mode
-        # selection at inference uses scale-based criterion, not this target).
-        vel_norm = X_obs[:, -1, :, 2:4]
-        pos_norm = X_obs[:, -1, :, :2]
-        t = torch.arange(1, self.T_pred + 1, dtype=X_obs.dtype, device=X_obs.device)
+        BN = B * N
+
+        # CV dummy future (used by the training loss path inside the model).
+        vel_norm   = X_obs[:, -1, :, 2:4]
+        pos_norm   = X_obs[:, -1, :, :2]
+        t          = torch.arange(1, self.T_pred + 1, dtype=X_obs.dtype, device=X_obs.device)
         future_pos = pos_norm.unsqueeze(1) + vel_norm.unsqueeze(1) * t.view(1, -1, 1, 1)
-        dummy_y = X_obs[:, -1:, :, :].expand(-1, self.T_pred, -1, -1).clone()
+        dummy_y    = X_obs[:, -1:, :, :].expand(-1, self.T_pred, -1, -1).clone()
         dummy_y[:, :, :, :2] = future_pos
 
         inputs, edge_pair = _to_hht_inputs(X_obs, dummy_y, mu, sigma)
-        _, full_pre_tra = self.model(inputs, edge_pair, epoch=0)
+        _, full_pre_tra   = self.model(inputs, edge_pair, epoch=0)
 
-        if _USE_MIN_SCALE:
-            # Pick the mode the model is most confident about (min total output scale).
-            # Independent of dummy_y — uses the model's own uncertainty estimate.
-            out_mu_all    = full_pre_tra[2]   # [K=20, B*N, T_pred, 2]
-            out_sigma_all = full_pre_tra[3]   # [K=20, B*N, T_pred, 2]
-            BN = out_mu_all.shape[1]
-            best = out_sigma_all.sum(dim=(-1, -2)).argmin(dim=0)  # [B*N]
-            pred_hht = out_mu_all[best, torch.arange(BN)].permute(1, 0, 2)  # [T_pred, B*N, 2]
-        else:
-            pred_hht = full_pre_tra[0][-self.T_pred:]  # ADE-optimal mode by CV dummy
+        out_mu_all    = full_pre_tra[2]   # [K, B*N, T_pred, 2]  HHT-normalised space
+        out_sigma_all = full_pre_tra[3]   # [K, B*N, T_pred, 2]
+        K             = out_mu_all.shape[0]
 
         abs_obs = X_obs[:, :, :, :2] * sigma + mu
-        shift   = abs_obs[:, -1].reshape(B * N, 2)
-        max_v   = (abs_obs - abs_obs[:, -1:]).abs().amax(1).reshape(B * N, 2).clamp(min=1.0)
+        shift   = abs_obs[:, -1].reshape(BN, 2)
+        max_v   = (abs_obs - abs_obs[:, -1:]).abs().amax(1).reshape(BN, 2).clamp(min=1.0)
+
+        # ── Mode selection (first True flag wins) ──────────────────────────────
+        if _USE_SIGMA_WEIGHTED:
+            # Precision-weighted mixture: modes with lower total scale get higher weight.
+            weights  = (1.0 / out_sigma_all.sum(dim=(-1, -2)))**10     # [K, B*N]
+            weights  = weights / weights.sum(dim=0, keepdim=True)  # normalise
+            pred_hht = (out_mu_all * weights[:, :, None, None]).sum(0).permute(1, 0, 2)
+
+        elif _USE_PER_AGENT_TYPE:
+            # Players  → velocity-continuity: pick mode whose first step best matches
+            #            the last observed velocity (smooth handoff at boundary).
+            # Ball     → equal-weight mean (ball is stochastic; hedge across modes).
+            is_player    = X_obs[:, 0, :, 4].reshape(BN).bool()
+            last_vel_abs = (X_obs[:, -1, :, 2:4] * sigma).reshape(BN, 2)     # [BN, 2]
+            first_disp   = out_mu_all[:, :, 0, :] * max_v.unsqueeze(0)       # [K, BN, 2]
+            vel_err      = torch.norm(first_disp - last_vel_abs.unsqueeze(0), dim=-1)  # [K, BN]
+            best_player  = vel_err.argmin(dim=0)                              # [BN]
+
+            pred_hht_bn             = out_mu_all.mean(dim=0).clone()          # [BN, T, 2] ball default
+            player_idx              = is_player.nonzero(as_tuple=True)[0]
+            pred_hht_bn[player_idx] = out_mu_all[best_player[player_idx], player_idx]
+            pred_hht = pred_hht_bn.permute(1, 0, 2)                          # [T, BN, 2]
+
+        elif _USE_NMS:
+            # Endpoint clustering: pick the mode that has the most neighbours
+            # (densest cluster in final-position space) — consensus trajectory.
+            endpoints = out_mu_all[:, :, -1, :]                               # [K, BN, 2]
+            diff      = endpoints.unsqueeze(0) - endpoints.unsqueeze(1)       # [K, K, BN, 2]
+            dists     = torch.norm(diff, dim=-1)                              # [K, K, BN]
+            neighbors = (dists < _NMS_RADIUS).sum(dim=1)                     # [K, BN]
+            best_nms  = neighbors.argmax(dim=0)                               # [BN]
+            pred_hht  = out_mu_all[best_nms, torch.arange(BN)].permute(1, 0, 2)
+
+        else:  # _USE_MIN_SCALE or default fallback
+            best     = out_sigma_all.sum(dim=(-1, -2)).argmin(dim=0)         # [BN]
+            pred_hht = out_mu_all[best, torch.arange(BN)].permute(1, 0, 2)
+
         return pred_hht * max_v.unsqueeze(0) + shift.unsqueeze(0)
 
     def predict(self, X_obs: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
         """
         Inference without ground truth.
 
-        X_obs: [B, T_obs, N, 6]  normalized input.
+        X_obs: [B, T_obs, N, 6]  normalised input.
         Returns: [T_pred, B*N, 2]  absolute positions in feet.
 
-        Toggle improvements via module-level flags above the class definition:
-          _USE_MIN_SCALE, _USE_TTA, _USE_CLAMP
+        Toggle module-level flags to switch strategies:
+          Mode selection (pick ONE): _USE_MIN_SCALE / _USE_SIGMA_WEIGHTED /
+                                     _USE_PER_AGENT_TYPE / _USE_NMS
+          Stackable:                 _USE_TTA, _USE_CLAMP
         """
-        pred = self._forward_single(X_obs, mu, sigma)  # [T_pred, B*N, 2]
+        pred = self._forward_single(X_obs, mu, sigma)   # [T_pred, B*N, 2]
 
         if _USE_TTA:
-            # Mirror the scene across the court's y-axis (sideline symmetry).
-            # Negate normalized y and dy, run a second forward pass, flip back, average.
-            X_flip = X_obs.clone()
-            X_flip[:, :, :, 1] = -X_obs[:, :, :, 1]   # negate normalized y position
-            X_flip[:, :, :, 3] = -X_obs[:, :, :, 3]   # negate normalized y velocity (dy)
-            pred_flip = self._forward_single(X_flip, mu, sigma)
-            pred_flip[:, :, 1] = -pred_flip[:, :, 1]   # flip predicted y back
-            pred = (pred + pred_flip) / 2
+            # 4-way augmentation: orig + y-flip + x-flip + both-flip (180° rotation).
+            # Each flip is a valid basketball court symmetry.
+            preds = [pred]
+
+            # y-flip: reflect across the long axis (sideline symmetry)
+            X_yf = X_obs.clone()
+            X_yf[:, :, :, 1] = -X_obs[:, :, :, 1]
+            X_yf[:, :, :, 3] = -X_obs[:, :, :, 3]
+            p = self._forward_single(X_yf, mu, sigma)
+            p[:, :, 1] = -p[:, :, 1]
+            preds.append(p)
+
+            # x-flip: reflect across the half-court line
+            X_xf = X_obs.clone()
+            X_xf[:, :, :, 0] = -X_obs[:, :, :, 0]
+            X_xf[:, :, :, 2] = -X_obs[:, :, :, 2]
+            p = self._forward_single(X_xf, mu, sigma)
+            p[:, :, 0] = -p[:, :, 0]
+            preds.append(p)
+
+            # both-flip: 180° rotation (negate x, y, dx, dy)
+            X_bf = X_obs.clone()
+            X_bf[:, :, :, 0] = -X_obs[:, :, :, 0]
+            X_bf[:, :, :, 1] = -X_obs[:, :, :, 1]
+            X_bf[:, :, :, 2] = -X_obs[:, :, :, 2]
+            X_bf[:, :, :, 3] = -X_obs[:, :, :, 3]
+            p = self._forward_single(X_bf, mu, sigma)
+            p[:, :, 0] = -p[:, :, 0]
+            p[:, :, 1] = -p[:, :, 1]
+            preds.append(p)
+
+            pred = torch.stack(preds).mean(0)
 
         if _USE_CLAMP:
             pred[:, :, 0].clamp_(-_COURT_HALF_LEN, _COURT_HALF_LEN)
