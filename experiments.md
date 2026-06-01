@@ -5,35 +5,43 @@ Tracking what we tried, what changed in the pipeline, and the results. Metric is
 **held-out validation fold** (`splits/fold0.json`, 497 sequences) unless noted as
 Kaggle. Task: C=8 context → H=12 horizon, 11 entities (10 players + ball).
 
-> **Headline:** EqMotion with **isotropic normalization + cosine LR + court-frame
-> hoop nodes** is our best single model — honest val **3.33**, Kaggle **3.2**.
-> The **5-seed ensemble** improves to val **3.25** (reflection TTA confirmed
-> as an exact no-op — empirical proof of O(2) equivariance). Starting point
-> for context: ~3.7 val EqMotion, ~3.8 STGCNN, ~3.8 MART. Ball is the
-> concentrated remaining error source (6.4× harder than players, ~39% of
-> total) with a robust floor at **~13.7 ft²** across every intervention we've
-> tried within EqMotion: ball-weighted loss, true ball-only loss, and larger
-> capacity all converge to the same range. The mechanistic reason is the
-> joint-training dependency — the ball's predictability depends on sharp
-> *player* representations the joint gradient maintains.
+> **Headline (updated Jun 1):** the best model is now **augmented + scaled
+> MART** — isotropic norm + full O(2) augmentation (continuous rotation +
+> reflections) + court-frame hoop nodes, 7.5M params, **5000 epochs** of cosine
+> LR → honest val **3.11** (best ckpt 3.112), **Kaggle 3.01 (confirmed)**. This
+> **beats the EqMotion 5-seed ensemble (val 3.25) with a single model**, and
+> beats EqMotion on the leaderboard too (Kaggle 3.01 vs 3.2). Note the val→Kaggle
+> gap is *favorable* (−0.10: Kaggle better than val), unlike EqMotion's roughly
+> neutral gap. **This is the new production submission.** Overturns the earlier
+> "task floor" verdict below. The previous best was EqMotion (iso + cosine + hoops): single
+> val **3.33** / Kaggle **3.2**, 5-seed ensemble **3.25** (reflection TTA an
+> exact no-op — empirical proof of O(2) equivariance). Starting context: ~3.7
+> EqMotion, ~3.8 STGCNN, ~3.8 MART.
 >
-> **Task-floor verdict (May 30–31):** the EqMotion ensemble at val 3.25 /
-> Kaggle 3.2 sits at or near the task floor for both entity classes given
-> the 8-frame past at H=12. Ball MSE bottoms out at ~13.7 across every
-> EqMotion intervention (capacity, weighting, ball-only loss) and ~15.8
-> across every MART intervention (mean/median/trimmed-mean/closest-to-mean
-> reductions + three learned-selector variants). Player MSE bottoms out at
-> 2.19 across both `min_ade` and `mean_mse` residual-MART variants —
-> ruling out both multimodal head selection AND deterministic regression on
-> systematic bias. **Direct empirical closer**: EqMotion ↔ MART error
-> correlation is ρ ≈ 0.93 (same across ball/players/total), so no
-> cross-architecture averaging can bridge the gap — the two completely
-> different inductive biases produce the same errors on the same samples,
-> meaning the residual error is about the data, not the model. The 2.6
-> leaderboard top is reachable in principle (MART oracle = 0.64) but
-> requires identifying future modes that 8 frames of past cannot
-> determine. Production submission stays the EqMotion 5-seed ensemble
-> (val 3.25, Kaggle 3.2).
+> **Why the "task floor" was wrong.** The earlier claim (below, struck through)
+> rested on every EqMotion *and* old-MART intervention converging to the same
+> error — but every one of those used a **300-epoch** schedule. The real binding
+> constraint was the **training budget × augmentation**, not the data. EqMotion's
+> hard O(2) equivariance makes geometric augmentation a *no-op* (TTA proves it),
+> so it can't use augmentation to regularize a bigger model or absorb a longer
+> schedule — it was stuck at *its* floor, not *the* floor. A **non-equivariant**
+> MART can: full O(2) augmentation supplies the diversity that lets a 7.5M-param
+> model train 5000 epochs with **zero overfitting** (train≈val≈0.026 at the end),
+> and val fell 3.79 → 3.47 (1000 ep) → **3.11** (5000 ep).
+>
+> **~~Task-floor verdict (May 30–31) — SUPERSEDED, see above:~~** ~~the EqMotion
+> ensemble at val 3.25 / Kaggle 3.2 sits at or near the task floor for both
+> entity classes given the 8-frame past at H=12. Ball MSE bottoms out at ~13.7
+> across every EqMotion intervention (capacity, weighting, ball-only loss) and
+> ~15.8 across every MART intervention. Player MSE bottoms out at 2.19. Direct
+> empirical closer: EqMotion ↔ MART error correlation ρ ≈ 0.93, so no
+> cross-architecture averaging can bridge the gap.~~ This held only within the
+> 300-epoch regime; the ρ≈0.93 figure was measured on the *old* under-trained
+> MART, not the 3.11 aug-MART (correlation re-check on the new model is an open
+> item). The 2.6 leaderboard top is reachable in principle (MART oracle min-of-K
+> = 0.64); aug-MART at 3.11 closes ~40% of the 3.25→2.6 gap. Production
+> submission decision pending the aug-MART Kaggle score
+> (`submissions/solution_mart_aug_5k_best.csv`).
 
 ---
 
@@ -128,6 +136,77 @@ single / 3.25 ensemble). Two findings worth flagging:
   loss-aligning to the leaderboard's single-shot metric can be counter-productive
   — the heads-as-ensemble structure was *load-bearing*.
 
+### MART — augment + scale + train-long (NEW BEST, val 3.11) ⭐
+
+The breakthrough run. Same `WindowEvalSampler` / `val/mse_ft` as above, so
+directly comparable to every number in this doc. Recipe = give a **non-equivariant**
+MART the same inductive structure that won for EqMotion (isotropic norm + court
+symmetry + hoop nodes), but via **augmentation** instead of hard equivariance —
+which (unlike EqMotion) lets capacity grow and the schedule lengthen.
+
+| Run | Norm | Aug | Hoops | Params | Epochs | val/mse_ft |
+|---|---|---|---|---|---|---|
+| mart_minade_s1 (old baseline) | aniso | none | no | ~0.9M | 300 | 3.79 |
+| mart_aug_iso_nohoops | **iso** | O(2)+mirror | no | 7.5M | 1000 | 3.55 |
+| mart_aug_iso_hoops | **iso** | O(2)+mirror | **yes** | 7.5M | 1000 | 3.47 |
+| **mart_aug_iso_hoops_5k** | **iso** | O(2)+mirror | **yes** | 7.5M | **5000** | **3.11** |
+| — EqMotion single / ensemble (prev best) | iso | — | yes | 0.4M | 300 | 3.33 / 3.25 |
+
+5k best-by-val ckpt = **3.112** (final epoch 3.123). Job 2954136, ~7h44m.
+
+**Four load-bearing findings:**
+
+1. **Augmentation enables the scale-up (the core mechanism).** At convergence
+   train_loss ≈ val_loss ≈ 0.026 — *zero* overfitting on a 7.5M-param model over
+   4.5k sequences, where every prior bigger-MART attempt overfit. Full continuous
+   O(2) augmentation (rotation ∈ U(−180°,180°) + independent x/y reflections,
+   applied as an exact isometry about the court center) supplies the diversity
+   that regularizes both the larger model and the longer schedule. This is the
+   lever EqMotion structurally *cannot* use — its hard O(2) equivariance makes
+   the same augmentation an exact no-op (proven by the reflection-TTA test).
+2. **Hoops transfer across architectures** (3.47 vs 3.55 at 1000 ep, +0.08). The
+   court-frame lever is not EqMotion-specific — injecting the baskets as static
+   nodes helps a relational transformer too. Good cross-arch ablation for the report.
+3. **Epochs were the dominant lever, but only because augmentation unlocked
+   them.** 300 ep (old) 3.79 → 1000 ep 3.47 → 5000 ep 3.11. Without augmentation a
+   5000-epoch run on 4.5k sequences would overfit badly; with it, val keeps falling.
+4. **Isotropic norm is a prerequisite, not just a nicety.** Rotation is only an
+   isometry in the normalized frame under a *shared scalar* std; anisotropic
+   per-axis std turns a rotation into a shear, so the augmented samples would be
+   geometrically invalid. `--aug_rot_deg` auto-enables `--iso_norm`.
+
+**Schedule-floor vs model-floor diagnostic (does the single-cosine LR cap us?).**
+Because cosine LR and val both flatten near the end, a single run can't by itself
+distinguish "model converged" from "LR ran out." Compared the two curves from the
+5k log:
+
+| epoch (% of run) | val/mse_ft | LR |
+|---|---|---|
+| 2499 (50%) | 3.373 | 2.55e-4 |
+| 3499 (70%) | 3.208 | 1.11e-4 |
+| 3999 (80%) | 3.134 | 5.69e-5 |
+| 4499 (90%) | 3.138 | 2.20e-5 |
+| 4749 (95%) | 3.123 | 1.30e-5 |
+| 4808 (best) | **3.112** | — |
+| 4894 | LR floor (1e-5) reached | 1.00e-5 |
+| 4999 (final) | 3.123 | 1.00e-5 |
+
+Val flattened at **~ep 4000–4500**, *before* the LR hit its 1e-5 floor at ep 4894
+(Δval after LR-floor ≈ +0.004, i.e. flat). So 3.11 is a genuine **single-cosine
+model floor, not a schedule strangle** — unlike the 1000-epoch run (where val was
+still dropping when its schedule ended, which is exactly why extending to 5000 ep
+paid). Implication: naïve "train even longer on one cosine" likely won't keep
+paying. The unexplored variant is **warm restarts (SGDR)** — periodically
+re-raising the LR to re-enter the productive mid-LR descent regime (the big gains
+above happened at LR 1e-4 → 6e-5).
+
+Submission generated: `submissions/solution_mart_aug_5k_best.csv` (verified: 1243
+ids, no NaNs, coords in court range). Code: `--iso_norm --aug_rot_deg 180
+--aug_court_mirror --aug_jitter` + `_augment_court()` in
+[src/mart/main_nba_pt.py](src/mart/main_nba_pt.py) (isometry verified to float
+precision) + best-by-val checkpointing + `configs/mart_nba_aug.yaml` (7.5M-param
+config) + `jobs/train_mart_aug_5k.sh` (account=team-ai for >12h).
+
 ---
 
 ## 3. What changed in the pipeline (code)
@@ -206,8 +285,25 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
 
 ## 5. Open / next
 
-- **Done:** 5-seed ensemble → val 3.25 (from 3.33); reflection TTA confirmed an
-  exact no-op (EqMotion is exactly O(2)-equivariant). Submission:
+- **⭐ DONE — augment + scale + train-long MART → val 3.11 (new best, beats the
+  3.25 EqMotion ensemble).** See the "MART — augment + scale" section above for
+  the full story. Overturns the prior task-floor verdict. **Kaggle 3.01
+  (confirmed)** — now production (`submissions/solution_mart_aug_5k_best.csv`).
+  The val→Kaggle gap was *favorable*: val 3.11 → Kaggle 3.01.
+- **Highest-value next steps (ranked):**
+  1. **Re-check aug-MART ↔ EqMotion error correlation (no GPU).** The ρ≈0.93 that
+     killed cross-arch ensembling was measured on the *old, under-trained* MART.
+     aug-MART (3.11 val / 3.01 Kaggle) is now the *strong* anchor; if its errors
+     are even partly decorrelated from EqMotion's, an aug-MART-anchored ensemble
+     could move toward the 2.6 top. Uses cached predictions.
+  2. **SGDR warm restarts.** The diagnostic says 3.11 is a single-cosine model
+     floor; re-raising the LR periodically tests whether the productive mid-LR
+     descent (LR 1e-4→6e-5, where the big gains happened) repeats. Cheap GPU run.
+  3. Ensemble multiple aug-MART seeds (EqMotion ensembling bought 3.33→3.25).
+  4. **Kaggle confirmed (was item 1):** val→LB gap is favorable for this arch
+     (−0.10), so val remains a trustworthy — slightly pessimistic — selector.
+- **Done (EqMotion era):** 5-seed ensemble → val 3.25 (from 3.33); reflection TTA
+  confirmed an exact no-op (EqMotion is exactly O(2)-equivariant). Submission:
   `submissions/solution_ens5_iso_hoops_val3.25.csv`.
 - **More court landmarks — TRIED, all hurt (negative result).** Job 2952604,
   all under iso + cosine + full-val + honest 11-entity metric, single seed,
@@ -557,10 +653,14 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
 
 ## 6. Best submission
 
-- **`submissions/solution_ens5_iso_hoops_val3.25.csv`** — 5-seed iso+hoops
-  ensemble, honest val 3.25. Best overall; upload this.
-- `submissions/solution_iso_hoops_fv_kaggle3.2.csv` — single iso+hoops model,
-  Kaggle 3.2 (confirmed).
+- **`submissions/solution_mart_aug_5k_best.csv`** — aug-MART 5000-ep, honest val
+  **3.11**, **Kaggle 3.01 (confirmed) — PRODUCTION**. Best overall; upload this.
+  Regenerate: `sbatch jobs/submit_mart_aug.sh`.
+- `submissions/solution_ens5_iso_hoops_val3.25.csv` — EqMotion 5-seed iso+hoops
+  ensemble, honest val 3.25 / Kaggle 3.2 (former production, now superseded).
+- `submissions/solution_iso_hoops_fv_kaggle3.2.csv` — single EqMotion iso+hoops
+  model, Kaggle 3.2 (confirmed).
 
-Regenerate a single checkpoint's CSV: `sbatch jobs/submit_eqmotion.sh --ckpt <path> --iso-norm`.
-Rebuild the ensemble CSV: `sbatch jobs/ensemble_eqmotion.sh`.
+Regenerate a single EqMotion CSV: `sbatch jobs/submit_eqmotion.sh --ckpt <path> --iso-norm`.
+Rebuild the EqMotion ensemble CSV: `sbatch jobs/ensemble_eqmotion.sh`.
+Rebuild the aug-MART CSV: `sbatch jobs/submit_mart_aug.sh`.
