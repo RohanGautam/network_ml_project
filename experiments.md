@@ -5,14 +5,16 @@ Tracking what we tried, what changed in the pipeline, and the results. Metric is
 **held-out validation fold** (`splits/fold0.json`, 497 sequences) unless noted as
 Kaggle. Task: C=8 context → H=12 horizon, 11 entities (10 players + ball).
 
-> **Headline (updated Jun 1):** the best model is now **augmented + scaled
-> MART** — isotropic norm + full O(2) augmentation (continuous rotation +
-> reflections) + court-frame hoop nodes, 7.5M params, **5000 epochs** of cosine
-> LR → honest val **3.11** (best ckpt 3.112), **Kaggle 3.01 (confirmed)**. This
-> **beats the EqMotion 5-seed ensemble (val 3.25) with a single model**, and
-> beats EqMotion on the leaderboard too (Kaggle 3.01 vs 3.2). Note the val→Kaggle
-> gap is *favorable* (−0.10: Kaggle better than val), unlike EqMotion's roughly
-> neutral gap. **This is the new production submission.** Overturns the earlier
+> **Headline (updated Jun 1):** best submission is a **0.70·aug-MART +
+> 0.30·EqMotion blend → val 3.073, Kaggle 2.98 (confirmed) — PRODUCTION.** The
+> backbone is **augmented + scaled MART** — isotropic norm + full O(2)
+> augmentation (continuous rotation + reflections) + court-frame hoop nodes, 7.5M
+> params, **5000 epochs** of cosine LR → honest val **3.11** (best ckpt 3.112),
+> **Kaggle 3.01** on its own. aug-MART alone already beats the EqMotion 5-seed
+> ensemble (val 3.25 / Kaggle 3.2) with a single model; blending in EqMotion at
+> w=0.70 banks a further −0.04 (val 3.11→3.07, Kaggle 3.01→2.98) — the val gain
+> held on the leaderboard. Note the val→Kaggle gap is *favorable* (~−0.10: Kaggle
+> better than val), unlike EqMotion's roughly neutral gap. Overturns the earlier
 > "task floor" verdict below. The previous best was EqMotion (iso + cosine + hoops): single
 > val **3.33** / Kaggle **3.2**, 5-seed ensemble **3.25** (reflection TTA an
 > exact no-op — empirical proof of O(2) equivariance). Starting context: ~3.7
@@ -290,18 +292,43 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
   the full story. Overturns the prior task-floor verdict. **Kaggle 3.01
   (confirmed)** — now production (`submissions/solution_mart_aug_5k_best.csv`).
   The val→Kaggle gap was *favorable*: val 3.11 → Kaggle 3.01.
+- **✅ DONE — aug-MART ↔ EqMotion ensemble re-check (job 2954940).** Cached
+  aug-MART's K=20 preds on the same 3078 val windows; computed ρ + weighted blend
+  + closed-form optimal weight. Analysis script validated against the OLD MART
+  cache first (reproduced EqMotion 3.29 / MART 3.79 / ρ≈0.94 / w*=2.2% exactly).
+
+  | | total | ball | players |
+  |---|---|---|---|
+  | EqMotion ensemble | 3.292 | 14.04 | 2.217 |
+  | aug-MART 5k (mean-K) | 3.112 | 13.50 | 2.074 |
+  | **best blend (0.70·augMART + 0.30·EqM)** | **3.073** | 13.30 | 2.051 |
+
+  **Blend Kaggle-confirmed: val 3.073 → Kaggle 2.98** (val gain held on the
+  leaderboard; favorable −0.09 val→LB gap, consistent with aug-MART's own). This
+  is the production submission. ρ stayed high: all=0.941, ball=0.937, players=0.894. Closed-form optimal
+  aug-MART weight: all **0.70**, ball 0.66, players 0.73. **Ensembling now helps
+  (+0.039 over aug-MART alone), where it didn't with old MART** — and the reason
+  corrects the earlier reasoning: averaging failed before NOT because ρ was high,
+  but because old-MART (3.79) was far *worse* than EqMotion so any weight on it
+  hurt (w*=2%). Optimal weight depends on ρ **and** relative error magnitude. Now
+  aug-MART is *better* than EqMotion, so even at ρ=0.94 the optimal weight is 0.70
+  and variance-reduction yields a real gain. High ρ still *caps* the gain at 0.04
+  (correlated errors can only help each other so much) — but it's free (no training).
+  **Caveat (resolved):** w=0.70 is val-tuned, so 3.073 was in-sample — but it
+  held: Kaggle came back **2.98**. Script: `src/mart/corr_augmart_eqmotion.py`;
+  cache: `cache/mart_aug_5k/`. Blend built CSV-level (the EqMotion CSV is
+  byte-identical to the cached test preds, verified max diff 0.0000, so a by-id
+  blend == blending the underlying feet predictions; no re-inference / ordering risk).
 - **Highest-value next steps (ranked):**
-  1. **Re-check aug-MART ↔ EqMotion error correlation (no GPU).** The ρ≈0.93 that
-     killed cross-arch ensembling was measured on the *old, under-trained* MART.
-     aug-MART (3.11 val / 3.01 Kaggle) is now the *strong* anchor; if its errors
-     are even partly decorrelated from EqMotion's, an aug-MART-anchored ensemble
-     could move toward the 2.6 top. Uses cached predictions.
+  1. **✅ DONE — 0.70/0.30 blended submission → Kaggle 2.98** (new production,
+     `submissions/solution_blend_augmart0.70_eqm0.30.csv`). The val +0.039 survived.
   2. **SGDR warm restarts.** The diagnostic says 3.11 is a single-cosine model
      floor; re-raising the LR periodically tests whether the productive mid-LR
      descent (LR 1e-4→6e-5, where the big gains happened) repeats. Cheap GPU run.
-  3. Ensemble multiple aug-MART seeds (EqMotion ensembling bought 3.33→3.25).
-  4. **Kaggle confirmed (was item 1):** val→LB gap is favorable for this arch
-     (−0.10), so val remains a trustworthy — slightly pessimistic — selector.
+  3. Ensemble multiple aug-MART seeds (EqMotion ensembling bought 3.33→3.25) —
+     same-arch seeds may decorrelate more than the cross-arch EqMotion blend.
+  4. **Kaggle confirmed:** val→LB gap is favorable for aug-MART (−0.10), so val
+     remains a trustworthy — slightly pessimistic — selector.
 - **Done (EqMotion era):** 5-seed ensemble → val 3.25 (from 3.33); reflection TTA
   confirmed an exact no-op (EqMotion is exactly O(2)-equivariant). Submission:
   `submissions/solution_ens5_iso_hoops_val3.25.csv`.
@@ -653,11 +680,14 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
 
 ## 6. Best submission
 
-- **`submissions/solution_mart_aug_5k_best.csv`** — aug-MART 5000-ep, honest val
-  **3.11**, **Kaggle 3.01 (confirmed) — PRODUCTION**. Best overall; upload this.
-  Regenerate: `sbatch jobs/submit_mart_aug.sh`.
+- **`submissions/solution_blend_augmart0.70_eqm0.30.csv`** — 0.70·aug-MART +
+  0.30·EqMotion blend, val **3.073**, **Kaggle 2.98 (confirmed) — PRODUCTION**.
+  Best overall; upload this. Rebuild: blend the two CSVs below by id at w=0.70
+  (CSV-level, no re-inference).
+- `submissions/solution_mart_aug_5k_best.csv` — aug-MART 5000-ep, val 3.11 /
+  Kaggle 3.01. Best single model; blend backbone. Regenerate: `sbatch jobs/submit_mart_aug.sh`.
 - `submissions/solution_ens5_iso_hoops_val3.25.csv` — EqMotion 5-seed iso+hoops
-  ensemble, honest val 3.25 / Kaggle 3.2 (former production, now superseded).
+  ensemble, val 3.25 / Kaggle 3.2 (blend's second component; former production).
 - `submissions/solution_iso_hoops_fv_kaggle3.2.csv` — single EqMotion iso+hoops
   model, Kaggle 3.2 (confirmed).
 
