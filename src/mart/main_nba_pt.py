@@ -23,6 +23,7 @@ submit_nba_pt.py (state_dict, full config, mu, sigma).
 """
 
 import argparse
+import math
 import os
 import random
 import sys
@@ -105,6 +106,24 @@ def parse_args():
     # reflected axis. Off by default.
     p.add_argument('--aug_court_mirror', action='store_true',
                    help='Random court-symmetry reflection per batch sample at train time.')
+    # Isotropic normalization: shared scalar std for x & y (vs per-axis). Required
+    # for valid rotation augmentation and independently a win for EqMotion.
+    p.add_argument('--iso_norm', action='store_true',
+                   help='Isotropic (shared scalar) z-score std; needed for --aug_rotate.')
+    # Rotation augmentation: random rotation about the court center, drawn from
+    # U(-aug_rot_deg, aug_rot_deg). 180 = full O(2) (with --aug_court_mirror).
+    # Implies --iso_norm geometrically; we enforce iso when this is > 0.
+    p.add_argument('--aug_rot_deg', type=float, default=0.0,
+                   help='Max rotation magnitude in degrees (0 = off; 180 = full circle).')
+    # Gaussian position jitter (normed units) on the PAST only — input regularizer.
+    p.add_argument('--aug_jitter', type=float, default=0.0,
+                   help='Std of Gaussian jitter added to past positions (normed units).')
+    # Optional overrides of capacity / schedule without editing the yaml, so a
+    # single config can drive a small sweep of model sizes / lengths.
+    p.add_argument('--num_epochs', type=int, default=None,
+                   help='Override config num_epochs (e.g. long training).')
+    p.add_argument('--dropout', type=float, default=None,
+                   help='Override config dropout.')
     # Logging
     p.add_argument('--wandb_project', type=str, default='NML_base')
     p.add_argument('--wandb_run_name', type=str, default=None)
@@ -129,45 +148,74 @@ def _model_forward(model, x_abs, x_rel, agent_ids):
     return model(x_abs, x_rel)
 
 
-def _augment_court_mirror(x_abs, y, aug_offset):
-    """Random court-symmetry reflections per batch instance (training only).
+def _augment_court(x_abs, y, center, rot_max_rad=0.0, mirror=False, jitter_std=0.0):
+    """Random O(2) court-symmetry augmentation per batch instance (training only).
 
-    Raw coords are court-centered, so a court reflection is a coordinate
-    negation in raw feet. Under z-scoring z = (raw - mu) / sigma, the
-    equivalent transform along axis c is z -> -z - 2*mu[c]/sigma[c]; we
-    precompute aug_offset = 2 * mu / sigma so the inner loop is a plain
-    `-z - aug_offset[c]` per flipped axis.
+    Composes a per-sample random rotation and/or independent x/y reflection,
+    applied *about the court center* so the transform is an exact isometry on
+    the court: pairwise agent distances are preserved, MART's relation/attention
+    structure stays valid, and agent_ids (team labels, ball, hoops) are
+    unchanged. The SAME transform is applied to past (`x_abs`) and future (`y`)
+    so the window stays coherent; `train_one_epoch` recomputes `x_rel` from the
+    transformed `x_abs`, so velocities transform correctly (the constant center
+    offset cancels in the time difference).
 
-    Reflections are isometries: pairwise agent distances are preserved, so
-    MART's relation/attention structure stays valid and agent_ids (team
-    labels, ball, hoops) are unchanged — team identity is independent of
-    which side of the court a team is playing on. Velocity is *not* mutated
-    here; train_one_epoch recomputes x_rel from the reflected x_abs, which
-    naturally flips the velocity sign (the constant offset cancels in the
-    time difference).
+    Rotation requires ISOTROPIC normalization (--iso_norm): under anisotropic
+    per-axis std a rotation in raw feet becomes a shear in the normed frame.
+    Reflections are valid under either norm, but for consistency we apply both
+    here in the (assumed iso) normed frame about `center`.
+
+    Court center in normed space is `center = -mu / sigma` (raw origin (0,0) is
+    the court center; z = (0 - mu) / sigma). For full rotation use
+    rot_max_rad = pi; for a mild regularizer use a small angle.
 
     Args:
-        x_abs:      [B, N, T_p, 2]  z-scored past positions
-        y:          [B, N, T_f, 2]  z-scored future positions
-        aug_offset: [2]             precomputed 2 * mu / sigma on x_abs.device
+        x_abs:       [B, N, T_p, 2]  z-scored past positions
+        y:           [B, N, T_f, 2]  z-scored future positions
+        center:      [2]             normed court center (-mu/sigma) on device
+        rot_max_rad: rotation angle drawn ~ U(-rot_max_rad, rot_max_rad). 0 = off.
+        mirror:      if True, independent 50/50 x and y reflections (D2).
+        jitter_std:  Gaussian position noise std (normed units) added to the
+                     PAST only (input regularizer; target stays clean). 0 = off.
     Returns:
-        Reflected (x_abs, y) as new tensors.
+        Transformed (x_abs, y) as new tensors.
     """
     B = x_abs.shape[0]
     device = x_abs.device
-    flip_x = (torch.rand(B, device=device) < 0.5).view(B, 1, 1)  # negate x coord
-    flip_y = (torch.rand(B, device=device) < 0.5).view(B, 1, 1)  # negate y coord
 
-    x_abs = x_abs.clone()
-    y = y.clone()
+    # Per-sample reflection signs (D2) folded into the linear map.
+    if mirror:
+        sx = torch.where(torch.rand(B, device=device) < 0.5, -1.0, 1.0)
+        sy = torch.where(torch.rand(B, device=device) < 0.5, -1.0, 1.0)
+    else:
+        sx = torch.ones(B, device=device)
+        sy = torch.ones(B, device=device)
 
-    # Channel 0 = court-length axis (x): swap left/right basket sides.
-    x_abs[..., 0] = torch.where(flip_x, -x_abs[..., 0] - aug_offset[0], x_abs[..., 0])
-    y[..., 0]     = torch.where(flip_x, -y[..., 0]     - aug_offset[0], y[..., 0])
+    if rot_max_rad > 0.0:
+        theta = (torch.rand(B, device=device) * 2.0 - 1.0) * rot_max_rad
+    else:
+        theta = torch.zeros(B, device=device)
+    cos, sin = torch.cos(theta), torch.sin(theta)
 
-    # Channel 1 = court-width axis (y): swap top/bottom sideline.
-    x_abs[..., 1] = torch.where(flip_y, -x_abs[..., 1] - aug_offset[1], x_abs[..., 1])
-    y[..., 1]     = torch.where(flip_y, -y[..., 1]     - aug_offset[1], y[..., 1])
+    # 2x2 per-sample map M = R(theta) @ diag(sx, sy), applied about `center`.
+    m00 = (cos * sx).view(B, 1, 1)
+    m01 = (-sin * sy).view(B, 1, 1)
+    m10 = (sin * sx).view(B, 1, 1)
+    m11 = (cos * sy).view(B, 1, 1)
+    c = center.view(1, 1, 1, 2)
+
+    def _apply(z):
+        zc = z - c
+        xc, yc = zc[..., 0], zc[..., 1]
+        nx = m00 * xc + m01 * yc
+        ny = m10 * xc + m11 * yc
+        return torch.stack([nx, ny], dim=-1) + c
+
+    x_abs = _apply(x_abs)
+    y = _apply(y)
+
+    if jitter_std > 0.0:
+        x_abs = x_abs + torch.randn_like(x_abs) * jitter_std
 
     return x_abs, y
 
@@ -199,12 +247,12 @@ def compute_loss(y_pred, y_exp, loss_type):
     return reduced.mean()
 
 
-def train_one_epoch(epoch, model, optimizer, loader, opts, device, aug_offset=None):
+def train_one_epoch(epoch, model, optimizer, loader, opts, device, aug=None):
     """One training epoch.
 
-    aug_offset: when --aug_court_mirror is set, the precomputed [2] tensor
-        2 * mu / sigma on `device`, used by _augment_court_mirror. None
-        disables the augmentation entirely (default).
+    aug: when geometric augmentation is enabled, a dict with keys
+        {center, rot_max_rad, mirror, jitter_std} forwarded to _augment_court.
+        None disables augmentation entirely (default).
     """
     model.train()
     total_n = 0
@@ -217,8 +265,13 @@ def train_one_epoch(epoch, model, optimizer, loader, opts, device, aug_offset=No
         agent_ids = agent_ids.to(device)
         B, N, _, _ = x_abs.shape
 
-        if aug_offset is not None:
-            x_abs, y = _augment_court_mirror(x_abs, y, aug_offset)
+        if aug is not None:
+            x_abs, y = _augment_court(
+                x_abs, y, aug['center'],
+                rot_max_rad=aug['rot_max_rad'],
+                mirror=aug['mirror'],
+                jitter_std=aug['jitter_std'],
+            )
 
         x_rel = _x_rel_from_x_abs(x_abs)
         y_pred = _model_forward(model, x_abs, x_rel, agent_ids)   # [B, N, K, T_f, 2]
@@ -379,9 +432,26 @@ def main():
     opts.loss = args.loss
     opts.use_hoops = args.use_hoops
     opts.aug_court_mirror = args.aug_court_mirror
+    opts.iso_norm = args.iso_norm
+    opts.aug_rot_deg = args.aug_rot_deg
+    opts.aug_jitter = args.aug_jitter
+    if args.num_epochs is not None:
+        opts.num_epochs = args.num_epochs
+    if args.dropout is not None:
+        opts.dropout = args.dropout
+
+    # Rotation in the normed frame is only an isometry under isotropic scaling.
+    # Force iso on whenever rotation is requested so we never silently train on
+    # sheared (geometrically invalid) augmented samples.
+    if opts.aug_rot_deg > 0.0 and not opts.iso_norm:
+        print('[WARN] --aug_rot_deg > 0 requires isotropic norm; enabling --iso_norm.')
+        opts.iso_norm = True
+
     print(f'[INFO] training loss: {opts.loss}')
     print(f'[INFO] use_hoops: {opts.use_hoops}')
-    print(f'[INFO] aug_court_mirror: {opts.aug_court_mirror}')
+    print(f'[INFO] iso_norm: {opts.iso_norm}')
+    print(f'[INFO] aug: mirror={opts.aug_court_mirror} rot_deg={opts.aug_rot_deg} '
+          f'jitter={opts.aug_jitter}')
     print('[INFO] opts:', opts)
 
     ckpt_dir = './checkpoints'
@@ -409,18 +479,24 @@ def main():
     train_files, val_files = load_split_files(args.split_path)
     print(f'[INFO] split: {len(train_files)} train, {len(val_files)} val')
 
-    mu, sigma = compute_xy_stats(train_files)
-    print(f'[INFO] norm stats: mu={mu.tolist()}, sigma={sigma.tolist()}')
+    mu, sigma = compute_xy_stats(train_files, iso=opts.iso_norm)
+    print(f'[INFO] norm stats (iso={opts.iso_norm}): mu={mu.tolist()}, sigma={sigma.tolist()}')
 
-    # Precompute the z-scored-space reflection offset once. mu is non-zero in
-    # general (empirical train-split mean isn't exactly the court center), so a
-    # naive negation would shift the reflected court; -z - aug_offset reflects
-    # around the true court origin. None disables the augmentation entirely.
-    if opts.aug_court_mirror:
-        aug_offset = (2.0 * mu / sigma).to(device)
-        print(f'[INFO] aug_court_mirror offset (2*mu/sigma): {aug_offset.tolist()}')
+    # Build the geometric-augmentation spec. The court center in normed space is
+    # -mu/sigma (raw origin (0,0) is the court center). Rotation/reflection are
+    # applied about it so distances are preserved. None disables augmentation.
+    if opts.aug_court_mirror or opts.aug_rot_deg > 0.0 or opts.aug_jitter > 0.0:
+        aug = {
+            'center': (-mu / sigma).to(device),
+            'rot_max_rad': math.radians(opts.aug_rot_deg),
+            'mirror': bool(opts.aug_court_mirror),
+            'jitter_std': float(opts.aug_jitter),
+        }
+        print(f'[INFO] augmentation enabled: center={aug["center"].tolist()} '
+              f'rot_max_rad={aug["rot_max_rad"]:.3f} mirror={aug["mirror"]} '
+              f'jitter={aug["jitter_std"]}')
     else:
-        aug_offset = None
+        aug = None
 
     DatasetCls = MARTNBAPTDatasetHoops if opts.use_hoops else MARTNBAPTDataset
     train_set = DatasetCls(
@@ -499,10 +575,12 @@ def main():
         return
 
     # ---- Train ----
-    # We checkpoint only after the final epoch (no best-on-val tracking). Val
-    # metrics are still computed every epoch for the wandb curve and the per-
-    # epoch log line, but they do not gate any save.
+    # We save BOTH the final-epoch checkpoint (ckpt_path) and the best-by-val
+    # checkpoint (best_ckpt_path). With long cosine schedules the last epoch is
+    # usually near-best, but best-tracking guards against late-run drift.
     val_metrics = None
+    best_ckpt_path = os.path.join(ckpt_dir, f'{args.model_name}_best.ckpt')
+    best_mse = float('inf')
 
     with wandb.init(
         project=args.wandb_project,
@@ -515,7 +593,7 @@ def main():
             train_sampler.set_epoch(epoch)
 
             train_loss = train_one_epoch(
-                epoch, model, optimizer, train_loader, opts, device, aug_offset,
+                epoch, model, optimizer, train_loader, opts, device, aug,
             )
             val_metrics = eval_minADE_minFDE(
                 model, val_loader, opts, device, split_name='val',
@@ -524,6 +602,22 @@ def main():
 
             if scheduler is not None:
                 scheduler.step()
+
+            if val_metrics['mse_ft'] < best_mse:
+                best_mse = val_metrics['mse_ft']
+                torch.save(
+                    {
+                        'epoch': epoch,
+                        'state_dict': model.state_dict(),
+                        'opts': dict(opts),
+                        'mu': mu,
+                        'sigma': sigma,
+                        'val_mse_ft': val_metrics['mse_ft'],
+                        'val_minADE': val_metrics['minADE'],
+                        'val_minFDE': val_metrics['minFDE'],
+                    },
+                    best_ckpt_path,
+                )
 
             log = {
                 'epoch': epoch,
@@ -561,6 +655,7 @@ def main():
             ckpt_path,
         )
         print(f'\n[INFO] Training complete. Saved final-epoch checkpoint to {ckpt_path}')
+        print(f'[INFO] Best-by-val checkpoint: {best_ckpt_path} (val/mse_ft {best_mse:.4f})')
         print('=== Final val metrics (last epoch) ===')
         print(f'  val/mse_ft : {val_metrics["mse_ft"]:.4f} ft²  (Kaggle-comparable)')
         print(f'  val/minADE : {val_metrics["minADE"]:.4f}  (normalized, min-of-K)')

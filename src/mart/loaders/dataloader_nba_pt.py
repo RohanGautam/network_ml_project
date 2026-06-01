@@ -46,15 +46,28 @@ def load_split_files(manifest_path):
     return train, val
 
 
-def compute_xy_stats(files):
-    """Per-axis mean/std over (x, y), pooled across all files and timesteps."""
+def compute_xy_stats(files, iso=False):
+    """Mean/std over (x, y), pooled across all files and timesteps.
+
+    iso=False: per-axis std (anisotropic, default — legacy behaviour).
+    iso=True:  a single shared scalar std for both axes. This is a prerequisite
+        for rotation/reflection augmentation: under anisotropic per-axis scaling
+        a physical rotation becomes a *shear* in the normalized frame the model
+        sees, so the augmented samples are geometrically inconsistent. A shared
+        scalar makes a rotation in raw feet map to a rotation in normed space
+        (same trick EqMotion needed for its O(2) equivariance).
+    """
     chunks = []
     for f in files:
         seq = torch.load(f).float()  # [T, N, F]
         chunks.append(seq[:, :, :2])
     pooled = torch.cat(chunks, dim=0)
     mu = pooled.mean(dim=(0, 1))
-    sigma = pooled.std(dim=(0, 1))
+    if iso:
+        s = pooled.std()
+        sigma = torch.stack([s, s])
+    else:
+        sigma = pooled.std(dim=(0, 1))
     return mu, sigma
 
 
