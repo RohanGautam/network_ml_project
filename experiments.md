@@ -389,11 +389,76 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
      CSVs: `solution_sgdr_best_val3.116.csv`,
      `solution_sgdr_snap_best3_val3.101.csv`,
      `solution_blend_best3_eqm_w0.73.csv`.
-  3. **10k single-cosine (job 2955275, RUNNING).** The "more compute, same shape"
-     arm — completes the 3-way ablation (5k-cosine 3.11 / 10k-cosine ? / 5k-SGDR
-     3.12). Tests whether raw epochs (not restart shape) push below 3.11.
-  4. Ensemble multiple aug-MART SEEDS (different inits may decorrelate more than
-     SGDR cycle minima, which share one trajectory).
+  3. **✅ D2 test-time augmentation (TTA) — WORKS, −0.029 free (job 2955757).**
+     Average aug-MART's predictions over the 4 EXACT court symmetries (D2:
+     identity, flip-x, flip-y, 180° rot), applied in normed space about the court
+     center, predictions inverse-transformed back (each is an involution). The 4
+     transforms give DIFFERENT per-transform val (identity 3.112, flip_x 3.111,
+     flip_y 3.125, rot180 3.117) — direct proof aug-MART is only *approximately*
+     O(2)-invariant (contrast EqMotion, where reflection TTA was an exact no-op).
+     **D2 4-way avg = 3.083 (Δ −0.029 vs no-TTA 3.112)** — a bigger, free,
+     no-training gain than the entire snapshot/blend effort, and ORTHOGONAL to
+     both seed-ensembling and the EqMotion blend (TTA cuts aug-MART's own
+     variance; the others add decorrelation on different axes) → should stack.
+     The TTA gain itself *measures* the model's degree of non-equivariance — good
+     report point. Code: `src/mart/tta_eval.py`, `jobs/tta_eval.sh`.
+  4. **aug-MART multi-seed ensemble — STARTED then CANCELLED (jobs 2955751/52/53).**
+     Seeds 2/3/4 launched, then cancelled ~ep 45: variance reduction caps at
+     ~2.93 (see 4c) so it can't reach the val<2.6 goal, and it was tying up 3
+     nodes the capacity test needs. Deprioritized in favor of the structural
+     capacity test (4d). Still a valid −0.06–0.12 lever for a *Kaggle* push later.
+  4c. **GOAL = val < 2.6.** Honest projection: variance reduction alone
+     (TTA −0.029 + 4-seed ens ~−0.06–0.12 + EqMotion blend ~−0.04, all
+     orthogonal) stacks to ~**2.93–2.98 val** — NOT 2.6. The 3.25→3.1→2.93 path
+     is all *variance*; the residual to 2.6 is the *shared bias* both
+     architectures hit (ρ≈0.94 ⇒ same errors on same samples ⇒ data/task floor,
+     not model variance). Per the MART-oracle finding (min-of-K=0.64), 2.6 lives
+     in future-mode info the 8-frame past underdetermines — unreachable by
+     point-MSE averaging. So beating 2.6 needs a STRUCTURAL change (more
+     capacity / longer context / richer features / different scoring), not more
+     ensembling. **Next structural test = capacity (below).**
+  4d. **Capacity-ceiling test — scaled aug-MART (job pending smoke 2955764).**
+     ~3-4× bigger (256-512-8, vs 128-256-6) at the same 5000-ep aug recipe.
+     Rationale: 7.5M showed ZERO overfit (train≈val), so capacity may not bind.
+     Caveat: train≈val (equal, not train≪val) leans "data floor" over "capacity
+     floor", so prior on a big gain is moderate. Diagnostic = watch train-vs-val:
+     train collapsing below val ⇒ capacity now binds (helps); staying equal ⇒
+     data floor confirmed. Config `mart_nba_aug_big.yaml`, `jobs/train_mart_aug_big.sh`.
+     **LAUNCHED (job 2955786):** 36.1M params (4.8× the 7.5M backbone), 256-512-8,
+     5000-ep cosine. Smoke confirmed builds/fits memory; per-epoch cost ≈ same as
+     7.5M (data/val loop bound, not matmul) so ~8h, fits 24h wall. Diagnostic to
+     watch: train-vs-val divergence (overfit ⇒ capacity binds ⇒ helps; train≈val
+     persists ⇒ data floor, 3rd independent confirmation alongside schedule+ensembling).
+  4e. **Goal/metric AUDIT (no-compute, decisive for target framing).** Findings:
+     - **val/mse_ft is computed correctly** — mean of squared error over (T_f, N=11
+       real, 2 coords) in feet², denormalized; matches the CLAUDE.md ADE spec and
+       EqMotion's `compute_mse` exactly. No metric bug inflating our numbers.
+     - **Submission is SINGLE-SHOT** (`data/sample_submission.csv`: 1 row/id, 264
+       cols = 11×12×2, one trajectory/entity). So Kaggle = single-shot mean-MSE,
+       confirming "predict the conditional mean" (averaging K heads) is correct
+       and **multimodal/best-of-K submission is impossible** — kills the idea of
+       submitting diverse modes. The oracle min-of-K=0.64 is therefore NOT
+       directly exploitable; only better *mode selection from 8 frames* helps
+       (and the learned selector already failed at that).
+     - **Context hard-capped at 8 frames** (all 1243 test files are (8,11,4)) →
+       the "longer context (C>8)" lever is DEAD; the model can't get more history.
+     - **val→Kaggle gap is consistently ~+0.08** (5 confirmed pairs: 3.07→2.98,
+       3.11→3.01, 3.12→3.05, 3.10→3.03, 3.07→3.00; val is *pessimistic*). So the
+       Kaggle 2.6 LB top ≈ **val ~2.68**, and a literal "val < 2.6" ≈ Kaggle
+       ~2.52 (below the top student team). Working target = **val ~2.68** =
+       matching the leaderboard top. Context: this is a *class* competition, so
+       2.6 is the top student group — likely a findable method lever, not SOTA.
+     - **Surviving live levers toward ~2.68:** (a) capacity [4d, running];
+       (b) basketball-specific / per-agent / handler-aware mode selection (the
+       oracle gap proves headroom; generic MLP selector failed but handler-cued
+       hasn't been tried); (c) a sharper-conditional-mean architecture from the
+       cited papers (MoFlow flow-matching, LED). Variance levers (ensembling/TTA)
+       are −0.03–0.12 each and cap ~2.93 — useful for Kaggle, insufficient for 2.68.
+  4b. **10k single-cosine (job 2955275, RUNNING, ~ep 8800, best ~3.14).** The
+     "more compute, same shape" ablation arm. Tracking ABOVE the 5k run's 3.11
+     (its LR is nearly floored with ~1250 ep left) → looks like raw epochs aren't
+     the lever either, consistent with SGDR. Confirms 3.11 as a real floor for
+     the single 7.5M model; final number TBD.
   5. **Infra fix (DONE).** Job scripts now use per-job scratch
      (`/scratch/izar/$USER/job_$SLURM_JOB_ID`) — the shared-scratch `rsync
      --delete` collided and killed the first SGDR run (2955010) mid-training when
@@ -747,6 +812,56 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
   remains the single concentrated source of irreducible-looking error; making
   it tractable likely needs a non-equivariant specialist, not capacity
   reallocation in the joint model.
+
+### 5f. 2026-06-02 capacity + aggregation + possession sweep — three more floor confirmations
+
+- **36M capacity test — FAILED, but diagnostic (job 2955786, killed at ep ~3736).**
+  Scaled aug-MART 7.5M→36M (256-512-8), same iso+O(2)+hoops+5000ep recipe.
+  Val/mse_ft pinned at **~11** while `val_minADE` (z-score, min-of-K) stayed
+  **0.036 — identical to the small models**. Same sigma, so not a denorm bug:
+  the bigger model finally had the capacity to do what `min_ade` actually asks
+  (spread the K modes), so best-of-K stayed sharp (~0.8 ft) while the mean of the
+  now-wide cloud blew up. **Capacity under `min_ade` is counterproductive for our
+  mean-of-K metric.** The 7.5M models' good mean-of-K (3.11) is *accidental*
+  mode-collapse (too small to spread), not objective alignment.
+
+- **Mode-aggregation probe — reconfirms K-reduction is dead (`agg_probe.py`).**
+  On 5k/10k aug checkpoints: sample diversity = **1.28 ft** (NOT collapsed), yet
+  medoid (3.22) and densest-cluster-centroid (3.20) both *lose* to mean-of-K
+  (3.11). The spread is unimodal jitter around a biased centre, not separable
+  branches (no density valley for clustering to exploit). Per-entity **oracle =
+  0.445 ft²** (RMS 0.94 ft) — the good sample sits in the low-density *tail*, so
+  density selection moves the wrong way. Headroom is real but un-selectable;
+  matches the earlier 4-reduction sweep and the 3-variant learned selector.
+
+- **Possession-anchored ball — DEAD, model beats the handler-oracle
+  (`ball_possession_probe.py` on aug 5k).** Current split: total **3.112**,
+  players **2.074** (floor), ball **13.50** → the whole 3.1→2.6 gap is the ball
+  (leader's ball ≈ 7.9). Tested anchoring the ball to its likely handler (player
+  nearest the ball at t=C):
+
+  | ball predictor | val ball MSE |
+  |---|---|
+  | model mean-of-K | **13.50** |
+  | constant-velocity | 61.60 |
+  | anchor to handler PREDICTED track | 27.48 |
+  | anchor to handler GROUND-TRUTH track (oracle) | 26.92 |
+
+  Possession persistence 0.72 (ball within 6 ft of t=C handler). **Even the
+  GT-handler oracle (26.9) is 2× worse than the model (13.5)** — the ball is near
+  but never co-located with its handler (dribble offset/bounces/handoffs), and
+  the relational model already exploits possession better than any naive anchor.
+  Constant-velocity (61.6) confirms the ball is strongly non-ballistic.
+
+- **Verdict after this sweep:** every single-prediction lever is now exhausted —
+  capacity (✗), aggregation (✗×5), selection (✗×3), possession (✗), physics (✗),
+  residual (✗), cross-arch ensemble (✗, ρ=0.93). The ball at ~13.5 is irreducible
+  for point-estimate MSE models from 8 frames. The 2.6 leaderboard top almost
+  certainly comes from a **sharper conditional generative model** (flow-matching /
+  diffusion — MoFlow [1], LED, OmniTraj [2] in our refs), which is the only
+  untried class that could lower the ball below ~13.5. Pending: a clean
+  full-recipe `mean_mse` run (job 2958480) as the definitive conditional-mean-
+  floor test (the prior `mean_mse` was 300ep / no-aug, confounded).
 
 ---
 
