@@ -23,9 +23,17 @@
 # schedule question; captured regardless of whether any single cycle beats 3.11).
 NAME="mart_aug_iso_hoops_sgdr"
 
-SCRATCH="/scratch/izar/rgautam/"
+# Per-job scratch dir keyed on the Slurm job id. CRITICAL: concurrent jobs must
+# NOT share one scratch tree — the `rsync --delete` below would otherwise wipe a
+# sibling job's in-progress run (this exact collision killed SGDR job 2955010
+# when the 10k job started and deleted its scratch mid-run). Unique per job =>
+# safe to run many jobs in parallel.
+SCRATCH="/scratch/izar/rgautam/job_${SLURM_JOB_ID:-manual_$$}"
+mkdir -p $SCRATCH
 rsync -a --delete --exclude='.venv' $HOME/network_ml_project $SCRATCH
-echo "SYNCHRONIZED AT $(date)"
+echo "SYNCHRONIZED AT $(date) -> $SCRATCH"
+# Clean up this job's scratch copy on exit (scratch is a shared, quota'd FS).
+trap "rm -rf $SCRATCH" EXIT
 
 cd $SCRATCH/network_ml_project/src/mart  # MART imports require src/mart as cwd
 source $HOME/network_ml_project/.venv/bin/activate
