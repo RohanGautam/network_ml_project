@@ -345,12 +345,61 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
 - **Highest-value next steps (ranked):**
   1. **✅ DONE — 0.70/0.30 blended submission → Kaggle 2.98** (new production,
      `submissions/solution_blend_augmart0.70_eqm0.30.csv`). The val +0.039 survived.
-  2. **SGDR warm restarts.** The diagnostic says 3.11 is a single-cosine model
-     floor; re-raising the LR periodically tests whether the productive mid-LR
-     descent (LR 1e-4→6e-5, where the big gains happened) repeats. Cheap GPU run.
-  3. Ensemble multiple aug-MART seeds (EqMotion ensembling bought 3.33→3.25) —
-     same-arch seeds may decorrelate more than the cross-arch EqMotion blend.
-  4. **Kaggle confirmed:** val→LB gap is favorable for aug-MART (−0.10), so val
+  2. **✅ DONE — SGDR warm restarts (job 2955274). Schedule shape is NOT the
+     lever (clean negative result).** Budget-matched to the single-cosine 5k
+     (same 5000 ep / 7.5M aug config / eta_min), 10 equal cosine cycles of 500
+     ep (T_0=500, T_mult=1). **SGDR best val 3.116 vs single-cosine 3.112 — a
+     tie** (Δ 0.004 = noise). Isolating LR trajectory at matched compute,
+     periodic restarts don't beat one anneal → **3.11 is a genuine
+     model/data/capacity floor, not a schedule strangle.** Confirms the 5k
+     diagnostic (val flattened before the LR floor). The 10 cycle minima improved
+     *monotonically* (3.556 → 3.119) rather than bouncing between diverse basins
+     — a quality ladder, not diverse solutions.
+
+     **Snapshot ensemble (job 2955532).** Averaging cycle minima: full 10-snap
+     ensemble = 3.177 (WORSE — weak early cycles drag the mean up, as the
+     monotone ladder predicted). But **best-3 (cycles 7+8+9, the late
+     comparable-quality minima) = 3.101** — beats both the 3.119 best solo
+     snapshot and the 3.112 baseline. The textbook snapshot-ensemble effect needs
+     *diverse-but-comparable* members: the 3 late cycles qualify (different
+     restart basins, similar quality), the early ones are just worse models and
+     pollute the mean. Modest −0.011 vs baseline.
+
+     **Kaggle-tested all 3 SGDR submissions (none beat the 2.98 production blend):**
+
+     | Submission | val | Kaggle | val→LB gap |
+     |---|---|---|---|
+     | SGDR best single | 3.116 | 3.05 | −0.07 |
+     | best-3 snapshot ens | 3.101 | 3.03 | −0.07 |
+     | best-3 × EqMotion (w=0.73) | 3.069 | **3.00** | −0.07 |
+     | — production (aug-MART × EqMotion) | 3.073 | **2.98** | −0.09 |
+
+     **Stacking did NOT pay.** best-3×EqMotion tuned to val 3.069 (vs production
+     3.073 — only −0.004, within noise), and on Kaggle it's 3.00 vs 2.98 — a
+     touch *worse*. The snapshot ensemble's −0.011 val gain over single aug-MART
+     mostly did not survive the EqMotion blend: EqMotion already absorbs the
+     variance that snapshot-averaging reduces, so the two gains overlap rather
+     than add. Also note the SGDR family carries a slightly smaller favorable
+     val→Kaggle gap (−0.07 vs production's −0.09), which is why even the
+     lower-val 3.069 blend lands above 2.98 on the board. **Production stays
+     `solution_blend_augmart0.70_eqm0.30.csv` (Kaggle 2.98).** Code:
+     `src/mart/{snapshot_ensemble_eval,blend_csvs,tune_best3_eqm_blend}.py`,
+     `jobs/{train_mart_sgdr,snapshot_ensemble,submit_sgdr}.sh`. Snapshots:
+     `checkpoints/mart_aug_iso_hoops_sgdr_snapshots/cycle_{00..09}.ckpt`. New
+     CSVs: `solution_sgdr_best_val3.116.csv`,
+     `solution_sgdr_snap_best3_val3.101.csv`,
+     `solution_blend_best3_eqm_w0.73.csv`.
+  3. **10k single-cosine (job 2955275, RUNNING).** The "more compute, same shape"
+     arm — completes the 3-way ablation (5k-cosine 3.11 / 10k-cosine ? / 5k-SGDR
+     3.12). Tests whether raw epochs (not restart shape) push below 3.11.
+  4. Ensemble multiple aug-MART SEEDS (different inits may decorrelate more than
+     SGDR cycle minima, which share one trajectory).
+  5. **Infra fix (DONE).** Job scripts now use per-job scratch
+     (`/scratch/izar/$USER/job_$SLURM_JOB_ID`) — the shared-scratch `rsync
+     --delete` collided and killed the first SGDR run (2955010) mid-training when
+     the 10k job started. Patched in the mart_aug/sgdr/10k/snapshot scripts;
+     other ~26 job scripts share the latent bug (only bites on concurrent runs).
+  6. **Kaggle confirmed:** val→LB gap is favorable for aug-MART (−0.10), so val
      remains a trustworthy — slightly pessimistic — selector.
 - **Done (EqMotion era):** 5-seed ensemble → val 3.25 (from 3.33); reflection TTA
   confirmed an exact no-op (EqMotion is exactly O(2)-equivariant). Submission:
