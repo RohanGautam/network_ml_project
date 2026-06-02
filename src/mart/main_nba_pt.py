@@ -124,6 +124,16 @@ def parse_args():
                    help='Override config num_epochs (e.g. long training).')
     p.add_argument('--dropout', type=float, default=None,
                    help='Override config dropout.')
+    # Scheduler override + SGDR (warm-restart) controls. To validate the
+    # schedule-shape hypothesis, run SGDR at the SAME num_epochs as the
+    # single-cosine baseline so any delta is from LR shape, not extra compute.
+    p.add_argument('--scheduler_type', type=str, default=None,
+                   help='Override config scheduler_type '
+                        '(e.g. CosineAnnealingWarmRestarts).')
+    p.add_argument('--sgdr_t0', type=int, default=None,
+                   help='SGDR first-cycle length in epochs (CosineAnnealingWarmRestarts).')
+    p.add_argument('--sgdr_tmult', type=int, default=None,
+                   help='SGDR cycle-length multiplier per restart (default 1).')
     # Logging
     p.add_argument('--wandb_project', type=str, default='NML_base')
     p.add_argument('--wandb_run_name', type=str, default=None)
@@ -439,6 +449,12 @@ def main():
         opts.num_epochs = args.num_epochs
     if args.dropout is not None:
         opts.dropout = args.dropout
+    if args.scheduler_type is not None:
+        opts.scheduler_type = args.scheduler_type
+    if args.sgdr_t0 is not None:
+        opts.sgdr_t0 = args.sgdr_t0
+    if args.sgdr_tmult is not None:
+        opts.sgdr_tmult = args.sgdr_tmult
 
     # Rotation in the normed frame is only an isometry under isotropic scaling.
     # Force iso on whenever rotation is requested so we never silently train on
@@ -560,6 +576,18 @@ def main():
         scheduler = lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=opts.num_epochs, eta_min=opts.lr * 0.02,
         )
+    elif opts.scheduler_type == 'CosineAnnealingWarmRestarts':
+        # SGDR: cosine annealing that periodically RESTARTS the LR back to its
+        # peak. First cycle is sgdr_t0 epochs; each subsequent cycle is sgdr_tmult
+        # times longer. eta_min matches CosineAnnealingLR for a fair comparison.
+        # NOTE: step() must be called once per epoch (we do, after each epoch),
+        # so the cycle lengths are in EPOCH units. Budget-match num_epochs to the
+        # single-cosine baseline so any delta is attributable to LR shape, not
+        # extra compute.
+        scheduler = lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=opts.sgdr_t0, T_mult=opts.get('sgdr_tmult', 1),
+            eta_min=opts.lr * 0.02,
+        )
     else:
         scheduler = None
 
@@ -581,6 +609,15 @@ def main():
     val_metrics = None
     best_ckpt_path = os.path.join(ckpt_dir, f'{args.model_name}_best.ckpt')
     best_mse = float('inf')
+    # For SGDR: snapshot the model at the END of each cosine cycle (its minimum),
+    # detected by the LR jumping back up after scheduler.step(). These per-cycle
+    # snapshots form a free same-arch "snapshot ensemble" — a different lever from
+    # the schedule-shape question, so we capture it regardless.
+    is_sgdr = (opts.scheduler_type == 'CosineAnnealingWarmRestarts')
+    snapshot_dir = os.path.join(ckpt_dir, f'{args.model_name}_snapshots')
+    if is_sgdr:
+        os.makedirs(snapshot_dir, exist_ok=True)
+    n_snapshots = 0
 
     with wandb.init(
         project=args.wandb_project,
@@ -600,8 +637,31 @@ def main():
                 mu=mu, sigma=sigma,
             )
 
+            lr_before = optimizer.param_groups[0]['lr']
             if scheduler is not None:
                 scheduler.step()
+            lr_after = optimizer.param_groups[0]['lr']
+
+            # SGDR restart detection: within a cosine cycle the LR is monotone
+            # DEcreasing, so ANY increase after step() is unambiguously a restart.
+            # (Using a strict >2x gate misfires at tiny T_0 where the pre-restart
+            # LR is the cosine midpoint, not eta_min; a 1.1x margin is robust to
+            # bottom-of-cosine float jitter while still catching every restart.)
+            # The model state *before* stepping is that cycle's minimum, so
+            # snapshot it now (we haven't mutated weights between step() calls).
+            if is_sgdr and lr_after > lr_before * 1.1:
+                snap_path = os.path.join(snapshot_dir, f'cycle_{n_snapshots:02d}.ckpt')
+                torch.save(
+                    {
+                        'epoch': epoch, 'state_dict': model.state_dict(),
+                        'opts': dict(opts), 'mu': mu, 'sigma': sigma,
+                        'val_mse_ft': val_metrics['mse_ft'],
+                    },
+                    snap_path,
+                )
+                print(f'[SGDR] cycle {n_snapshots} ended at epoch {epoch} '
+                      f'(val/mse_ft {val_metrics["mse_ft"]:.4f}) -> {snap_path}')
+                n_snapshots += 1
 
             if val_metrics['mse_ft'] < best_mse:
                 best_mse = val_metrics['mse_ft']
