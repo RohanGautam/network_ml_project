@@ -856,12 +856,56 @@ All in `src/equivariance/eqmotion_nba.py` unless noted.
 - **Verdict after this sweep:** every single-prediction lever is now exhausted —
   capacity (✗), aggregation (✗×5), selection (✗×3), possession (✗), physics (✗),
   residual (✗), cross-arch ensemble (✗, ρ=0.93). The ball at ~13.5 is irreducible
-  for point-estimate MSE models from 8 frames. The 2.6 leaderboard top almost
-  certainly comes from a **sharper conditional generative model** (flow-matching /
-  diffusion — MoFlow [1], LED, OmniTraj [2] in our refs), which is the only
-  untried class that could lower the ball below ~13.5. Pending: a clean
-  full-recipe `mean_mse` run (job 2958480) as the definitive conditional-mean-
-  floor test (the prior `mean_mse` was 300ep / no-aug, confounded).
+  for point-estimate MSE models from 8 frames.
+
+- **Clean full-recipe `mean_mse` — LOST and OVERFIT (job 2958480, 7.5M, iso+O(2)
+  +hoops+5000ep cosine, loss=mean_mse).** Definitive un-confounded conditional-
+  mean-floor test. Best val ever = **3.20** (~ep 1200) vs `min_ade` **3.112**;
+  then val *climbed* to ~3.59 while train collapsed to 0.0026 (≈1.3 ft² vs val
+  3.59 — 2.7× train/val gap). `min_ade` never overfit (train≈val). **Conclusion:
+  `min_ade`'s averaging of K diverse heads is a regularizer that gives a
+  better-generalizing E[y|x] estimate than direct regression; 3.11 is the
+  well-regularized conditional mean, NOT a `min_ade` artifact.**
+
+- **This closes the generative lever too (by shared objective).** Every point-
+  estimate generative model (MDN/GMM, flow-matching, diffusion) submits the
+  conditional mean for our single-shot mean-MSE metric. `mean_mse` *is* that
+  target optimized directly, and it can't beat 3.11 (overfits to 3.20). The
+  published MoFlow [1] / LED / OmniTraj [2] NBA wins are all on **minADE**
+  (best-of-K), which a single-submission mean-MSE metric structurally cannot
+  exploit. **6th independent floor confirmation.** Path to 2.6 would require
+  information beyond the 8-frame past or a submission mechanism we don't have;
+  neither exists in this task.
+
+- **Learned selector RE-RUN on the BEST model (aug-5k) — same ~5% floor (job
+  2958657, `selector_aug5k.sh`).** The prior selector was on the inferior 300ep/
+  no-aug `mart_minade_s1`; this re-ran the full cache→train pipeline on
+  `mart_aug_iso_hoops_5k` (ball 13.50, the quantified-headroom case) with stronger
+  regularization to combat the prior overfit. Baseline ball 13.50 →
+
+  | variant | ball MSE | Δ |
+  |---|---|---|
+  | v1 scene-context | 13.10 | −3.0% |
+  | v2 ball-only loss | 13.05 | −3.3% |
+  | v3 no-scene + more reg | **12.88** | **−4.5%** |
+
+  Best total 3.05 (vs 3.11) — real but tiny, nowhere near ball≈8 / total≈2.6.
+  **The ~5% ball floor is invariant to base-model quality** — a cleaner,
+  better-trained model did NOT make the modes more selectable. Tell-tale: v3
+  *removed* scene context and won, so the t=C player configuration does NOT
+  predict the ball's mode. **7th confirmation, and the strongest** — it kills the
+  one lever with quantified headroom on the best model. The deciding info is a
+  future decision (pass-left/right/drive/shoot) absent from the 8-frame past.
+
+- **FINAL VERDICT.** val<2.6 is unreachable for a single-prediction model on this
+  task; ~3.1 / Kaggle ~2.98 is the floor, 7-way confirmed across 2 architectures
+  and every lever (capacity, aggregation×6, selection×2-models, possession,
+  physics, residual, cross-arch, direct-regression). The entire 3.1→2.6 gap is
+  irreducible ball multimodality not determined by 8 frames. The 2.6 leaderboard
+  top must use out-of-regime information or a multi-submission mechanism this
+  setup does not provide. Consolidate the floor story as the report's central
+  critical-analysis contribution; production stays 0.70 aug-MART + 0.30 EqMotion
+  (Kaggle 2.98). Optional micro-gain: fold the v3 aug-5k selector (total 3.05).
 
 ---
 

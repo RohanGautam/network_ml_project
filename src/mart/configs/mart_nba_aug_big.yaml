@@ -1,0 +1,42 @@
+# MART config: SCALED-UP "augment + train-long" — capacity-ceiling test.
+#
+# Rationale: the 7.5M aug-MART (mart_nba_aug.yaml) showed ZERO overfit at 5000 ep
+# (train≈val≈0.026), so capacity may not yet bind. This ~3-4x bigger model tests
+# whether the shared aug-MART/EqMotion error floor (~3.1) is a capacity limit
+# (=> this helps) or a data floor (=> it won't, train≈val will just persist at a
+# similar number). Same augmentation regime regularizes it: --iso_norm
+# --aug_rot_deg 180 --aug_court_mirror --use_hoops.
+#
+# Deltas vs mart_nba_aug.yaml: model_dim 128->256, hidden 256->512, layers 6->8,
+# dropout 0.1->0.15 (more capacity -> slightly more reg). num_heads 8 (256/8=32/head).
+
+# model params (scaled ~3-4x vs the 7.5M / 128-256-6 config)
+num_layers: 8
+num_heads: 8
+model_dim: 256
+hidden_dim: 512
+decoder_hidden_dim: 512
+dropout: 0.15
+sample_k: 20
+aggregation: 'avg'
+function_type: 2
+hyper_scales: [1, 'adaptive']
+
+# input/output params
+past_length: 8
+future_length: 12
+inputs: ['pos_x', 'pos_y', 'vel_x', 'vel_y']
+pred_rel: False
+
+# Entity-type embedding (TeamA / TeamB / Ball [/ Hoop]).
+use_entity_embed: true
+embed_dim: 4
+
+# training params — same 5000-ep cosine as the 7.5M run for a clean comparison.
+num_epochs: 5000
+lr: 0.0005
+clip_grad: null
+batch_size: 64
+scheduler_type: CosineAnnealingLR
+milestones: [100, 200]
+decay_gamma: 0.5
