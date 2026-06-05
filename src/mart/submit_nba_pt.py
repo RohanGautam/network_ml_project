@@ -139,7 +139,10 @@ def main():
 
     # ---- Load checkpoint ----
     print(f'loading checkpoint: {args.checkpoint}')
-    ckpt = torch.load(args.checkpoint, map_location='cpu')
+    # weights_only=False because we save a Box config object alongside the
+    # state_dict (PyTorch 2.6 defaults to weights_only=True and would reject it).
+    # Safe: this is our own checkpoint, not third-party.
+    ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     opts = Box(ckpt['opts'])
     mu = ckpt['mu'].float()       # [2]
     sigma = ckpt['sigma'].float() # [2]

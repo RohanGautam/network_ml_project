@@ -46,15 +46,28 @@ def load_split_files(manifest_path):
     return train, val
 
 
-def compute_xy_stats(files):
-    """Per-axis mean/std over (x, y), pooled across all files and timesteps."""
+def compute_xy_stats(files, iso=False):
+    """Mean/std over (x, y), pooled across all files and timesteps.
+
+    iso=False: per-axis std (anisotropic, default — legacy behaviour).
+    iso=True:  a single shared scalar std for both axes. This is a prerequisite
+        for rotation/reflection augmentation: under anisotropic per-axis scaling
+        a physical rotation becomes a *shear* in the normalized frame the model
+        sees, so the augmented samples are geometrically inconsistent. A shared
+        scalar makes a rotation in raw feet map to a rotation in normed space
+        (same trick EqMotion needed for its O(2) equivariance).
+    """
     chunks = []
     for f in files:
         seq = torch.load(f).float()  # [T, N, F]
         chunks.append(seq[:, :, :2])
     pooled = torch.cat(chunks, dim=0)
     mu = pooled.mean(dim=(0, 1))
-    sigma = pooled.std(dim=(0, 1))
+    if iso:
+        s = pooled.std()
+        sigma = torch.stack([s, s])
+    else:
+        sigma = pooled.std(dim=(0, 1))
     return mu, sigma
 
 
@@ -142,3 +155,33 @@ class WindowSampler(Sampler):
 
     def __len__(self):
         return len(self.max_start)
+
+
+class WindowEvalSampler(Sampler):
+    """Deterministic, multi-window validation sampler (mirrors EqMotion's
+    NBAEvalSampler exactly so val/mse_ft is directly comparable across models).
+
+    Instead of one random window per sequence per epoch (the noisy
+    `WindowSampler` behaviour, which makes val bounce between epochs and gives
+    a lucky-draw checkpoint signal), this enumerates a fixed set of evenly
+    spaced windows per sequence, capped at `windows_per_seq`. Each sequence
+    contributes the same number of windows (no over-weighting of long ones).
+    """
+
+    def __init__(self, max_start, windows_per_seq=8):
+        self.windows = []
+        for i, ms in enumerate(max_start):
+            if ms <= 0:
+                starts = [0]
+            else:
+                k = min(windows_per_seq, ms + 1)
+                starts = sorted(
+                    {int(round(s)) for s in torch.linspace(0, ms, k).tolist()}
+                )
+            self.windows.extend((i, s) for s in starts)
+
+    def __iter__(self):
+        return iter(self.windows)
+
+    def __len__(self):
+        return len(self.windows)

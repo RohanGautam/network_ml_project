@@ -23,19 +23,20 @@ submit_nba_pt.py (state_dict, full config, mu, sigma).
 """
 
 import argparse
+import math
 import os
 import random
 import sys
 
-# wandb auth: replace with your API key from https://wandb.ai/authorize
-os.environ.setdefault(
-    'WANDB_API_KEY',
-    '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',
-)
-
+import dotenv
 import numpy as np
 import torch
 import wandb
+
+# WANDB_API_KEY is loaded from the project's .env (same pattern as the other
+# training scripts in this repo). To override, set the env var before launch
+# or run `wandb login`.
+dotenv.load_dotenv(dotenv.find_dotenv())
 
 from torch import optim
 from torch.optim import lr_scheduler
@@ -49,6 +50,7 @@ from models.mart_id import MART_ID
 from loaders.dataloader_nba_pt import (
     MARTNBAPTDataset,
     WindowSampler,
+    WindowEvalSampler,
     compute_xy_stats,
     load_split_files,
 )
@@ -104,8 +106,36 @@ def parse_args():
     # reflected axis. Off by default.
     p.add_argument('--aug_court_mirror', action='store_true',
                    help='Random court-symmetry reflection per batch sample at train time.')
+    # Isotropic normalization: shared scalar std for x & y (vs per-axis). Required
+    # for valid rotation augmentation and independently a win for EqMotion.
+    p.add_argument('--iso_norm', action='store_true',
+                   help='Isotropic (shared scalar) z-score std; needed for --aug_rotate.')
+    # Rotation augmentation: random rotation about the court center, drawn from
+    # U(-aug_rot_deg, aug_rot_deg). 180 = full O(2) (with --aug_court_mirror).
+    # Implies --iso_norm geometrically; we enforce iso when this is > 0.
+    p.add_argument('--aug_rot_deg', type=float, default=0.0,
+                   help='Max rotation magnitude in degrees (0 = off; 180 = full circle).')
+    # Gaussian position jitter (normed units) on the PAST only — input regularizer.
+    p.add_argument('--aug_jitter', type=float, default=0.0,
+                   help='Std of Gaussian jitter added to past positions (normed units).')
+    # Optional overrides of capacity / schedule without editing the yaml, so a
+    # single config can drive a small sweep of model sizes / lengths.
+    p.add_argument('--num_epochs', type=int, default=None,
+                   help='Override config num_epochs (e.g. long training).')
+    p.add_argument('--dropout', type=float, default=None,
+                   help='Override config dropout.')
+    # Scheduler override + SGDR (warm-restart) controls. To validate the
+    # schedule-shape hypothesis, run SGDR at the SAME num_epochs as the
+    # single-cosine baseline so any delta is from LR shape, not extra compute.
+    p.add_argument('--scheduler_type', type=str, default=None,
+                   help='Override config scheduler_type '
+                        '(e.g. CosineAnnealingWarmRestarts).')
+    p.add_argument('--sgdr_t0', type=int, default=None,
+                   help='SGDR first-cycle length in epochs (CosineAnnealingWarmRestarts).')
+    p.add_argument('--sgdr_tmult', type=int, default=None,
+                   help='SGDR cycle-length multiplier per restart (default 1).')
     # Logging
-    p.add_argument('--wandb_project', type=str, default='mart_nba_pt')
+    p.add_argument('--wandb_project', type=str, default='NML_base')
     p.add_argument('--wandb_run_name', type=str, default=None)
     p.add_argument('--wandb_mode', type=str, default='online',
                    help='online | offline | disabled')
@@ -128,45 +158,74 @@ def _model_forward(model, x_abs, x_rel, agent_ids):
     return model(x_abs, x_rel)
 
 
-def _augment_court_mirror(x_abs, y, aug_offset):
-    """Random court-symmetry reflections per batch instance (training only).
+def _augment_court(x_abs, y, center, rot_max_rad=0.0, mirror=False, jitter_std=0.0):
+    """Random O(2) court-symmetry augmentation per batch instance (training only).
 
-    Raw coords are court-centered, so a court reflection is a coordinate
-    negation in raw feet. Under z-scoring z = (raw - mu) / sigma, the
-    equivalent transform along axis c is z -> -z - 2*mu[c]/sigma[c]; we
-    precompute aug_offset = 2 * mu / sigma so the inner loop is a plain
-    `-z - aug_offset[c]` per flipped axis.
+    Composes a per-sample random rotation and/or independent x/y reflection,
+    applied *about the court center* so the transform is an exact isometry on
+    the court: pairwise agent distances are preserved, MART's relation/attention
+    structure stays valid, and agent_ids (team labels, ball, hoops) are
+    unchanged. The SAME transform is applied to past (`x_abs`) and future (`y`)
+    so the window stays coherent; `train_one_epoch` recomputes `x_rel` from the
+    transformed `x_abs`, so velocities transform correctly (the constant center
+    offset cancels in the time difference).
 
-    Reflections are isometries: pairwise agent distances are preserved, so
-    MART's relation/attention structure stays valid and agent_ids (team
-    labels, ball, hoops) are unchanged — team identity is independent of
-    which side of the court a team is playing on. Velocity is *not* mutated
-    here; train_one_epoch recomputes x_rel from the reflected x_abs, which
-    naturally flips the velocity sign (the constant offset cancels in the
-    time difference).
+    Rotation requires ISOTROPIC normalization (--iso_norm): under anisotropic
+    per-axis std a rotation in raw feet becomes a shear in the normed frame.
+    Reflections are valid under either norm, but for consistency we apply both
+    here in the (assumed iso) normed frame about `center`.
+
+    Court center in normed space is `center = -mu / sigma` (raw origin (0,0) is
+    the court center; z = (0 - mu) / sigma). For full rotation use
+    rot_max_rad = pi; for a mild regularizer use a small angle.
 
     Args:
-        x_abs:      [B, N, T_p, 2]  z-scored past positions
-        y:          [B, N, T_f, 2]  z-scored future positions
-        aug_offset: [2]             precomputed 2 * mu / sigma on x_abs.device
+        x_abs:       [B, N, T_p, 2]  z-scored past positions
+        y:           [B, N, T_f, 2]  z-scored future positions
+        center:      [2]             normed court center (-mu/sigma) on device
+        rot_max_rad: rotation angle drawn ~ U(-rot_max_rad, rot_max_rad). 0 = off.
+        mirror:      if True, independent 50/50 x and y reflections (D2).
+        jitter_std:  Gaussian position noise std (normed units) added to the
+                     PAST only (input regularizer; target stays clean). 0 = off.
     Returns:
-        Reflected (x_abs, y) as new tensors.
+        Transformed (x_abs, y) as new tensors.
     """
     B = x_abs.shape[0]
     device = x_abs.device
-    flip_x = (torch.rand(B, device=device) < 0.5).view(B, 1, 1)  # negate x coord
-    flip_y = (torch.rand(B, device=device) < 0.5).view(B, 1, 1)  # negate y coord
 
-    x_abs = x_abs.clone()
-    y = y.clone()
+    # Per-sample reflection signs (D2) folded into the linear map.
+    if mirror:
+        sx = torch.where(torch.rand(B, device=device) < 0.5, -1.0, 1.0)
+        sy = torch.where(torch.rand(B, device=device) < 0.5, -1.0, 1.0)
+    else:
+        sx = torch.ones(B, device=device)
+        sy = torch.ones(B, device=device)
 
-    # Channel 0 = court-length axis (x): swap left/right basket sides.
-    x_abs[..., 0] = torch.where(flip_x, -x_abs[..., 0] - aug_offset[0], x_abs[..., 0])
-    y[..., 0]     = torch.where(flip_x, -y[..., 0]     - aug_offset[0], y[..., 0])
+    if rot_max_rad > 0.0:
+        theta = (torch.rand(B, device=device) * 2.0 - 1.0) * rot_max_rad
+    else:
+        theta = torch.zeros(B, device=device)
+    cos, sin = torch.cos(theta), torch.sin(theta)
 
-    # Channel 1 = court-width axis (y): swap top/bottom sideline.
-    x_abs[..., 1] = torch.where(flip_y, -x_abs[..., 1] - aug_offset[1], x_abs[..., 1])
-    y[..., 1]     = torch.where(flip_y, -y[..., 1]     - aug_offset[1], y[..., 1])
+    # 2x2 per-sample map M = R(theta) @ diag(sx, sy), applied about `center`.
+    m00 = (cos * sx).view(B, 1, 1)
+    m01 = (-sin * sy).view(B, 1, 1)
+    m10 = (sin * sx).view(B, 1, 1)
+    m11 = (cos * sy).view(B, 1, 1)
+    c = center.view(1, 1, 1, 2)
+
+    def _apply(z):
+        zc = z - c
+        xc, yc = zc[..., 0], zc[..., 1]
+        nx = m00 * xc + m01 * yc
+        ny = m10 * xc + m11 * yc
+        return torch.stack([nx, ny], dim=-1) + c
+
+    x_abs = _apply(x_abs)
+    y = _apply(y)
+
+    if jitter_std > 0.0:
+        x_abs = x_abs + torch.randn_like(x_abs) * jitter_std
 
     return x_abs, y
 
@@ -198,12 +257,12 @@ def compute_loss(y_pred, y_exp, loss_type):
     return reduced.mean()
 
 
-def train_one_epoch(epoch, model, optimizer, loader, opts, device, aug_offset=None):
+def train_one_epoch(epoch, model, optimizer, loader, opts, device, aug=None):
     """One training epoch.
 
-    aug_offset: when --aug_court_mirror is set, the precomputed [2] tensor
-        2 * mu / sigma on `device`, used by _augment_court_mirror. None
-        disables the augmentation entirely (default).
+    aug: when geometric augmentation is enabled, a dict with keys
+        {center, rot_max_rad, mirror, jitter_std} forwarded to _augment_court.
+        None disables augmentation entirely (default).
     """
     model.train()
     total_n = 0
@@ -216,8 +275,13 @@ def train_one_epoch(epoch, model, optimizer, loader, opts, device, aug_offset=No
         agent_ids = agent_ids.to(device)
         B, N, _, _ = x_abs.shape
 
-        if aug_offset is not None:
-            x_abs, y = _augment_court_mirror(x_abs, y, aug_offset)
+        if aug is not None:
+            x_abs, y = _augment_court(
+                x_abs, y, aug['center'],
+                rot_max_rad=aug['rot_max_rad'],
+                mirror=aug['mirror'],
+                jitter_std=aug['jitter_std'],
+            )
 
         x_rel = _x_rel_from_x_abs(x_abs)
         y_pred = _model_forward(model, x_abs, x_rel, agent_ids)   # [B, N, K, T_f, 2]
@@ -264,13 +328,35 @@ def train_one_epoch(epoch, model, optimizer, loader, opts, device, aug_offset=No
 
 
 @torch.no_grad()
-def eval_minADE_minFDE(model, loader, opts, device, split_name):
-    """Compute min-of-K minADE and minFDE over the full future horizon."""
+def eval_minADE_minFDE(model, loader, opts, device, split_name, mu=None, sigma=None):
+    """Validation metrics.
+
+    Reports:
+      * `val/mse_ft` — mean squared error in feet², over real entities (11),
+        on the MEAN-of-K prediction. Matches Kaggle's single-shot mean MSE
+        scoring AND EqMotion's `val/mse_ft` definition exactly, so numbers
+        are directly comparable across architectures. Requires `mu`/`sigma`
+        (the train-split z-score stats) for denormalization.
+      * `minADE` / `minFDE` — min-of-K ADE/FDE in **normalized units** (z-score
+        space). Kept for parity with MART's paper-native loss; NOT comparable
+        to Kaggle or to EqMotion's feet-space metric.
+
+    Uses whatever sampler the caller wires up (we wire `WindowEvalSampler`
+    for deterministic multi-window evaluation, matching EqMotion's full-val).
+    """
     model.eval()
     sum_ade = 0.0
     sum_fde = 0.0
     sum_loss = 0.0
     n_total = 0
+    sse_ft = 0.0   # sum of squared errors, in feet², on real entities only
+    cnt_ft = 0     # element count for the mean below
+
+    use_ft = mu is not None and sigma is not None
+    if use_ft:
+        # Broadcast as [1, 1, 1, 2] over (B, N, T_f, 2) for the mean-of-K pred.
+        mu_b = mu.to(device).view(1, 1, 1, 2).float()
+        sigma_b = sigma.to(device).view(1, 1, 1, 2).float()
 
     for x_abs, y, agent_ids in loader:
         x_abs = x_abs.to(device)
@@ -287,42 +373,58 @@ def eval_minADE_minFDE(model, loader, opts, device, split_name):
 
         y_exp = y[:, :, None, :, :]        # [B, N, 1, T_f, 2]
 
-        # Mask hoops out of val metrics for the same reason as the train loss:
-        # they're static, so their contribution is trivially zero and deflates
-        # minADE/minFDE relative to the original 11-agent setup.
+        # Mask hoops out of all val metrics — they're static so they trivially
+        # zero the loss and inflate apparent quality (this exact bug bit
+        # EqMotion: val 2.82 → real 3.33 once hoops were stripped).
         if opts.get('use_hoops', False):
             y_pred = y_pred[:, :HOOPS_N_REAL_AGENTS]
             y_exp = y_exp[:, :HOOPS_N_REAL_AGENTS]
+            y_real = y[:, :HOOPS_N_REAL_AGENTS]
             N_scored = HOOPS_N_REAL_AGENTS
         else:
+            y_real = y
             N_scored = N
 
-        # min-of-K ADE: norm -> mean over T_f -> min over K -> mean over B,N
+        # min-of-K ADE / FDE (z-score space, kept for parity with paper).
         per_step_err = torch.norm(y_pred - y_exp, dim=-1)            # [B, N, K, T_f]
         ade_perK = per_step_err.mean(dim=3)                          # [B, N, K]
         min_ade = ade_perK.min(dim=2)[0]                             # [B, N]
-
-        # min-of-K FDE (final step only)
         fde_perK = per_step_err[:, :, :, -1]                         # [B, N, K]
         min_fde = fde_perK.min(dim=2)[0]                             # [B, N]
-
-        # min-of-K loss (same form used during training, for parity)
         loss_val = min_ade.mean()
-
         sum_ade += min_ade.sum().item()
         sum_fde += min_fde.sum().item()
         sum_loss += loss_val.item() * B * N_scored
         n_total += B * N_scored
 
+        # val/mse_ft on the MEAN-of-K prediction, denormalized to feet.
+        # Equivalent to what submit_nba_pt.py writes (--reduce mean), so val
+        # tracks Kaggle directly. Matches EqMotion's compute_mse exactly:
+        # mean over (T_f, B, N_real, 2) of squared error in feet².
+        if use_ft:
+            y_mean = y_pred.mean(dim=2)                              # [B, N_real, T_f, 2]
+            y_mean_ft = y_mean * sigma_b + mu_b
+            y_tgt_ft = y_real * sigma_b + mu_b
+            sse_ft += ((y_mean_ft - y_tgt_ft) ** 2).sum().item()
+            cnt_ft += y_mean_ft.numel()
+
     avg_ade = sum_ade / max(n_total, 1)
     avg_fde = sum_fde / max(n_total, 1)
     avg_loss = sum_loss / max(n_total, 1)
+    mse_ft = sse_ft / cnt_ft if use_ft and cnt_ft > 0 else float('nan')
 
-    print(
-        f'[{split_name.upper()}] minADE/minFDE @ {opts.future_length} steps: '
-        f'{avg_ade:.4f} / {avg_fde:.4f}'
-    )
-    return {'loss': avg_loss, 'minADE': avg_ade, 'minFDE': avg_fde}
+    if use_ft:
+        print(
+            f'[{split_name.upper()}] mse_ft = {mse_ft:.4f} ft²  '
+            f'| minADE/minFDE (z-score) @ {opts.future_length} steps: '
+            f'{avg_ade:.4f} / {avg_fde:.4f}'
+        )
+    else:
+        print(
+            f'[{split_name.upper()}] minADE/minFDE @ {opts.future_length} steps: '
+            f'{avg_ade:.4f} / {avg_fde:.4f}'
+        )
+    return {'loss': avg_loss, 'minADE': avg_ade, 'minFDE': avg_fde, 'mse_ft': mse_ft}
 
 
 def main():
@@ -340,9 +442,32 @@ def main():
     opts.loss = args.loss
     opts.use_hoops = args.use_hoops
     opts.aug_court_mirror = args.aug_court_mirror
+    opts.iso_norm = args.iso_norm
+    opts.aug_rot_deg = args.aug_rot_deg
+    opts.aug_jitter = args.aug_jitter
+    if args.num_epochs is not None:
+        opts.num_epochs = args.num_epochs
+    if args.dropout is not None:
+        opts.dropout = args.dropout
+    if args.scheduler_type is not None:
+        opts.scheduler_type = args.scheduler_type
+    if args.sgdr_t0 is not None:
+        opts.sgdr_t0 = args.sgdr_t0
+    if args.sgdr_tmult is not None:
+        opts.sgdr_tmult = args.sgdr_tmult
+
+    # Rotation in the normed frame is only an isometry under isotropic scaling.
+    # Force iso on whenever rotation is requested so we never silently train on
+    # sheared (geometrically invalid) augmented samples.
+    if opts.aug_rot_deg > 0.0 and not opts.iso_norm:
+        print('[WARN] --aug_rot_deg > 0 requires isotropic norm; enabling --iso_norm.')
+        opts.iso_norm = True
+
     print(f'[INFO] training loss: {opts.loss}')
     print(f'[INFO] use_hoops: {opts.use_hoops}')
-    print(f'[INFO] aug_court_mirror: {opts.aug_court_mirror}')
+    print(f'[INFO] iso_norm: {opts.iso_norm}')
+    print(f'[INFO] aug: mirror={opts.aug_court_mirror} rot_deg={opts.aug_rot_deg} '
+          f'jitter={opts.aug_jitter}')
     print('[INFO] opts:', opts)
 
     ckpt_dir = './checkpoints'
@@ -355,7 +480,9 @@ def main():
     # doesn't silently build the model with the wrong embedding size and crash
     # state_dict load. (Training mode uses the CLI flag as authored.)
     if args.test and os.path.isfile(ckpt_path):
-        ckpt_opts = torch.load(ckpt_path, map_location='cpu').get('opts', {})
+        ckpt_opts = torch.load(
+            ckpt_path, map_location='cpu', weights_only=False,
+        ).get('opts', {})
         ckpt_uh = bool(ckpt_opts.get('use_hoops', False))
         if ckpt_uh != opts.use_hoops:
             print(
@@ -368,18 +495,24 @@ def main():
     train_files, val_files = load_split_files(args.split_path)
     print(f'[INFO] split: {len(train_files)} train, {len(val_files)} val')
 
-    mu, sigma = compute_xy_stats(train_files)
-    print(f'[INFO] norm stats: mu={mu.tolist()}, sigma={sigma.tolist()}')
+    mu, sigma = compute_xy_stats(train_files, iso=opts.iso_norm)
+    print(f'[INFO] norm stats (iso={opts.iso_norm}): mu={mu.tolist()}, sigma={sigma.tolist()}')
 
-    # Precompute the z-scored-space reflection offset once. mu is non-zero in
-    # general (empirical train-split mean isn't exactly the court center), so a
-    # naive negation would shift the reflected court; -z - aug_offset reflects
-    # around the true court origin. None disables the augmentation entirely.
-    if opts.aug_court_mirror:
-        aug_offset = (2.0 * mu / sigma).to(device)
-        print(f'[INFO] aug_court_mirror offset (2*mu/sigma): {aug_offset.tolist()}')
+    # Build the geometric-augmentation spec. The court center in normed space is
+    # -mu/sigma (raw origin (0,0) is the court center). Rotation/reflection are
+    # applied about it so distances are preserved. None disables augmentation.
+    if opts.aug_court_mirror or opts.aug_rot_deg > 0.0 or opts.aug_jitter > 0.0:
+        aug = {
+            'center': (-mu / sigma).to(device),
+            'rot_max_rad': math.radians(opts.aug_rot_deg),
+            'mirror': bool(opts.aug_court_mirror),
+            'jitter_std': float(opts.aug_jitter),
+        }
+        print(f'[INFO] augmentation enabled: center={aug["center"].tolist()} '
+              f'rot_max_rad={aug["rot_max_rad"]:.3f} mirror={aug["mirror"]} '
+              f'jitter={aug["jitter_std"]}')
     else:
-        aug_offset = None
+        aug = None
 
     DatasetCls = MARTNBAPTDatasetHoops if opts.use_hoops else MARTNBAPTDataset
     train_set = DatasetCls(
@@ -393,9 +526,10 @@ def main():
     train_sampler = WindowSampler(
         opts.batch_size, train_set.max_start, seed=args.seed, shuffle=True,
     )
-    val_sampler = WindowSampler(
-        opts.batch_size, val_set.max_start, seed=args.seed, shuffle=False,
-    )
+    # Deterministic multi-window val sampler so val/mse_ft is stable across
+    # epochs and directly comparable to EqMotion's --full-val numbers.
+    val_sampler = WindowEvalSampler(val_set.max_start, windows_per_seq=8)
+    print(f'[INFO] val windows: {len(val_sampler)} (deterministic 8/seq)')
 
     train_loader = DataLoader(
         train_set, batch_size=opts.batch_size, sampler=train_sampler,
@@ -436,22 +570,54 @@ def main():
         scheduler = lr_scheduler.MultiStepLR(
             optimizer, milestones=opts.milestones, gamma=opts.decay_gamma,
         )
+    elif opts.scheduler_type == 'CosineAnnealingLR':
+        # Same shape as EqMotion (eta_min = lr*0.02) so cross-arch comparisons
+        # share an LR schedule. T_max=num_epochs anneals over the full run.
+        scheduler = lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=opts.num_epochs, eta_min=opts.lr * 0.02,
+        )
+    elif opts.scheduler_type == 'CosineAnnealingWarmRestarts':
+        # SGDR: cosine annealing that periodically RESTARTS the LR back to its
+        # peak. First cycle is sgdr_t0 epochs; each subsequent cycle is sgdr_tmult
+        # times longer. eta_min matches CosineAnnealingLR for a fair comparison.
+        # NOTE: step() must be called once per epoch (we do, after each epoch),
+        # so the cycle lengths are in EPOCH units. Budget-match num_epochs to the
+        # single-cosine baseline so any delta is attributable to LR shape, not
+        # extra compute.
+        scheduler = lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=opts.sgdr_t0, T_mult=opts.get('sgdr_tmult', 1),
+            eta_min=opts.lr * 0.02,
+        )
     else:
         scheduler = None
 
     # ---- Test-only path ----
     if args.test:
         print(f'[INFO] Loading model from: {ckpt_path}')
-        ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt['state_dict'], strict=True)
-        eval_minADE_minFDE(model, val_loader, opts, device, split_name='val')
+        eval_minADE_minFDE(
+            model, val_loader, opts, device, split_name='val',
+            mu=mu, sigma=sigma,
+        )
         return
 
     # ---- Train ----
-    # We checkpoint only after the final epoch (no best-on-val tracking). Val
-    # metrics are still computed every epoch for the wandb curve and the per-
-    # epoch log line, but they do not gate any save.
+    # We save BOTH the final-epoch checkpoint (ckpt_path) and the best-by-val
+    # checkpoint (best_ckpt_path). With long cosine schedules the last epoch is
+    # usually near-best, but best-tracking guards against late-run drift.
     val_metrics = None
+    best_ckpt_path = os.path.join(ckpt_dir, f'{args.model_name}_best.ckpt')
+    best_mse = float('inf')
+    # For SGDR: snapshot the model at the END of each cosine cycle (its minimum),
+    # detected by the LR jumping back up after scheduler.step(). These per-cycle
+    # snapshots form a free same-arch "snapshot ensemble" — a different lever from
+    # the schedule-shape question, so we capture it regardless.
+    is_sgdr = (opts.scheduler_type == 'CosineAnnealingWarmRestarts')
+    snapshot_dir = os.path.join(ckpt_dir, f'{args.model_name}_snapshots')
+    if is_sgdr:
+        os.makedirs(snapshot_dir, exist_ok=True)
+    n_snapshots = 0
 
     with wandb.init(
         project=args.wandb_project,
@@ -464,14 +630,54 @@ def main():
             train_sampler.set_epoch(epoch)
 
             train_loss = train_one_epoch(
-                epoch, model, optimizer, train_loader, opts, device, aug_offset,
+                epoch, model, optimizer, train_loader, opts, device, aug,
             )
             val_metrics = eval_minADE_minFDE(
                 model, val_loader, opts, device, split_name='val',
+                mu=mu, sigma=sigma,
             )
 
+            lr_before = optimizer.param_groups[0]['lr']
             if scheduler is not None:
                 scheduler.step()
+            lr_after = optimizer.param_groups[0]['lr']
+
+            # SGDR restart detection: within a cosine cycle the LR is monotone
+            # DEcreasing, so ANY increase after step() is unambiguously a restart.
+            # (Using a strict >2x gate misfires at tiny T_0 where the pre-restart
+            # LR is the cosine midpoint, not eta_min; a 1.1x margin is robust to
+            # bottom-of-cosine float jitter while still catching every restart.)
+            # The model state *before* stepping is that cycle's minimum, so
+            # snapshot it now (we haven't mutated weights between step() calls).
+            if is_sgdr and lr_after > lr_before * 1.1:
+                snap_path = os.path.join(snapshot_dir, f'cycle_{n_snapshots:02d}.ckpt')
+                torch.save(
+                    {
+                        'epoch': epoch, 'state_dict': model.state_dict(),
+                        'opts': dict(opts), 'mu': mu, 'sigma': sigma,
+                        'val_mse_ft': val_metrics['mse_ft'],
+                    },
+                    snap_path,
+                )
+                print(f'[SGDR] cycle {n_snapshots} ended at epoch {epoch} '
+                      f'(val/mse_ft {val_metrics["mse_ft"]:.4f}) -> {snap_path}')
+                n_snapshots += 1
+
+            if val_metrics['mse_ft'] < best_mse:
+                best_mse = val_metrics['mse_ft']
+                torch.save(
+                    {
+                        'epoch': epoch,
+                        'state_dict': model.state_dict(),
+                        'opts': dict(opts),
+                        'mu': mu,
+                        'sigma': sigma,
+                        'val_mse_ft': val_metrics['mse_ft'],
+                        'val_minADE': val_metrics['minADE'],
+                        'val_minFDE': val_metrics['minFDE'],
+                    },
+                    best_ckpt_path,
+                )
 
             log = {
                 'epoch': epoch,
@@ -479,6 +685,7 @@ def main():
                 'th': get_th(opts, model),
                 'train/loss': train_loss,
                 'val/loss': val_metrics['loss'],
+                'val/mse_ft': val_metrics['mse_ft'],
                 'val/minADE': val_metrics['minADE'],
                 'val/minFDE': val_metrics['minFDE'],
             }
@@ -486,8 +693,8 @@ def main():
 
             print(
                 f'[INFO] Epoch {epoch:03d} done | train_loss {train_loss:.4f} | '
-                f'val_minADE {val_metrics["minADE"]:.4f} | '
-                f'val_minFDE {val_metrics["minFDE"]:.4f}'
+                f'val/mse_ft {val_metrics["mse_ft"]:.4f} ft² | '
+                f'val_minADE {val_metrics["minADE"]:.4f}'
             )
 
         # ---- After all epochs: save the final checkpoint and report final val ----
@@ -503,13 +710,16 @@ def main():
                 'sigma': sigma,
                 'val_minADE': val_metrics['minADE'],
                 'val_minFDE': val_metrics['minFDE'],
+                'val_mse_ft': val_metrics['mse_ft'],
             },
             ckpt_path,
         )
         print(f'\n[INFO] Training complete. Saved final-epoch checkpoint to {ckpt_path}')
-        print('=== Final val metrics (normalized units, last epoch) ===')
-        print(f'  val/minADE : {val_metrics["minADE"]:.4f}')
-        print(f'  val/minFDE : {val_metrics["minFDE"]:.4f}')
+        print(f'[INFO] Best-by-val checkpoint: {best_ckpt_path} (val/mse_ft {best_mse:.4f})')
+        print('=== Final val metrics (last epoch) ===')
+        print(f'  val/mse_ft : {val_metrics["mse_ft"]:.4f} ft²  (Kaggle-comparable)')
+        print(f'  val/minADE : {val_metrics["minADE"]:.4f}  (normalized, min-of-K)')
+        print(f'  val/minFDE : {val_metrics["minFDE"]:.4f}  (normalized, min-of-K)')
         print(f'  val/loss   : {val_metrics["loss"]:.4f}')
         print(
             '[INFO] For metrics in feet (denormalized, ADE/FDE/MSE + min-of-K '
