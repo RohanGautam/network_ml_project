@@ -1,8 +1,8 @@
 #!/bin/bash
 
 #SBATCH --job-name=mart_hoopfeats
-#SBATCH --output=/home/kolhe/network_ml_project/jobs/out/%x_%j.out
-#SBATCH --error=/home/kolhe/network_ml_project/jobs/out/%x_%j.err
+#SBATCH --output=$HOME/network_ml_project/jobs/out/%x_%j.out
+#SBATCH --error=$HOME/network_ml_project/jobs/out/%x_%j.err
 #SBATCH --time=04:00:00
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
@@ -12,14 +12,14 @@
 #SBATCH --ntasks=1
 #SBATCH --account=ee-452
 
-SCRATCH="/scratch/izar/kolhe/job_$SLURM_JOB_ID"
+SCRATCH="/scratch/izar/$USER/job_$SLURM_JOB_ID"
 rsync -a --exclude='__pycache__' --exclude='*.db' --exclude='logs/' \
       $HOME/network_ml_project $SCRATCH
 echo "SYNCHRONIZED AT $(date)"
 
 cd $SCRATCH/network_ml_project/src/mart
 
-source /home/kolhe/miniconda3/etc/profile.d/conda.sh
+source $HOME/miniconda3/etc/profile.d/conda.sh
 conda activate nanovlm
 
 pip install python-box python-dotenv wandb -q
