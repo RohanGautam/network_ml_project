@@ -135,6 +135,35 @@ def parse_args():
     p.add_argument('--sgdr_tmult', type=int, default=None,
                    help='SGDR cycle-length multiplier per restart (default 1).')
     # Logging
+    p.add_argument('--hoop_feats', action='store_true',
+                   help='Inject hoop-relative offset vectors as extra input features. '
+                        'Requires --use_hoops (hoop positions are taken from the 2 '
+                        'landmark nodes already in x_abs, so augmentation is automatic).')
+    p.add_argument('--ball_dist', action='store_true',
+                   help='Inject scalar Euclidean distance to the ball as an extra input '
+                        'feature for every agent at every past timestep. Ball is always '
+                        'at canonical index 10. Adds 1 dim to extra_input_dim.')
+    p.add_argument('--edge_type_emb', action='store_true',
+                   help='Add a learned edge-type embedding bias to the RT pair encoder\'s '
+                        'initial edge features. Types encode basketball structure: '
+                        'same-team, opponent, player↔ball, agent↔hoop, self.')
+    p.add_argument('--curriculum', action='store_true',
+                   help='Curriculum loss: use --loss (default min_ade) for the first '
+                        '--curriculum_switch epochs, then switch to mean_mse.')
+    p.add_argument('--curriculum_switch', type=int, default=None,
+                   help='Epoch at which to switch from --loss to mean_mse. '
+                        'Defaults to half of num_epochs if not set.')
+    p.add_argument('--soft_wta_temp', type=float, default=0.5,
+                   help='Temperature for soft-WTA loss (--loss soft_wta). '
+                        'Lower = closer to min-of-K; higher = closer to mean-of-K.')
+    p.add_argument('--laplace_nll', action='store_true',
+                   help='Use Laplace NLL loss. Changes decoder output to 4D '
+                        '(loc + scale). Best mode selected by ADE on loc.')
+    p.add_argument('--cfi', action='store_true',
+                   help='Enable Cross-modal Future Interaction decoder. Adds Branch 2 '
+                        'with self-attention over K×N mode-agent tokens. '
+                        'Loss = loss(branch1) + loss(branch2). Val uses branch2 mean-of-K.')
+    # Logging
     p.add_argument('--wandb_project', type=str, default='NML_base')
     p.add_argument('--wandb_run_name', type=str, default=None)
     p.add_argument('--wandb_mode', type=str, default='online',
@@ -151,11 +180,38 @@ def _x_rel_from_x_abs(x_abs):
     return x_rel
 
 
-def _model_forward(model, x_abs, x_rel, agent_ids):
+def _model_forward(model, x_abs, x_rel, agent_ids, extra_feats=None, mu=None, sigma=None):
     """Dispatch to MART_ID (takes agent_ids) vs stock MART (ignores them)."""
     if isinstance(model, MART_ID):
-        return model(x_abs, x_rel, agent_ids)
-    return model(x_abs, x_rel)
+        return model(x_abs, x_rel, agent_ids, extra_feats=extra_feats, mu=mu, sigma=sigma)
+    return model(x_abs, x_rel, extra_feats=extra_feats, mu=mu, sigma=sigma)
+
+
+def _compute_ball_dist_feats(x_abs):
+    """Euclidean distance from every agent to the ball at every past timestep.
+
+    Ball is always at canonical index 10 ([TeamA(5), TeamB(5), Ball]).
+    Returns: [B, N, T_p, 1]
+    """
+    ball_pos = x_abs[:, 10:11, :, :]          # [B, 1, T_p, 2]
+    dist = torch.norm(x_abs - ball_pos, dim=-1, keepdim=True)  # [B, N, T_p, 1]
+    return dist
+
+
+def _compute_hoop_feats(x_abs, n_real):
+    """Hoop-relative offset vectors for every agent at every past timestep.
+
+    Hoop nodes sit at x_abs indices n_real and n_real+1. Computing offsets
+    from the hoop positions already in x_abs means the result is automatically
+    consistent with whatever augmentation (rotation, mirror) was applied.
+
+    Returns: [B, N, T_p, 4]  = [off_to_hoop1_x, off_to_hoop1_y, off_to_hoop2_x, off_to_hoop2_y]
+    """
+    hoop1 = x_abs[:, n_real:n_real+1, :, :]      # [B, 1, T_p, 2]
+    hoop2 = x_abs[:, n_real+1:n_real+2, :, :]    # [B, 1, T_p, 2]
+    off1 = hoop1 - x_abs                          # [B, N, T_p, 2]
+    off2 = hoop2 - x_abs                          # [B, N, T_p, 2]
+    return torch.cat([off1, off2], dim=-1)         # [B, N, T_p, 4]
 
 
 def _augment_court(x_abs, y, center, rot_max_rad=0.0, mirror=False, jitter_std=0.0):
@@ -230,22 +286,47 @@ def _augment_court(x_abs, y, center, rot_max_rad=0.0, mirror=False, jitter_std=0
     return x_abs, y
 
 
-def compute_loss(y_pred, y_exp, loss_type):
+def compute_loss(y_pred, y_exp, loss_type, soft_wta_temp=0.5):
     """Aggregate K hypotheses into a scalar loss.
 
-    y_pred: [B, N, K, T_f, 2]   y_exp: [B, N, 1, T_f, 2]
+    y_pred: [B, N, K, T_f, 2] or [B, N, K, T_f, 4] for laplace_nll
+    y_exp:  [B, N, 1, T_f, 2]
 
-    Per-K error:
-        ade  -> mean L2 distance over T_f
-        mse  -> mean squared error over T_f and the (x, y) axes
-    Aggregation over K:
-        min  -> best-of-K (encourages mode diversity, MART's default)
-        mean -> all-of-K (pushes every head toward GT, collapses diversity)
+    loss_type options:
+        min_ade   — min-of-K L2 (MART default, best for diversity)
+        mean_ade  — mean-of-K L2 (collapses diversity, not recommended)
+        min_mse   — min-of-K MSE
+        mean_mse  — mean-of-K MSE (Kaggle-aligned but collapses diversity)
+        soft_wta  — temperature-weighted softmin over K heads; interpolates
+                    min (τ→0) and mean (τ→∞). Aligns training with mean-of-K
+                    inference while preserving mode diversity.
+        laplace_nll — Laplace NLL on the best mode; y_pred must be 4D
+                      (loc_x, loc_y, raw_scale_x, raw_scale_y).
     """
+    if loss_type == 'soft_wta':
+        per_k = torch.norm(y_pred - y_exp, dim=-1).mean(dim=3)        # [B, N, K]
+        weights = torch.nn.functional.softmin(per_k / soft_wta_temp, dim=2).detach()
+        return (weights * per_k).sum(dim=2).mean()
+
+    if loss_type == 'laplace_nll':
+        MIN_SCALE = 1e-3
+        loc   = y_pred[..., :2]                                        # [B, N, K, T_f, 2]
+        scale = torch.nn.functional.softplus(y_pred[..., 2:]) + MIN_SCALE  # [B, N, K, T_f, 2]
+        # Best mode by ADE on loc
+        per_k = torch.norm(loc - y_exp, dim=-1).mean(dim=3)           # [B, N, K]
+        best_k = per_k.argmin(dim=2)                                   # [B, N]
+        B, N, K, T_f, _ = loc.shape
+        idx = best_k.view(B, N, 1, 1, 1).expand(B, N, 1, T_f, 2)
+        best_loc   = loc.gather(2, idx).squeeze(2)                     # [B, N, T_f, 2]
+        best_scale = scale.gather(2, idx).squeeze(2)                   # [B, N, T_f, 2]
+        y_gt = y_exp.squeeze(2)                                        # [B, N, T_f, 2]
+        nll = torch.log(2 * best_scale) + torch.abs(y_gt - best_loc) / best_scale
+        return nll.mean()
+
     if loss_type in ('min_ade', 'mean_ade'):
-        per_k = torch.norm(y_pred - y_exp, dim=-1).mean(dim=3)   # [B, N, K]
+        per_k = torch.norm(y_pred - y_exp, dim=-1).mean(dim=3)        # [B, N, K]
     elif loss_type in ('min_mse', 'mean_mse'):
-        per_k = ((y_pred - y_exp) ** 2).mean(dim=(3, 4))         # [B, N, K]
+        per_k = ((y_pred - y_exp) ** 2).mean(dim=(3, 4))              # [B, N, K]
     else:
         raise ValueError(f'unknown loss_type: {loss_type}')
 
@@ -257,7 +338,7 @@ def compute_loss(y_pred, y_exp, loss_type):
     return reduced.mean()
 
 
-def train_one_epoch(epoch, model, optimizer, loader, opts, device, aug=None):
+def train_one_epoch(epoch, model, optimizer, loader, opts, device, aug=None, mu=None, sigma=None):
     """One training epoch.
 
     aug: when geometric augmentation is enabled, a dict with keys
@@ -283,8 +364,19 @@ def train_one_epoch(epoch, model, optimizer, loader, opts, device, aug=None):
                 jitter_std=aug['jitter_std'],
             )
 
+        extra_parts = []
+        if opts.get('hoop_feats', False):
+            extra_parts.append(_compute_hoop_feats(x_abs, HOOPS_N_REAL_AGENTS))
+        if opts.get('ball_dist', False):
+            extra_parts.append(_compute_ball_dist_feats(x_abs))
+        extra_feats = torch.cat(extra_parts, dim=-1) if extra_parts else None
+
         x_rel = _x_rel_from_x_abs(x_abs)
-        y_pred = _model_forward(model, x_abs, x_rel, agent_ids)   # [B, N, K, T_f, 2]
+        fwd = _model_forward(model, x_abs, x_rel, agent_ids, extra_feats, mu, sigma)
+
+        # CFI returns (loc1, loc2); standard returns a single tensor
+        cfi_mode = isinstance(fwd, tuple)
+        y_pred = fwd[1] if cfi_mode else fwd    # use branch2 as primary prediction
 
         if opts.pred_rel:
             cur_pos = x_abs[:, :, [-1]].unsqueeze(2)
@@ -292,17 +384,27 @@ def train_one_epoch(epoch, model, optimizer, loader, opts, device, aug=None):
 
         y_exp = y[:, :, None, :, :]         # [B, N, 1, T_f, 2]
 
-        # Hoops are static; including them in the loss trivially shrinks it and
-        # dilutes the gradient away from the real 11 entities. Slice them off
-        # before reduction. Hoops are always appended at the tail in the
-        # canonical layout, so [:N_real] is exactly the players + ball.
         if opts.get('use_hoops', False):
             y_pred_loss = y_pred[:, :HOOPS_N_REAL_AGENTS]
             y_exp_loss = y_exp[:, :HOOPS_N_REAL_AGENTS]
         else:
             y_pred_loss = y_pred
             y_exp_loss = y_exp
-        loss = compute_loss(y_pred_loss, y_exp_loss, opts.loss)
+
+        # Curriculum: switch loss type after curriculum_switch epoch
+        effective_loss = opts.loss
+        if opts.get('curriculum', False) and epoch >= opts.get('curriculum_switch', opts.num_epochs // 2):
+            effective_loss = 'mean_mse'
+
+        loss = compute_loss(y_pred_loss, y_exp_loss, effective_loss,
+                            soft_wta_temp=opts.get('soft_wta_temp', 0.5))
+
+        # CFI: add branch1 loss to encourage diverse hypotheses before refinement
+        if cfi_mode:
+            loc1 = fwd[0]
+            loc1_loss = loc1[:, :HOOPS_N_REAL_AGENTS] if opts.get('use_hoops', False) else loc1
+            loss = loss + compute_loss(loc1_loss, y_exp_loss, effective_loss,
+                                       soft_wta_temp=opts.get('soft_wta_temp', 0.5))
 
         optimizer.zero_grad()
         loss.backward()
@@ -364,8 +466,20 @@ def eval_minADE_minFDE(model, loader, opts, device, split_name, mu=None, sigma=N
         agent_ids = agent_ids.to(device)
         B, N, _, _ = x_abs.shape
 
+        extra_parts = []
+        if opts.get('hoop_feats', False):
+            extra_parts.append(_compute_hoop_feats(x_abs, HOOPS_N_REAL_AGENTS))
+        if opts.get('ball_dist', False):
+            extra_parts.append(_compute_ball_dist_feats(x_abs))
+        extra_feats = torch.cat(extra_parts, dim=-1) if extra_parts else None
+
         x_rel = _x_rel_from_x_abs(x_abs)
-        y_pred = _model_forward(model, x_abs, x_rel, agent_ids)   # [B, N, K, T_f, 2]
+        fwd = _model_forward(model, x_abs, x_rel, agent_ids, extra_feats, mu, sigma)
+        y_pred = fwd[1] if isinstance(fwd, tuple) else fwd   # [B, N, K, T_f, 2 or 4]
+
+        # Laplace NLL: strip scale channels — only loc matters for metrics
+        if y_pred.shape[-1] == 4:
+            y_pred = y_pred[..., :2]
 
         if opts.pred_rel:
             cur_pos = x_abs[:, :, [-1]].unsqueeze(2)
@@ -441,6 +555,17 @@ def main():
     opts = load_config(args.config)
     opts.loss = args.loss
     opts.use_hoops = args.use_hoops
+    opts.hoop_feats = args.hoop_feats
+    opts.ball_dist = args.ball_dist
+    opts.edge_type_emb = args.edge_type_emb
+    opts.cfi = args.cfi
+    opts.curriculum = args.curriculum
+    opts.curriculum_switch = args.curriculum_switch   # resolved to int in main()
+    opts.soft_wta_temp = args.soft_wta_temp
+    opts.laplace_nll = args.laplace_nll
+    if args.laplace_nll:
+        opts.loss = 'laplace_nll'
+    opts.extra_input_dim = (4 if args.hoop_feats else 0) + (1 if args.ball_dist else 0)
     opts.aug_court_mirror = args.aug_court_mirror
     opts.iso_norm = args.iso_norm
     opts.aug_rot_deg = args.aug_rot_deg
@@ -463,8 +588,20 @@ def main():
         print('[WARN] --aug_rot_deg > 0 requires isotropic norm; enabling --iso_norm.')
         opts.iso_norm = True
 
+    if opts.hoop_feats and not opts.use_hoops:
+        raise ValueError('--hoop_feats requires --use_hoops (hoop positions come from the landmark nodes in x_abs).')
+
+    # Resolve curriculum switch epoch now that num_epochs is finalised
+    if opts.curriculum and opts.curriculum_switch is None:
+        opts.curriculum_switch = opts.num_epochs // 2
+    if opts.curriculum:
+        print(f'[INFO] curriculum: {opts.loss} for epochs 0–{opts.curriculum_switch-1}, '
+              f'then mean_mse for epochs {opts.curriculum_switch}–{opts.num_epochs-1}')
+
     print(f'[INFO] training loss: {opts.loss}')
     print(f'[INFO] use_hoops: {opts.use_hoops}')
+    print(f'[INFO] hoop_feats: {opts.hoop_feats}  ball_dist: {opts.ball_dist}  '
+          f'extra_input_dim={opts.extra_input_dim}')
     print(f'[INFO] iso_norm: {opts.iso_norm}')
     print(f'[INFO] aug: mirror={opts.aug_court_mirror} rot_deg={opts.aug_rot_deg} '
           f'jitter={opts.aug_jitter}')
@@ -631,6 +768,7 @@ def main():
 
             train_loss = train_one_epoch(
                 epoch, model, optimizer, train_loader, opts, device, aug,
+                mu=mu, sigma=sigma,
             )
             val_metrics = eval_minADE_minFDE(
                 model, val_loader, opts, device, split_name='val',

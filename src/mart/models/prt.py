@@ -63,6 +63,8 @@ class RT(nn.Module):
             edge_hidden_dim_1: int = 128,
             edge_hidden_dim_2: int = 128,
             dropout: float = 0.0,
+            edge_type_matrix=None,
+            num_edge_types: int = 0,
     ):
         super(RT, self).__init__()
         layer = RTTransformerLayer(
@@ -81,6 +83,18 @@ class RT(nn.Module):
         self.node2edge_mlp = MLP(input_dim=node_dim * 2 if self.aggregation == 'cat' else node_dim, output_dim=node_dim, hidden_size=(node_hidden_dim,))
         if self.aggregation == 'att':
             self.attention_mlp = MLP(input_dim=node_dim + edge_dim, output_dim=1, hidden_size=(32,))
+
+        # Optional explicit edge-type embedding — adds a learned [N, N, edge_dim]
+        # bias to initial edge features, keyed by basketball relationship type
+        # (same-team, opponent, player↔ball, agent↔hoop, self).
+        if edge_type_matrix is not None and num_edge_types > 0:
+            self.register_buffer('edge_type_matrix', edge_type_matrix)  # [N, N]
+            self.edge_type_emb = nn.Embedding(num_edge_types, edge_dim)
+            print(f'[INFO] RT: edge-type embedding enabled '
+                  f'({num_edge_types} types, dim={edge_dim})')
+        else:
+            self.edge_type_matrix = None
+            self.edge_type_emb = None
 
     def init_adj(self, num_nodes, batch):
         off_diag = np.ones([num_nodes, num_nodes])
@@ -131,9 +145,13 @@ class RT(nn.Module):
             edges = torch.matmul(H_weight, x)
             
         edges = edges.reshape(B, N, N, -1)
-            
+
+        if self.edge_type_emb is not None:
+            type_bias = self.edge_type_emb(self.edge_type_matrix)   # [N, N, edge_dim]
+            edges = edges + type_bias.unsqueeze(0)                   # broadcast over B
+
         return edges
-        
+
     def forward(self, node_features, edge_features_, return_edge=False):
         batch = node_features.shape[0]
         num_nodes = node_features.shape[1]

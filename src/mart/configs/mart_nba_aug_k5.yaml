@@ -1,0 +1,27 @@
+# Same as mart_nba_aug.yaml but with sample_k: 5 for K-sweep ablation.
+num_layers: 6
+num_heads: 8
+model_dim: 128
+hidden_dim: 256
+decoder_hidden_dim: 256
+dropout: 0.1
+sample_k: 5
+aggregation: 'avg'
+function_type: 2
+hyper_scales: [1, 'adaptive']
+
+past_length: 8
+future_length: 12
+inputs: ['pos_x', 'pos_y', 'vel_x', 'vel_y']
+pred_rel: False
+
+use_entity_embed: true
+embed_dim: 4
+
+num_epochs: 5000
+lr: 0.0005
+clip_grad: null
+batch_size: 64
+scheduler_type: CosineAnnealingLR
+milestones: [100, 200]
+decay_gamma: 0.5
