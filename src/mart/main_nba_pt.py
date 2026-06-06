@@ -153,6 +153,10 @@ def parse_args():
     p.add_argument('--curriculum_switch', type=int, default=None,
                    help='Epoch at which to switch from --loss to mean_mse. '
                         'Defaults to half of num_epochs if not set.')
+    p.add_argument('--curriculum_lr_reset', action='store_true',
+                   help='At the curriculum switch epoch, rebuild the LR scheduler '
+                        'with T_max = remaining epochs so each phase gets its own '
+                        'full cosine decay instead of sharing one stretched curve.')
     p.add_argument('--soft_wta_temp', type=float, default=0.5,
                    help='Temperature for soft-WTA loss (--loss soft_wta). '
                         'Lower = closer to min-of-K; higher = closer to mean-of-K.')
@@ -561,6 +565,7 @@ def main():
     opts.cfi = args.cfi
     opts.curriculum = args.curriculum
     opts.curriculum_switch = args.curriculum_switch   # resolved to int in main()
+    opts.curriculum_lr_reset = args.curriculum_lr_reset
     opts.soft_wta_temp = args.soft_wta_temp
     opts.laplace_nll = args.laplace_nll
     if args.laplace_nll:
@@ -597,6 +602,9 @@ def main():
     if opts.curriculum:
         print(f'[INFO] curriculum: {opts.loss} for epochs 0–{opts.curriculum_switch-1}, '
               f'then mean_mse for epochs {opts.curriculum_switch}–{opts.num_epochs-1}')
+        if opts.curriculum_lr_reset:
+            print(f'[INFO] curriculum_lr_reset: scheduler rebuilt at epoch '
+                  f'{opts.curriculum_switch} with T_max={opts.num_epochs - opts.curriculum_switch}')
 
     print(f'[INFO] training loss: {opts.loss}')
     print(f'[INFO] use_hoops: {opts.use_hoops}')
@@ -774,6 +782,22 @@ def main():
                 model, val_loader, opts, device, split_name='val',
                 mu=mu, sigma=sigma,
             )
+
+            # Curriculum LR reset: at the switch epoch, rebuild the cosine scheduler
+            # so Phase 2 gets its own full decay over the remaining epochs rather
+            # than inheriting the tail of a stretched Phase-1 curve.
+            if (opts.get('curriculum_lr_reset', False)
+                    and opts.get('curriculum', False)
+                    and epoch == opts.get('curriculum_switch', -1)
+                    and opts.get('scheduler_type') == 'CosineAnnealingLR'):
+                remaining = opts.num_epochs - epoch
+                for pg in optimizer.param_groups:
+                    pg['lr'] = opts.lr
+                scheduler = lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=remaining, eta_min=opts.lr * 0.02,
+                )
+                print(f'[LR-RESET] epoch {epoch}: rebuilt CosineAnnealingLR '
+                      f'T_max={remaining}, lr reset to {opts.lr:.2e}')
 
             lr_before = optimizer.param_groups[0]['lr']
             if scheduler is not None:
