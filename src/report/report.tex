@@ -7,6 +7,8 @@
 
 \usepackage{hyperref}
 \usepackage{url}
+\usepackage{graphicx}
+\usepackage{booktabs}
 
 
 \title{Graph-Based Methods for Multi-Agent\\ NBA Trajectory Forecasting}
@@ -58,9 +60,15 @@ EPFL, Spring 2025/2026 \\
 % - Task: given C=8 frames predict H=12 for all N=11 entities (10 players+ball);
 %   20-step windows sampled from longer sequences.
 % - Data: L x N x D tensors, features [x, y, isplayer, team]; ~6K plays.
-% - Metric: ADE = single-shot mean MSE over horizon (Eq. 1), positions only.
 % - Protocol: local train/val fold (497 seqs) is the labelled proxy (test is
 %   unlabelled); Kaggle as external reference. Metric hygiene (see 4.1).
+% The metric (positions only, single-shot) is:
+\begin{equation}
+\label{eq:ade}
+\mathrm{ADE} = \frac{1}{H\times N}\sum_{t=C+1}^{C+H}\sum_{n}
+\big\lVert \hat{z}^n_t - z^n_t \big\rVert_2^2,
+\qquad \hat{z}^n_t, z^n_t \in \mathbb{R}^2 .
+\end{equation}
 
 \section{Method}
 \label{sec:method}
@@ -94,35 +102,210 @@ EPFL, Spring 2025/2026 \\
 \section{Results}
 \label{sec:results}
 
+All numbers are \texttt{val/mse\_ft}: the single-shot mean squared error in
+feet$^2$ over the $H{=}12$ horizon, evaluated on the 11 real entities of the
+held-out validation fold (497 sequences), matching the Kaggle ADE definition
+(Eq.~\ref{eq:ade}). We report Kaggle scores where a submission was made.
+
 \subsection{Setup \& metric hygiene}
 \label{sec:hygiene}
-% Two measurement artifacts, each worth 0.2-0.5: (i) noisy single-window val ->
-% deterministic multi-window sampler; (ii) hoop nodes deflate the metric (13 vs
-% 11 entities) -> landmark-aware metric. After fixes, val tracks Kaggle.
+Before comparing models we fixed two measurement artifacts, each of which moved
+the apparent error by $0.2$--$0.5$~ft$^2$. \textbf{(i)~Window noise:} drawing one
+random window per sequence per epoch made \texttt{val/mse\_ft} bounce between
+$3.2$ and $3.9$ across epochs, so checkpoint-on-minimum selected lucky draws; a
+deterministic sampler with 8 evenly-spaced windows per sequence gives a stable
+selection signal. \textbf{(ii)~Landmark deflation:} when the static hoop nodes
+(Sec.~\ref{sec:eqmotion}) are added, naively averaging over all 13 nodes includes
+two near-zero-error stationary hoops and deflates the metric
+($2.82\times13/11=3.33$); a landmark-aware metric strips them so it matches the
+11-entity Kaggle score. After both fixes the validation metric tracks Kaggle
+closely (e.g.\ $3.33$ val vs $3.2$ Kaggle), and the validation$\rightarrow$Kaggle
+gap is consistently favorable ($\sim{+}0.08$, val is slightly pessimistic), so we
+treat the local fold as a trustworthy selector.
+
+% FIGURE 1 -- export from wandb: overlay val/mse_ft vs epoch for the noisy
+% single-window run vs the deterministic --full-val run (two lines). Shows the
+% selection signal stabilizing. Optional; cut first if space is tight.
 
 \subsection{Main comparison}
 \label{sec:main-results}
-% One table (breadth + winners). Numbers: baseline ~3.7; STGCNN ~3.8;
-% CVAE/SocialVAE 4.3/5.0; MART-300ep 3.79; EqMotion single 3.33 (Kaggle 3.2) /
-% ensemble 3.25; aug-MART 5k 3.11 (Kaggle 3.01); +D2 TTA 3.08;
-% PRODUCTION blend 3.07 / Kaggle 2.98.
+Table~\ref{tab:main} collects the families we explored. Two patterns stand out.
+First, every graph model that predicts a single trajectory beats the non-graph
+temporal baseline, while the multimodal generative models (STGCNN-CVAE,
+SocialVAE) \emph{lose}: they optimise best-of-$K$ (minADE), whereas the leaderboard
+scores a single-shot mean, which rewards predicting the conditional mean.
+Second, our two strongest models come from opposite ends of the equivariance
+spectrum (Sec.~\ref{sec:tradeoff}): the exactly-O(2)-equivariant EqMotion and the
+non-equivariant augmented MART. The augmented MART backbone alone
+($3.11$~val\,/\,$3.01$~Kaggle) already beats the 5-seed EqMotion ensemble, and a
+$0.70$\,/\,$0.30$ blend of the two is our production submission at
+\textbf{$2.98$~Kaggle}.
+
+\begin{table}[t]
+\caption{Main comparison across model families. Lower is better; \texttt{val}
+is feet$^2$ on the held-out fold, \texttt{Kaggle} is the public leaderboard.
+The production blend combines the two best models (Sec.~\ref{sec:tradeoff}).}
+\label{tab:main}
+\begin{center}
+\begin{tabular}{llcc}
+\toprule
+\textbf{Family} & \textbf{Model} & \textbf{val} & \textbf{Kaggle} \\
+\midrule
+Non-graph        & Temporal baseline                 & $\sim$3.7 & -- \\
+Fixed graph      & STGCNN (pos.\ graph + autoreg.)   & $\sim$3.8 & -- \\
+Multimodal       & STGCNN-CVAE                       & 4.3       & -- \\
+Multimodal       & SocialVAE                         & 5.0       & -- \\
+Hypergraph       & MART (300 ep, fair baseline)      & 3.79      & -- \\
+Equivariant      & EqMotion, single (iso + hoops)    & 3.33      & 3.2 \\
+Equivariant      & EqMotion, 5-seed ensemble         & 3.25      & -- \\
+Hypergraph       & aug-MART (iso + O(2) + hoops, 7.5M, 5k ep) & 3.11 & 3.01 \\
+Hypergraph       & \quad + D2 test-time augmentation & 3.08      & -- \\
+\midrule
+\textbf{Blend}   & \textbf{0.70 aug-MART + 0.30 EqMotion} & \textbf{3.07} & \textbf{2.98} \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
 
 \subsection{Ablations on the winners}
 \label{sec:ablations}
-% Focused on EqMotion/aug-MART: isotropic vs aniso norm; hoop nodes (and "more
-% landmarks all hurt"); O(2) augmentation; epochs/capacity (bigger overfits or
-% mis-aligns min_ade); D2 TTA; ensembling/blend.
+\textbf{What the symmetry buys (EqMotion).} Starting from an anisotropically
+normalized baseline ($3.69$), isotropic normalization, which restores exact O(2)
+equivariance, drops the error to $3.46$, and adding the two court-frame hoop
+nodes drops it further to $3.33$ -- the single biggest structural lever
+(Table~\ref{tab:abl}, left). Hoops are the \emph{right amount} of court
+structure: adding free-throw lines, three-point apexes or corners all hurt
+monotonically (e.g.\ $3.33\rightarrow3.36\rightarrow3.42$), because those points
+sit on the basket axis already encoded by the hoops and merely dilute message
+passing. Reflection test-time augmentation is an \emph{exact no-op} on EqMotion
+(predictions identical to 4 decimals), an empirical proof of its O(2)
+equivariance -- and the reason it cannot exploit augmentation to grow.
 
-\subsection{The ball is the bottleneck (critical analysis)}
+\textbf{What augmentation unlocks (MART).} A non-equivariant MART trained with the
+same court inductive structure supplied as \emph{augmentation} (continuous O(2)
+rotation + mirrors about court center) instead of hard equivariance can do what
+EqMotion cannot: scale. Table~\ref{tab:abl} (right) shows error falling
+monotonically as the schedule lengthens ($3.79\rightarrow3.55\rightarrow
+3.47\rightarrow3.11$) with a 7.5M-parameter model that shows \emph{zero}
+overfitting (train$\,\approx\,$val$\,\approx\,0.026$). Two diagnostics confirm
+$3.11$ is a genuine model/data floor rather than a tuning artifact: budget-matched
+SGDR warm restarts tie it ($3.116$), and a 10k-epoch single-cosine run does not
+beat it. The remaining free gains come from variance reduction orthogonal to the
+backbone: D2 test-time augmentation ($-0.03$, and its non-zero per-transform
+spread \emph{measures} aug-MART's departure from exact equivariance) and the
+EqMotion blend ($-0.04$).
+
+\begin{table}[t]
+\caption{Ablations on the two winning models. \textbf{Left:} EqMotion structural
+levers (honest 11-entity metric). \textbf{Right:} augmented MART scaling --
+augmentation is what lets the larger model and longer schedule pay off.}
+\label{tab:abl}
+\begin{center}
+\begin{tabular}{lc@{\hspace{2.5em}}lc}
+\toprule
+\multicolumn{2}{c}{\textbf{EqMotion levers}} & \multicolumn{2}{c}{\textbf{aug-MART scaling}}\\
+\cmidrule(r){1-2}\cmidrule(l){3-4}
+Variant & val & Variant & val \\
+\midrule
+aniso + cosine            & 3.69 & MART 300 ep (aniso, no aug)   & 3.79 \\
+\;+ isotropic norm        & 3.46 & aug iso, no hoops, 1k ep      & 3.55 \\
+\;+ hoop nodes            & 3.33 & aug iso + hoops, 1k ep        & 3.47 \\
+\;+ 5-seed ensemble       & 3.25 & aug iso + hoops, 5k ep        & \textbf{3.11} \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+\begin{figure}[t]
+\begin{center}
+\includegraphics[width=0.62\linewidth]{fig2.png}
+\end{center}
+\caption{Loss choice, controlled. Two 7.5M MART models under the identical
+iso\,+\,O(2)\,+\,hoops 5000-epoch recipe, differing \emph{only} in the training
+loss. The min\_ade head-averaged model (orange) converges to $3.12$; direct
+\texttt{mean\_mse} regression on the single-shot target (green) reaches its best
+$\sim$$3.2$ early and then \emph{overfits}, ending at $3.58$. Optimising the
+leaderboard metric directly is worse -- the diverse-head averaging acts as a
+regularizer on the conditional mean (Sec.~\ref{sec:ball}).}
+\label{fig:loss}
+\end{figure}
+% TODO neaten: clamp y-axis to ~[2.8, 6] so the green dip-and-rise (overfit) is
+% visible; both curves are currently squished by the 0-15 range.
+
+\subsection{The ball is the bottleneck}
 \label{sec:ball}
-% CROWN JEWEL -- the 25% interpretation marks live here. Error decomposes into
-% players ~2.07 (floor) + ball ~13.5 (6.4x harder, ~the whole 3.1->2.6 gap).
-% The ball floor is 7-WAY confirmed: capacity, aggregation, head-selection (x2
-% models), possession, physics, residual, cross-arch (rho=0.93), and direct
-% mean_mse regression (overfits to 3.20). HONEST verdict: even point-estimate
-% generative models submit the conditional mean, so the generative lever is
-% CLOSED too. The 3.1->2.6 gap is irreducible ball multimodality undetermined by
-% an 8-frame past -- NOT an architecture/optimization artifact.
+Decomposing the error by entity reveals where the residual lives: for the
+production blend the 10 players sit at $2.05$~ft$^2$ while the ball is at
+$13.3$~ft$^2$ -- $6.5\times$ harder and, given the $10{:}1$ entity ratio,
+essentially the \emph{entire} gap between our $3.1$ and the $2.6$ leaderboard top
+(a $2.6$ total implies a ball near $7.9$ with players fixed; Table~\ref{tab:ball}).
+
+We then asked whether this ball error is reducible, and found that it is a
+\emph{task floor}, not an artifact of our models. Across two architectures with
+opposite inductive biases (EqMotion ${\leftrightarrow}$ aug-MART error
+correlation $\rho\!\approx\!0.94$, Fig.~\ref{fig:corr}) and seven independent
+intervention strategies
+-- added capacity, six aggregation/selection rules over MART's $K{=}20$ heads, a
+learned per-agent head selector (re-run on the \emph{best} model, still only
+$-5\%$), possession-anchoring (the ground-truth-handler oracle is $2\times$
+\emph{worse} than the model), constant-velocity physics ($61.6$, the ball is
+strongly non-ballistic), residual boosting, and direct \texttt{mean\_mse}
+regression -- the ball MSE never leaves the $13$--$14$~ft$^2$ band. The
+\texttt{mean\_mse} run is decisive (Fig.~\ref{fig:loss}): optimising the
+single-shot target directly \emph{overfits} (best $3.20$ then climbing to $3.58$)
+and loses to $3.11$, so the head-averaged conditional mean is already the
+best-regularized estimator.
+This also closes the generative lever: any point-estimate generative model
+(MDN, flow-matching, diffusion) must submit the conditional mean under a
+single-shot mean-MSE metric, and that target cannot beat $3.11$. The published
+MoFlow/SocialVAE NBA wins are all on minADE (best-of-$K$), which our metric
+structurally cannot exploit. The residual error is thus irreducible ball
+multimodality -- which player receives the pass, and when -- that an 8-frame past
+simply does not determine (Fig.~\ref{fig:play}); an oracle that picks the best of
+MART's $K$ heads per sample reaches $0.45$~ft$^2$, but the winning mode sits in the
+low-density tail and is unselectable from the context.
+
+\begin{table}[t]
+\caption{Per-entity error (feet$^2$). The ball dominates and is invariant to
+model improvements; players are already at their floor.}
+\label{tab:ball}
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Model & total & ball & players \\
+\midrule
+EqMotion 5-seed ensemble          & 3.29 & 14.04 & 2.22 \\
+aug-MART 5k (mean-of-$K$)          & 3.11 & 13.50 & 2.07 \\
+\textbf{Production blend}          & \textbf{3.07} & \textbf{13.30} & \textbf{2.05} \\
+\midrule
+\emph{MART oracle min-of-$K$ (unattainable)} & \emph{0.64} & \emph{3.10} & \emph{0.39} \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+\begin{figure}[t]
+\begin{center}
+\includegraphics[width=0.40\linewidth]{fig3.png}
+\end{center}
+\caption{Per-play ball error, EqMotion ensemble vs.\ augmented MART, one point per
+validation window. Two architectures with opposite inductive biases make the
+\emph{same} errors on the \emph{same} plays ($\rho=0.94$); the residual ball error
+is a property of the data, not of either model.}
+\label{fig:corr}
+\end{figure}
+
+\begin{figure}[t]
+\begin{center}
+\includegraphics[width=0.92\linewidth]{fig4.png}
+\end{center}
+\caption{One play. Players (faded) follow near-deterministic paths the model
+recovers tightly, but the ball's $K{=}20$ predicted modes (orange) fan out toward
+distinct plausible pass targets, only one of which is realized (black dashed).
+The mean of these modes is far from every one of them -- the source of the
+irreducible ball error.}
+\label{fig:play}
+\end{figure}
 
 \section{Conclusion}
 \label{sec:conclusion}
