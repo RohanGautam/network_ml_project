@@ -15,7 +15,7 @@
 EE-452: Network Machine Learning\\
 EPFL, Spring 2025/2026 \\
 \texttt{\{firstname.lastname\}@epfl.ch}
-}
+} 
 
 % The \author macro works with any number of authors. There are two commands
 % used to separate the names and addresses of multiple authors: \And and \AND.
@@ -35,9 +35,11 @@ EPFL, Spring 2025/2026 \\
 \maketitle
 
 \begin{abstract}
-% 1 paragraph: task (NBA C=8 -> H=12, ADE), the question (graph vs non-graph),
-% our families of models (baselines, fixed/hyper/dynamic/equivariant graphs),
-% headline result (best model + Kaggle), and the key insight (ball is the floor).
+% 1 paragraph: task (NBA C=8 -> H=12, single-shot mean-MSE / ADE); we sweep the
+% graph taxonomy but the paper centers on TWO winners -- EqMotion (exactly
+% O(2)-equivariant) and augmented MART (soft O(2) invariance via augmentation);
+% headline = 0.70 aug-MART + 0.30 EqMotion blend, Kaggle 2.98; central insight =
+% the residual error is an irreducible ball-multimodality FLOOR (7-way confirmed).
 \end{abstract}
 
 \section{Introduction}
@@ -46,76 +48,88 @@ EPFL, Spring 2025/2026 \\
 % - Why it's hard: stochastic futures, agent interactions, heterogeneity
 %   (players vs ball, two teams), variable-length sequences.
 % - Why graphs: entities as nodes, interactions as edges, message passing.
-% - Our contribution / objective: systematic comparison of graph vs non-graph
-%   approaches across four graph paradigms + ablations, and what we learned
-%   (e.g. the ball is the performance bottleneck).
+% - Contributions (3): (i) two strong graph models + the hard-vs-soft
+%   equivariance trade-off between them; (ii) court-frame (hoop) features +
+%   normalization/metric-hygiene ablations; (iii) a critical 7-way analysis that
+%   the error is a task floor dominated by the ball.
 
 \section{Problem Setup \& Data}
 \label{sec:setup}
-% - Task definition: given context C=8 frames predict horizon H=12 for all
-%   N entities; window of 20 steps sampled from longer sequences.
-% - Data format: L x N x D tensors, features [x, y, isplayer, team]; ~6K plays.
-% - Metric: ADE = mean MSE over horizon (Eq. 1), positions only.
-% - Splits & evaluation protocol: local train/val split, min-ADE for model
-%   selection, Kaggle leaderboard as external reference.
-% - Preprocessing: isotropic normalization, windowing, optional hoop/landmark
-%   nodes.
+% - Task: given C=8 frames predict H=12 for all N=11 entities (10 players+ball);
+%   20-step windows sampled from longer sequences.
+% - Data: L x N x D tensors, features [x, y, isplayer, team]; ~6K plays.
+% - Metric: ADE = single-shot mean MSE over horizon (Eq. 1), positions only.
+% - Protocol: local train/val fold (497 seqs) is the labelled proxy (test is
+%   unlabelled); Kaggle as external reference. Metric hygiene (see 4.1).
 
 \section{Method}
 \label{sec:method}
 
-\subsection{Non-graph baselines}
-\label{sec:baselines}
-% GRU and Transformer temporal baselines (no graph prior). Reference point for
-% "does the graph help?".
+\subsection{Survey of graph paradigms (breadth)}
+\label{sec:survey}
+% COMPRESS to ~1 sentence each -- these are the breadth-table rows, not depth:
+% temporal baseline (no graph); fixed-structure STGCNN; hypergraph GroupNet;
+% dynamic/learned dNRI; multimodal STGCNN-CVAE / SocialVAE (and why single-shot
+% mean-MSE penalizes best-of-K models). Establishes we covered the taxonomy.
 
-\subsection{Fixed-structure graphs}
-\label{sec:fixed-graph}
-% Social-STGCNN and our modified STGCNN (velocity/acceleration features, edge
-% weights, autoregressive decoder). NLL vs MSE loss.
+\subsection{Equivariance: EqMotion}
+\label{sec:eqmotion}
+% Exactly O(2)-equivariant backbone. Our levers: isotropic normalization
+% (prerequisite -- aniso norm silently breaks equivariance) + court-frame hoop
+% nodes (re-inject the D2 frame as features). Key limitation: symmetry is free
+% but augmentation is a no-op (reflection-TTA exact) -> it CANNOT scale capacity.
 
-\subsection{Hypergraph models}
-\label{sec:hypergraph}
-% GroupNet (multiscale hypergraph, relational reasoning) and MART (transformer
-% over multiscale relations). Heterogeneous hypergraph / CFI for heterogeneous
-% agents.
+\subsection{Augmented MART}
+\label{sec:augmart}
+% Non-equivariant relational transformer. Soft O(2) INVARIANCE via continuous
+% O(2)+mirror augmentation -> regularizes a 7.5M model over 5000 epochs with
+% ZERO overfit (train~=val). Hoops transfer here too. The lever EqMotion can't use.
 
-\subsection{Dynamic and learned-structure graphs}
-\label{sec:dynamic-graph}
-% Neural Relational Inference (NRI/dNRI): latent, time-varying graph structure.
-
-\subsection{Equivariance}
-\label{sec:equivariant}
-% EqMotion: O(2)-equivariant trajectory prediction; combined with best models.
+\subsection{The equivariance trade-off \& production blend}
+\label{sec:tradeoff}
+% Headline framing: an over-strong O(2) prior + explicit D2 court features beats
+% BOTH plain equivariance AND learned-via-augmentation. Hard (free, can't scale)
+% vs soft (paid, scales). Production = 0.70 aug-MART + 0.30 EqMotion blend.
 
 \section{Results}
 \label{sec:results}
 
+\subsection{Setup \& metric hygiene}
+\label{sec:hygiene}
+% Two measurement artifacts, each worth 0.2-0.5: (i) noisy single-window val ->
+% deterministic multi-window sampler; (ii) hoop nodes deflate the metric (13 vs
+% 11 entities) -> landmark-aware metric. After fixes, val tracks Kaggle.
+
 \subsection{Main comparison}
 \label{sec:main-results}
-% Table: all model families, local ADE (val) and Kaggle score. Headline:
-% best single model and best ensemble/blend.
+% One table (breadth + winners). Numbers: baseline ~3.7; STGCNN ~3.8;
+% CVAE/SocialVAE 4.3/5.0; MART-300ep 3.79; EqMotion single 3.33 (Kaggle 3.2) /
+% ensemble 3.25; aug-MART 5k 3.11 (Kaggle 3.01); +D2 TTA 3.08;
+% PRODUCTION blend 3.07 / Kaggle 2.98.
 
-\subsection{Ablations}
+\subsection{Ablations on the winners}
 \label{sec:ablations}
-% - Graph construction & k (GroupNet).
-% - Loss functions: MSE vs min-ADE vs curriculum.
-% - Augmentation (O(2) flips), normalization (isotropic vs anisotropic).
-% - Hoop / landmark nodes.
-% - Capacity, training length, LR schedules.
-% - Inference tricks: TTA, court clamping, ensembling, trajectory selection.
+% Focused on EqMotion/aug-MART: isotropic vs aniso norm; hoop nodes (and "more
+% landmarks all hurt"); O(2) augmentation; epochs/capacity (bigger overfits or
+% mis-aligns min_ade); D2 TTA; ensembling/blend.
 
-\subsection{The ball is the bottleneck}
+\subsection{The ball is the bottleneck (critical analysis)}
 \label{sec:ball}
-% Key analysis: error decomposition shows the ball dominates ADE (players ~2,
-% ball ~13). Single-prediction levers saturate; argue a generative
-% (flow/diffusion) model is needed to go further.
+% CROWN JEWEL -- the 25% interpretation marks live here. Error decomposes into
+% players ~2.07 (floor) + ball ~13.5 (6.4x harder, ~the whole 3.1->2.6 gap).
+% The ball floor is 7-WAY confirmed: capacity, aggregation, head-selection (x2
+% models), possession, physics, residual, cross-arch (rho=0.93), and direct
+% mean_mse regression (overfits to 3.20). HONEST verdict: even point-estimate
+% generative models submit the conditional mean, so the generative lever is
+% CLOSED too. The 3.1->2.6 gap is irreducible ball multimodality undetermined by
+% an 8-frame past -- NOT an architecture/optimization artifact.
 
 \section{Conclusion}
 \label{sec:conclusion}
-% Summary of what graphs buy us vs baselines, the best approach, and the main
-% insight (ball-dominated error). Limitations and future work (generative ball
-% model).
+% What graphs buy vs baselines; the hard-vs-soft equivariance trade-off; the
+% blend (Kaggle 2.98); and the central insight -- a ball-dominated task floor.
+% Limitations/future: out-of-regime info or a multi-submission mechanism (not
+% available here) would be needed to pass the floor.
 
 \appendix
 \section{Appendix}
