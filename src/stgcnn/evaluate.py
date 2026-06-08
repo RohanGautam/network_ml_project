@@ -88,7 +88,7 @@ def evaluate(model_path: str, tta: bool = False, clamp: bool = False):
                         X_flip[:, ax + 4] = -X_flip[:, ax + 4]
                 
                 # Predict
-                mu_x, mu_y = model(X_flip, A)
+                mu_x, mu_y, _, _, _ = model(X_flip, A)
                 pred = torch.stack([mu_x, mu_y], dim=-1) # [B, 12, 11, 2]
                 
                 # Denormalize
