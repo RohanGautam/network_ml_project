@@ -58,7 +58,7 @@ from model.GroupNet_nba_id import GroupNetWithID
 from submit_nba_pt import inference_chunked
 
 
-# ----------------------------- CLI -----------------------------
+# CLI 
 
 def parse_cli():
     p = argparse.ArgumentParser()
@@ -92,7 +92,7 @@ def parse_cli():
     return p.parse_args()
 
 
-# ------------------------ Config plumbing ----------------------
+# Config plumbing 
 
 def base_fixed_cfg(base):
     """Return a SimpleNamespace with all the cfg fields the model needs."""
@@ -131,7 +131,7 @@ def suggest_search_params(trial):
     }
 
 
-# ------------------------ Data + eval --------------------------
+# Data + eval 
 
 def build_loaders(cfg, mu, sigma):
     train_files, val_files = load_split_files(cfg.split_path)
@@ -180,7 +180,7 @@ def compute_val_ade(model, val_loader, mu, sigma, future_length,
     return err_sum / max(n_total, 1)
 
 
-# ------------------------ Train loop --------------------------
+# Train loop 
 
 def train_run(cfg, mu, sigma, train_loader, val_loader, train_sampler, device,
               *, save_checkpoints=False, save_dir=None, trial=None,
@@ -205,7 +205,7 @@ def train_run(cfg, mu, sigma, train_loader, val_loader, train_sampler, device,
 
     best_val_ade = float('inf')
     for epoch in range(cfg.num_epochs):
-        # ---- train ----
+        #  train 
         train_sampler.set_epoch(epoch)
         model.train()
         train_loss_sum = 0.0
@@ -222,7 +222,7 @@ def train_run(cfg, mu, sigma, train_loader, val_loader, train_sampler, device,
 
         train_total = train_loss_sum / max(n_batches, 1)
 
-        # ---- val ----
+        #  val 
         val_ade = compute_val_ade(model, val_loader, mu, sigma,
                                   cfg.future_length, cfg.K_eval,
                                   cfg.sample_k_chunk)
@@ -238,13 +238,13 @@ def train_run(cfg, mu, sigma, train_loader, val_loader, train_sampler, device,
             'epoch': epoch,
         })
 
-        # ---- pruning ----
+        #  pruning 
         if trial is not None:
             trial.report(val_ade, epoch)
             if trial.should_prune():
                 raise optuna.TrialPruned()
 
-        # ---- checkpoint ----
+        #  checkpoint 
         if save_checkpoints:
             is_save_epoch = (epoch + 1) % cfg.model_save_epoch == 0
             is_final = (epoch + 1) == cfg.num_epochs
@@ -271,7 +271,7 @@ def train_run(cfg, mu, sigma, train_loader, val_loader, train_sampler, device,
     return best_val_ade
 
 
-# ------------------------ Optuna entry ------------------------
+#  Optuna entry 
 
 def main():
     base = parse_cli()
@@ -285,7 +285,7 @@ def main():
     mu, sigma = compute_xy_stats(train_files)
     print(f'mu={mu.tolist()} sigma={sigma.tolist()}')
 
-    # ---- Optuna search ----
+    # Optuna search 
     def objective(trial):
         cfg = base_fixed_cfg(base)
         cfg = apply_search_params(cfg, suggest_search_params(trial))
@@ -323,7 +323,7 @@ def main():
     print(f'Best val ADE  : {study.best_value:.4f}')
     print(f'Best params   : {study.best_params}')
 
-    # ---- Final retrain ----
+    #  Final retrain 
     print(f'\n========== FINAL RETRAIN ({base.final_epochs} epochs) ==========')
     final_cfg = base_fixed_cfg(base)
     final_cfg = apply_search_params(final_cfg, study.best_params)

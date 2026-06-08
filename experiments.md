@@ -209,6 +209,70 @@ ids, no NaNs, coords in court range). Code: `--iso_norm --aug_rot_deg 180
 precision) + best-by-val checkpointing + `configs/mart_nba_aug.yaml` (7.5M-param
 config) + `jobs/train_mart_aug_5k.sh` (account=team-ai for >12h).
 
+### MART — further experiments on aug-MART
+
+Building on the best aug-MART (iso_norm + O(2) aug + hoops). All numbers are
+`val/mse_ft` on the 497-sequence val fold, mean-of-K prediction.
+
+**K-sweep — number of decoder heads**
+
+| Model | K | Epochs | val/mse_ft |
+|---|---|---|---|
+| mart_exp_700ep (base) | 20 | 700 | 3.49 |
+| *(manual)* | 5 | 700 | 3.23 |
+| *(manual)* | 10 | 700 | 3.33 |
+| *(manual)* | 40 | 700 | 6.31 |
+| mart_k5_5k | 5 | 5000 | 3.16 |
+| mart_k10_3k (curriculum) | 10 | 3000 | 3.14 |
+| mart_k3_5k *(manual)* | 3 | 5000 | 3.12 |
+
+At 700 epochs K=5 already beats K=20. K=40 completely failed — too many heads
+to coordinate in a short schedule. With longer training K=3 edges out K=5 and
+K=10; the diversity benefit of more heads is outweighed by the difficulty of
+training them jointly.
+
+**Loss variants — curriculum vs alternatives (K=20, 2k epochs)**
+
+| Model | Loss | val/mse_ft |
+|---|---|---|
+| mart_curriculum_2k | curriculum (min-ADE → mean-MSE, sw 1k) | 3.09 |
+| mart_soft_wta_2k | soft winner-takes-all (temp=0.5) | 3.32 |
+| mart_laplace_nll_2k | Laplace NLL | 3.38 |
+
+Curriculum is the clear winner. Soft-WTA converges to a similar basin as plain
+min-ADE. Laplace NLL penalises uncertainty rather than directly optimising the
+mean prediction, so it's misaligned with single-shot MSE scoring.
+
+**CFI module — transplanting the cross-modal future interaction decoder**
+
+| Model | K | CFI | Curriculum | Epochs | val/mse_ft |
+|---|---|---|---|---|---|
+| mart_cfi_700ep | 20 | yes | no | 700 | 3.33 |
+| mart_k10_cfi_5k | 10 | yes | no | 5000 | 3.14 |
+| mart_k10_curriculum_5k | 10 | no | yes | 5000 | 3.14 |
+| mart_k10_cfi_curriculum_5k* | 10 | yes | yes | 5000 | 3.11 |
+| mart_cfi_curriculum_5k | 20 | yes | yes | 5000 | 3.13 |
+
+CFI at 700 epochs gives no benefit. At 5k, combining K=10 + CFI + curriculum
+reaches 3.11 — the best CFI result — consistent with the K-sweep: K=10 is
+better than K=20 at this compute scale. The CFI and curriculum gains appear
+largely additive at K=10.
+
+*(\*) checkpoint `mart_k10_cfi_curriculum_5k_best.ckpt`, no dedicated job script.*
+
+**Curriculum tuning — developing the best single model**
+
+| Model | Switch epoch | Phase-2 LR | Epochs | val/mse_ft |
+|---|---|---|---|---|
+| mart_curriculum_2k | 1000 | 0.0005 | 2000 | 3.09 |
+| mart_curriculum_4k *(manual)* | 2000 | 0.0005 | 4000 | 3.11 |
+| **mart_curriculum_4k_sw1k_lrdrop** | **1000** | **0.00005** | **4000** | **2.98** |
+
+Switching at epoch 1000 (rather than 2000) gives phase 2 more time to directly
+optimise MSE. The 4× LR drop with a fresh cosine schedule at the switch is the
+decisive change — it prevents phase 2 from overshooting the mode structure built
+in phase 1. This is the best standalone MART model.
+
 ---
 
 ## 3. What changed in the pipeline (code)

@@ -148,7 +148,7 @@ def main():
 
     os.makedirs(args.model_save_dir, exist_ok=True)
 
-    # ---- Data ----
+    # Data
     train_files, val_files = load_split_files(args.split_path)
     print(f'split: {len(train_files)} train files, {len(val_files)} val files')
 
@@ -183,7 +183,7 @@ def main():
         pin_memory=torch.cuda.is_available(),
     )
 
-    # ---- Model ----
+    # Model
     model = GroupNetWithID(args, device, embed_dim=args.embed_dim)
     model.set_device(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
@@ -200,7 +200,7 @@ def main():
         if 'scheduler' in ckpt:
             scheduler.load_state_dict(ckpt['scheduler'])
 
-    # ---- Train ----
+    # Train
     # Mirrors network_ml_project's wandb pattern (ref_script.py: wandb.init + wandb.log).
     # Set WANDB_MODE=disabled (or =offline) at runtime to silence wandb without code changes.
     with wandb.init(
