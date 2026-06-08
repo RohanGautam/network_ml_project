@@ -1,0 +1,43 @@
+# MART config for the "augment + scale + train-long" experiment.
+#
+# Rationale (see experiments.md): EqMotion's winning recipe was isotropic norm +
+# rotation/reflection invariance + hoop nodes, but its HARD O(2) equivariance
+# caps capacity (geometric augmentation is a no-op, so it can't regularize a
+# bigger model). MART is NOT equivariant, so the same inductive structure can be
+# supplied via AUGMENTATION (--iso_norm --aug_rot_deg 180 --aug_court_mirror
+# [--use_hoops]) — which lets us scale width/depth + train long without
+# overfitting the ~4.5k sequences.
+#
+# Deltas vs configs/mart_nba_pt.yaml: bigger model, dropout > 0, 1000 epochs.
+
+# model params (scaled up vs the 64/128/4 baseline)
+num_layers: 6
+num_heads: 8
+model_dim: 128
+hidden_dim: 256
+decoder_hidden_dim: 256
+dropout: 0.1
+sample_k: 20
+aggregation: 'avg'
+function_type: 2
+hyper_scales: [1, 'adaptive']
+
+# input/output params
+past_length: 8
+future_length: 12
+inputs: ['pos_x', 'pos_y', 'vel_x', 'vel_y']
+pred_rel: False
+
+# Entity-type embedding (TeamA / TeamB / Ball [/ Hoop]).
+use_entity_embed: true
+embed_dim: 4
+
+# training params — long cosine schedule. Augmentation supplies the diversity
+# that a 1000-epoch run on 4.5k sequences would otherwise overfit.
+num_epochs: 5000
+lr: 0.0005
+clip_grad: null
+batch_size: 64
+scheduler_type: CosineAnnealingLR
+milestones: [100, 200]
+decay_gamma: 0.5

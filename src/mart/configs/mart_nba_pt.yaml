@@ -25,10 +25,14 @@ use_entity_embed: true
 embed_dim: 4
 
 # training params
-num_epochs: 100
+# Aligned with EqMotion's regime (300 epochs + cosine LR, eta_min = lr*0.02) so
+# val/mse_ft is judged under a shared budget/schedule across architectures.
+num_epochs: 300
 lr: 0.0005
 clip_grad: null
 batch_size: 64
-scheduler_type: MultiStepLR
+scheduler_type: CosineAnnealingLR
+# milestones / decay_gamma kept for back-compat with StepLR / MultiStepLR; unused
+# under CosineAnnealingLR.
 milestones: [100, 200]
 decay_gamma: 0.5

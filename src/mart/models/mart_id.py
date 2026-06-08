@@ -38,12 +38,13 @@ class MART_ID(MART):
         # unchanged so MART's recipe carries over verbatim.
         self.input_fc = nn.Linear(self.input_dim + self.embed_dim, args.model_dim)
 
-    def forward(self, x_abs, x_rel, agent_ids):
+    def forward(self, x_abs, x_rel, agent_ids, extra_feats=None, mu=None, sigma=None):
         """
         Args:
-            x_abs:     [B, N, T_p, 2]
-            x_rel:     [B, N, T_p, 2]
-            agent_ids: [B, N] long
+            x_abs:       [B, N, T_p, 2]
+            x_rel:       [B, N, T_p, 2]
+            agent_ids:   [B, N] long
+            extra_feats: [B, N, T_p, extra_dim] optional
         Returns:
             out: [B, N, K, T_f, 2]
         """
@@ -52,32 +53,49 @@ class MART_ID(MART):
 
         # ---- Build the standard MART input feature ----
         inputs = []
-        if 'pos_x' in self.args.inputs and 'pos_y' in self.args.inputs:
+        if "pos_x" in self.args.inputs and "pos_y" in self.args.inputs:
             inputs.append(x_abs)
-        if 'vel_x' in self.args.inputs and 'vel_y' in self.args.inputs:
+        if "vel_x" in self.args.inputs and "vel_y" in self.args.inputs:
             inputs.append(x_rel)
-        inputs = torch.cat(inputs, dim=-1)   # [B, N, T_p, input_dim]
+        inputs = torch.cat(inputs, dim=-1)  # [B, N, T_p, input_dim]
+
+        if extra_feats is not None:
+            inputs = torch.cat([inputs, extra_feats], dim=-1)
 
         # ---- Inject entity-type embedding (the only addition vs MART) ----
-        embed = self.entity_embedding(agent_ids)                          # [B, N, embed_dim]
-        embed = embed.unsqueeze(2).expand(
-            batch_size, num_agents, length, self.embed_dim,
-        ).to(inputs.dtype)                                                # [B, N, T_p, embed_dim]
-        inputs = torch.cat([inputs, embed], dim=-1)                       # [B, N, T_p, input_dim+embed_dim]
+        embed = self.entity_embedding(agent_ids)  # [B, N, embed_dim]
+        embed = (
+            embed.unsqueeze(2)
+            .expand(
+                batch_size,
+                num_agents,
+                length,
+                self.embed_dim,
+            )
+            .to(inputs.dtype)
+        )  # [B, N, T_p, embed_dim]
+        inputs = torch.cat([inputs, embed], dim=-1)  # [B, N, T_p, input_dim+embed_dim]
 
         inputs = inputs.view(batch_size * num_agents, length, -1).contiguous()
 
         # ---- Rest is byte-for-byte MART.forward ----
         inputs_fc = self.input_fc(inputs).view(
-            batch_size * num_agents, length, self.args.model_dim,
+            batch_size * num_agents,
+            length,
+            self.args.model_dim,
         )
         inputs_pos = self.pos_encoder(inputs_fc, num_a=batch_size * num_agents)
         inputs_pos = inputs_pos.view(
-            batch_size, num_agents, length, self.args.model_dim,
+            batch_size,
+            num_agents,
+            length,
+            self.args.model_dim,
         )
         n_initial = self.input_fc2(
             inputs_pos.contiguous().view(
-                batch_size, num_agents, length * self.args.model_dim,
+                batch_size,
+                num_agents,
+                length * self.args.model_dim,
             )
         )
 
@@ -86,9 +104,14 @@ class MART_ID(MART):
 
         for i in range(self.args.num_layers):
             n_pair, e_pair = self.pair_encoders[i](n_pair, e_pair, return_edge=True)
-            n_group, e_group, G = self.hyper_encoders[i](n_group, e_group, G, return_edge=True)
+            n_group, e_group, G = self.hyper_encoders[i](
+                n_group, e_group, G, return_edge=True
+            )
 
         n_final = torch.cat([n_initial, n_pair, n_group], dim=-1)
+
+        if self.cfi_decoder is not None:
+            return self.cfi_decoder(n_final, cur_pos, mu, sigma)
 
         out_list = []
         for i in range(self.args.sample_k):
@@ -97,6 +120,10 @@ class MART_ID(MART):
 
         out = torch.cat(out_list, dim=2)
         out = out.view(
-            batch_size, num_agents, self.args.sample_k, self.args.future_length, -1,
+            batch_size,
+            num_agents,
+            self.args.sample_k,
+            self.args.future_length,
+            -1,
         )
         return out
