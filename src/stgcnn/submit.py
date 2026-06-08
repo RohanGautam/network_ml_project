@@ -20,13 +20,27 @@ def generate_submission(model_path: str, test_dir: str, output_csv: str):
         device = torch.device("cpu")
     print(f"Using device: {device}")
     
-    # Load model
-    model = Social_STGCNN().to(device)
+    # Load checkpoint first to auto-detect architecture
     checkpoint = torch.load(model_path, map_location=device)
-    if "model_state_dict" in checkpoint:
-        model.load_state_dict(checkpoint["model_state_dict"])
-    else:
-        model.load_state_dict(checkpoint)
+    state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
+    
+    # Auto-detect parameters
+    in_channels = state_dict["st_gcnn1.tcn.weight"].shape[1]
+    hidden_dim = state_dict["st_gcnn1.tcn.weight"].shape[0]
+    use_edge_importance = "st_gcnn1.edge_importance" in state_dict
+    
+    print(f"Auto-detected model architecture:")
+    print(f"  in_channels: {in_channels}")
+    print(f"  hidden_dim: {hidden_dim}")
+    print(f"  use_edge_importance: {use_edge_importance}")
+    
+    # Load model
+    model = Social_STGCNN(
+        in_channels=in_channels,
+        hidden_dim=hidden_dim,
+        use_edge_importance=use_edge_importance
+    ).to(device)
+    model.load_state_dict(state_dict)
     model.eval()
     
     # Normalization statistics
@@ -51,14 +65,28 @@ def generate_submission(model_path: str, test_dir: str, output_csv: str):
                 
             # Normalize coordinates
             coords_norm = (coords - mu) / sigma
-            X = coords_norm.permute(2, 0, 1) # [2, 8, 11]
+            
+            if in_channels == 6:
+                # Calculate velocity: v_t = x_t - x_{t-1}
+                vel = torch.zeros_like(coords_norm)
+                vel[1:] = coords_norm[1:] - coords_norm[:-1]
+                
+                # Calculate acceleration: a_t = v_t - v_{t-1}
+                acc = torch.zeros_like(vel)
+                acc[1:] = vel[1:] - vel[:-1]
+                
+                # Concatenate pos, vel, acc along feature axis
+                feat = torch.cat([coords_norm, vel, acc], dim=-1) # [8, 11, 6]
+                X = feat.permute(2, 0, 1) # [6, 8, 11]
+            else:
+                X = coords_norm.permute(2, 0, 1) # [2, 8, 11]
             
             # Add batch dimension and send to device
-            X = X.unsqueeze(0).to(device) # [1, 2, 8, 11]
+            X = X.unsqueeze(0).to(device) # [1, C, 8, 11]
             A = A.unsqueeze(0).to(device) # [1, 8, 11, 11]
             
             # Predict
-            mu_x, mu_y, sig_x, sig_y, rho = model(X, A)
+            mu_x, mu_y, _, _, _ = model(X, A)
             pred = torch.stack([mu_x, mu_y], dim=-1).squeeze(0) # [12, 11, 2]
             
             # Denormalize
