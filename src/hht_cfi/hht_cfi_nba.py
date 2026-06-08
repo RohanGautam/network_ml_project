@@ -30,7 +30,6 @@ import lightning as L
 import pandas as pd
 import dotenv
 
-# ── Path setup ─────────────────────────────────────────────────────────────────
 _SRC  = Path(__file__).resolve().parents[1]          # .../src/
 _ROOT = Path(__file__).resolve().parents[2]          # .../network_ml_project/
 
@@ -48,7 +47,6 @@ SUB_DIR   = _ROOT / "submissions"
 SUB_DIR.mkdir(exist_ok=True)
 
 
-# ── HHT-CFI args ───────────────────────────────────────────────────────────────
 class _Args:
     hidden_size      = 64
     obs_length       = 8
@@ -66,7 +64,6 @@ class _Args:
             setattr(self, k, v)
 
 
-# ── Data pipeline ──────────────────────────────────────────────────────────────
 class NBADataset(Dataset):
     def __init__(self, files, context_size, horizon_size, mu, sigma):
         super().__init__()
@@ -189,7 +186,6 @@ class NBADataModule(L.LightningDataModule):
         print(f"Saved: {out}")
 
 
-# ── Edge cache & format conversion ─────────────────────────────────────────────
 _EDGE_CACHE: dict[int, Tensor] = {}
 
 
@@ -252,14 +248,13 @@ def _to_hht_inputs(X: Tensor, y: Tensor, mu: Tensor, sigma: Tensor):
     return inputs, edge_pair
 
 
-# ── Inference toggles ───────────────────────────────────────────────────────────
-# Mode selection — exactly ONE should be True (first True wins in priority order):
+# mode selection: only one should be True at a time
 _USE_MIN_SCALE      = True   # most confident mode (min total Laplace scale)
 _USE_SIGMA_WEIGHTED = False  # precision-weighted mean over all K modes
 _USE_PER_AGENT_TYPE = False   # velocity-continuity for players, equal-mean for ball
 _USE_NMS            = False  # NMS: centroid of densest endpoint cluster
 
-# Other toggles — independent, can stack freely:
+# stackable toggles
 _USE_TTA   = True   # 4-way test-time augmentation (orig + y-flip + x-flip + both)
 _USE_CLAMP = True    # clip predictions to NBA court bounds
 
@@ -268,7 +263,6 @@ _COURT_HALF_LEN = 47.5  # ft  (x-axis: baseline to baseline)
 _COURT_HALF_WID = 25.0  # ft  (y-axis: sideline to sideline)
 
 
-# ── Model wrapper ───────────────────────────────────────────────────────────────
 class NBAHHTCFIModel(nn.Module):
     """Wraps MyTraj for batched NBA sequences."""
 
@@ -316,7 +310,7 @@ class NBAHHTCFIModel(nn.Module):
         shift   = abs_obs[:, -1].reshape(BN, 2)
         max_v   = (abs_obs - abs_obs[:, -1:]).abs().amax(1).reshape(BN, 2).clamp(min=1.0)
 
-        # ── Mode selection (first True flag wins) ──────────────────────────────
+        # mode selection
         if _USE_SIGMA_WEIGHTED:
             # Precision-weighted mixture: modes with lower total scale get higher weight.
             weights  = (1.0 / out_sigma_all.sum(dim=(-1, -2)))**10     # [K, B*N]
@@ -432,7 +426,6 @@ class NBAHHTCFIModel(nn.Module):
         return denorm.permute(0, 2, 1, 3)
 
 
-# ── Lightning module ────────────────────────────────────────────────────────────
 class NBAHHTCFILightningModel(L.LightningModule):
     def __init__(
         self,
@@ -520,7 +513,6 @@ class NBAHHTCFILightningModel(L.LightningModule):
         return torch.cat([obs_out, pred_out], dim=0)               # [T_obs+T_pred, N, 4]
 
 
-# ── Entry point ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     from lightning.pytorch.callbacks import EarlyStopping
     from lightning.pytorch.loggers import WandbLogger

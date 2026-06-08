@@ -29,7 +29,6 @@ sys.path.insert(0, str(_SRC))
 
 from hht_cfi.hht_cfi_nba import NBADataModule, NBAHHTCFILightningModel  # noqa: E402
 
-# ── Tuning budget ───────────────────────────────────────────────────────────────
 DATA_FRACTION = 0.25   # fraction of training files per trial
 MAX_EPOCHS    = 25     # per trial; early stopping will cut most short
 PATIENCE      = 7      # early stopping patience on val/mse_ft
@@ -39,7 +38,6 @@ DB_PATH       = _ROOT / "optuna_hht_cfi.db"
 SPLIT_PATH    = str(_ROOT / "splits" / "fold0.json")
 
 
-# ── Pruning callback (no external integration package needed) ───────────────────
 class _PruneCallback(L.Callback):
     def __init__(self, trial: optuna.Trial, monitor: str = "val/mse_ft"):
         self.trial   = trial
@@ -54,9 +52,7 @@ class _PruneCallback(L.Callback):
             raise optuna.TrialPruned()
 
 
-# ── Objective ───────────────────────────────────────────────────────────────────
 def objective(trial: optuna.Trial) -> float:
-    # ── Sample hyperparameters ─────────────────────────────────────────────────
     hidden_size      = trial.suggest_categorical("hidden_size",      [32, 64, 128])
     x_encoder_layers = trial.suggest_int(        "x_encoder_layers", 2, 5)
     # n_heads must divide hidden_size; 4 and 8 both divide 32/64/128
@@ -65,7 +61,6 @@ def objective(trial: optuna.Trial) -> float:
     batch_size       = trial.suggest_categorical("batch_size",        [8, 16, 32])
     grad_clip        = trial.suggest_categorical("grad_clip",         [0.5, 1.0, 2.0])
 
-    # ── Data (subset of training files, full val) ──────────────────────────────
     dm = NBADataModule(
         split_path    = SPLIT_PATH,
         batch_size    = batch_size,
@@ -73,7 +68,6 @@ def objective(trial: optuna.Trial) -> float:
         seed          = trial.number,   # different random subset per trial
     )
 
-    # ── Model ──────────────────────────────────────────────────────────────────
     L.seed_everything(0)
     model = NBAHHTCFILightningModel(
         hidden_size      = hidden_size,
@@ -82,7 +76,6 @@ def objective(trial: optuna.Trial) -> float:
         lr               = lr,
     )
 
-    # ── Trainer ────────────────────────────────────────────────────────────────
     wandb_logger = WandbLogger(
         project  = "NML_base",
         name     = f"optuna_trial_{trial.number:03d}",
@@ -121,7 +114,6 @@ def objective(trial: optuna.Trial) -> float:
     return val_mse.item()
 
 
-# ── Entry point ─────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--report", action="store_true",
@@ -158,14 +150,12 @@ def main():
 
 
 def _print_report(study: optuna.Study):
-    print(f"\n{'='*60}")
-    print(f"OPTUNA RESULTS — {study.study_name}")
+    print(f"\nOPTUNA RESULTS - {study.study_name}")
     print(f"Completed trials: {len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])}")
     print(f"Pruned trials   : {len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])}")
-    print(f"{'='*60}")
 
     best = study.best_trial
-    print(f"\nBest trial #{best.number}  →  val/mse_ft = {best.value:.4f} ft²")
+    print(f"\nBest trial #{best.number}  val/mse_ft = {best.value:.4f} ft²")
     print("Best hyperparameters:")
     for k, v in best.params.items():
         print(f"  {k:25s} = {v}")
@@ -175,7 +165,7 @@ def _print_report(study: optuna.Study):
         [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE],
         key=lambda t: t.value,
     )
-    print(f"  {'#':>4}  {'val/mse_ft':>12}  params")
+    print(f"  {'#':>4}  {'val/mse_ft':>12}  params")  # noqa
     for t in completed[:10]:
         param_str = "  ".join(f"{k}={v}" for k, v in t.params.items())
         print(f"  {t.number:>4}  {t.value:>12.4f}  {param_str}")
