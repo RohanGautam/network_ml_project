@@ -118,6 +118,22 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, epochs, d
             print(f"  [Checkpoint] New best Val MSE. Model saved to {checkpoint_path}")
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--use_kinematics", action="store_true", help="Use 6-channel kinematics features")
+    parser.add_argument("--use_edge_importance", action="store_true", help="Use learnable edge weights")
+    parser.add_argument("--hidden_dim", type=int, default=128, help="Model hidden dimension size")
+    parser.add_argument("--lr", type=float, default=0.0003, help="Initial learning rate")
+    parser.add_argument("--weight_decay", type=float, default=1.155e-07, help="Adam weight decay")
+    parser.add_argument("--batch_size", type=int, default=256, help="Training batch size")
+    parser.add_argument("--step_size", type=int, default=30, help="Scheduler decay step size")
+    parser.add_argument("--gamma", type=float, default=0.1, help="Scheduler decay factor")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--save_path", type=str, default="src/stgcnn/best_model.pt", help="Checkpoint save path")
+    parser.add_argument("--augment", action="store_true", default=True, help="Enable train-time flips")
+    parser.add_argument("--no_augment", action="store_false", dest="augment", help="Disable train-time flips")
+    args = parser.parse_args()
+
     if torch.backends.mps.is_available():
         device = torch.device("mps")
     elif torch.cuda.is_available():
@@ -126,21 +142,44 @@ if __name__ == "__main__":
         device = torch.device("cpu")
         
     print(f"Using device: {device}")
-
-    BATCH_SIZE = 128
-    LEARNING_RATE = 0.001
-    EPOCHS = 30
+    print(f"Training Arguments: {args}")
 
     print("Loading datasets...")
 
-    train_dataset = NBADataset(split_file="splits/fold0.json", data_dir="data/train/train", split_key="train")
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    train_dataset = NBADataset(
+        split_file="splits/fold0.json", 
+        data_dir="data/train/train", 
+        split_key="train",
+        use_kinematics=args.use_kinematics
+    )
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     
-    val_dataset = NBADataset(split_file="splits/fold0.json", data_dir="data/train/train", split_key="val")
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    val_dataset = NBADataset(
+        split_file="splits/fold0.json", 
+        data_dir="data/train/train", 
+        split_key="val",
+        use_kinematics=args.use_kinematics
+    )
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
-    model = Social_STGCNN().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    in_channels = 6 if args.use_kinematics else 2
+    model = Social_STGCNN(
+        in_channels=in_channels,
+        hidden_dim=args.hidden_dim,
+        use_edge_importance=args.use_edge_importance
+    ).to(device)
+    
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
 
-    train_model(model, train_loader, val_loader, optimizer, scheduler, EPOCHS, device)
+    train_model(
+        model=model, 
+        train_loader=train_loader, 
+        val_loader=val_loader, 
+        optimizer=optimizer, 
+        scheduler=scheduler, 
+        epochs=args.epochs, 
+        device=device,
+        checkpoint_path=args.save_path,
+        augment=args.augment
+    )
