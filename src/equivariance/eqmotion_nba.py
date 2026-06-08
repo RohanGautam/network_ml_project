@@ -28,23 +28,62 @@ SUBMISSION_DIR.mkdir(exist_ok=True)
 COURT_IMAGE = PROJECT_ROOT / "src" / "img" / "basketball_court.png"
 
 
+# Court-frame landmark presets, each as a list of (x_ft, y_ft, team_id) in the
+# raw court-centered frame. Distinct team_ids let the model's id_embed learn a
+# separate embedding per landmark type. All sets are chosen to respect the
+# court's D2 symmetry (under 180° rotation and the two axis reflections each
+# set maps to itself), so they don't break EqMotion's equivariance.
+LANDMARK_SETS = {
+    "hoops":   [(-41.75, 0.0, 3.0), (41.75, 0.0, 3.0)],
+    "ft":      [(-28.0,  0.0, 4.0), (28.0,  0.0, 4.0)],     # free-throw lines
+    "3pt":     [(-18.0,  0.0, 5.0), (18.0,  0.0, 5.0)],     # 3-pt arc apex
+    "corners": [(-47.0, -25.0, 6.0), (-47.0, 25.0, 6.0),
+                ( 47.0, -25.0, 6.0), ( 47.0, 25.0, 6.0)],
+    "center":  [(0.0, 0.0, 7.0)],
+}
+
+
+def landmarks_from_spec(spec):
+    """Parse 'hoops,ft' → concatenated list of (x,y,team_id). Empty → []."""
+    if not spec or spec == "none":
+        return []
+    out = []
+    for name in spec.split(","):
+        name = name.strip()
+        if name not in LANDMARK_SETS:
+            raise ValueError(
+                f"unknown landmark preset '{name}'; available: {list(LANDMARK_SETS)}"
+            )
+        out.extend(LANDMARK_SETS[name])
+    return out
+
+
 class NBADataset(Dataset):
-    def __init__(self, files, context_size, horizon_size, mu, sigma, add_hoops=False):
+    def __init__(self, files, context_size, horizon_size, mu, sigma,
+                 add_hoops=False, landmarks=None):
         super().__init__()
         self.context_size = context_size
         self.horizon_size = horizon_size
         self.window_size = context_size + horizon_size
-        self.add_hoops = add_hoops
+        # `landmarks` is the general form (list of (x,y,team_id)). `add_hoops` is
+        # kept as a back-compat alias for landmarks=LANDMARK_SETS["hoops"].
+        if landmarks is None:
+            landmarks = LANDMARK_SETS["hoops"] if add_hoops else []
+        self.landmarks = landmarks
         self.load_data(files, mu, sigma)
 
     def load_data(self, files, mu, sigma):
         self.sequences = []
         self.max_start = []
-        # Data is in a court-centered frame (origin at center, x in [-48,48]=length,
-        # y in [-26,26]=width). Hoops sit 5.25 ft in from each baseline (x=+-47) at
-        # center width: x = +-(47-5.25) = +-41.75, y = 0.
-        raw_hoops = torch.tensor([[-41.75, 0.0], [41.75, 0.0]])
-        norm_hoops = (raw_hoops - mu) / sigma
+        # Precompute normalized landmark positions once. Each landmark contributes
+        # one static node appended to the end of the agent axis with [x,y]=normed
+        # position, zero velocity, isplayer=0, team=its preset team_id.
+        if self.landmarks:
+            raw_land = torch.tensor([[x, y] for x, y, _ in self.landmarks],
+                                    dtype=torch.float32)
+            norm_land = (raw_land - mu) / sigma
+            team_ids = torch.tensor([t for _, _, t in self.landmarks],
+                                    dtype=torch.float32)
         for f in files:
             seq = torch.load(f, weights_only=False)
             seq[:, :, [0, 1]] = (seq[:, :, [0, 1]].clone() - mu) / sigma
@@ -53,15 +92,15 @@ class NBADataset(Dataset):
             # feature layout: [x, y, dx, dy, isplayer, team]
             seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
 
-            if self.add_hoops:
-                # Append 2 static landmark nodes: [T, 11, 6] -> [T, 13, 6]
+            if self.landmarks:
+                # Append L static landmark nodes: [T, 11, 6] -> [T, 11+L, 6]
                 T = seq.shape[0]
-                hoop_nodes = torch.zeros((T, 2, 6), dtype=seq.dtype)
-                hoop_nodes[:, :, :2] = norm_hoops  # Broadcast normalized X, Y
-                hoop_nodes[:, :, 2:4] = 0.0  # Static: Velocity is zero
-                hoop_nodes[:, :, 4] = 0.0  # isplayer = 0
-                hoop_nodes[:, :, 5] = 3.0  # Unique "team" ID for landmarks
-                seq = torch.cat([seq, hoop_nodes], dim=1)
+                L = len(self.landmarks)
+                land_nodes = torch.zeros((T, L, 6), dtype=seq.dtype)
+                land_nodes[:, :, :2] = norm_land
+                land_nodes[:, :, 4] = 0.0      # isplayer = 0
+                land_nodes[:, :, 5] = team_ids  # one team_id per landmark type
+                seq = torch.cat([seq, land_nodes], dim=1)
 
             self.sequences.append(seq)
             self.max_start.append(max(0, len(seq) - self.window_size))
@@ -128,7 +167,9 @@ class NBAEvalSampler(Sampler):
                 starts = [0]
             else:
                 k = min(windows_per_seq, ms + 1)
-                starts = sorted({int(round(s)) for s in torch.linspace(0, ms, k).tolist()})
+                starts = sorted(
+                    {int(round(s)) for s in torch.linspace(0, ms, k).tolist()}
+                )
             self.windows.extend((i, s) for s in starts)
 
     def __iter__(self):
@@ -139,14 +180,52 @@ class NBAEvalSampler(Sampler):
 
 
 class MultiStepMSE:
-    def __init__(self):
-        self.loss_fn = torch.nn.MSELoss()
+    """Mean MSE loss with optional ball-weighting or ball-only training.
+
+    - ball_weight=1.0 (default): plain mean MSE over (T, B, N, 2).
+    - ball_weight>1:              soft weighting; the ball element's loss is
+                                  scaled but players still get gradient.
+    - ball_only=True:             hard mask — loss is computed *only* on the
+                                  ball entity. Player and landmark predictions
+                                  get zero gradient. Inputs (all 11 agents +
+                                  any landmarks) are unchanged, so the model
+                                  still uses joint context to predict the ball;
+                                  it just doesn't waste capacity on the players.
+                                  Use with `--monitor val/mse_ball` since
+                                  `val/mse_ft` becomes garbage (players free).
+    """
+
+    def __init__(self, ball_weight: float = 1.0, ball_only: bool = False):
+        self.ball_weight = float(ball_weight)
+        self.ball_only = bool(ball_only)
+
+    def _ball_mask(self, target):
+        # Ball is the entity with isplayer==0 among the first 11 nodes; landmarks
+        # (positions >=11) also have isplayer=0 by construction, so we cap to 11.
+        B, _, N, _ = target.shape
+        n_real_cap = min(N, 11)
+        m = torch.zeros(B, N, dtype=torch.bool, device=target.device)
+        m[:, :n_real_cap] = target[:, 0, :n_real_cap, 4] == 0
+        return m  # [B, N]
 
     def compute(self, pred, target) -> Tensor:
+        # target [B, T, N, 6] (full features, incl. static isplayer at ch 4);
+        # pred [T, B*N, 2] (normalized positions, real-agent ordering preserved).
         B, T, N, _ = target.shape
-        target = target[:, :, :, :2].permute(1, 0, 2, 3).reshape(T, B * N, 2)
-        loss = sum(self.loss_fn(pred[t], target[t]) for t in range(T))
-        return loss / T
+        target_xy = target[:, :, :, :2].permute(1, 0, 2, 3)  # [T, B, N, 2]
+        pred_r = pred.view(T, B, N, 2)
+        sq = (pred_r - target_xy) ** 2  # [T, B, N, 2]
+
+        if self.ball_only:
+            ball_4d = self._ball_mask(target).view(1, B, N, 1).expand_as(sq)
+            return sq[ball_4d].mean()
+
+        if self.ball_weight == 1.0:
+            return sq.mean()
+
+        ball_4d = self._ball_mask(target).view(1, B, N, 1).expand_as(sq)
+        weights = 1.0 + (self.ball_weight - 1.0) * ball_4d.float()
+        return (weights * sq).sum() / weights.sum()
 
 
 # ── EqMotion wrapper ──────────────────────────────────────────────────────────
@@ -222,13 +301,17 @@ class NBAEqMotionLightningModel(L.LightningModule):
         max_epochs: int = 500,
         warmup_epochs: int = 0,
         n_landmarks: int = 0,  # static court nodes appended last (e.g. 2 hoops)
+        ball_weight: float = 1.0,  # >1 trains a ball-specialist; 1.0 = plain MSE
+        ball_only_loss: bool = False,  # True = loss is ONLY on ball; ignores ball_weight
     ):
         super().__init__()
         self.save_hyperparameters()
         self.net = NBAEqMotionModel(
             context_size, horizon_size, hidden_nf, hid_channel, n_layers
         )
-        self.loss_fn = MultiStepMSE()
+        self.loss_fn = MultiStepMSE(
+            ball_weight=ball_weight, ball_only=ball_only_loss
+        )
 
     def on_fit_start(self):
         dm = self.trainer.datamodule
@@ -258,10 +341,14 @@ class NBAEqMotionLightningModel(L.LightningModule):
         # mean deflates val/mse_ft and breaks comparability with the Kaggle metric
         # (which is over the 11 real entities only).
         n_land = self.hparams.n_landmarks
+        n_real = N - n_land
         if n_land > 0:
-            n_real = N - n_land
-            pred_real = pred_real.view(T, B, N, 2)[:, :, :n_real, :].reshape(T, B * n_real, 2)
-            target_real = target_real.view(T, B, N, 2)[:, :, :n_real, :].reshape(T, B * n_real, 2)
+            pred_real = pred_real.view(T, B, N, 2)[:, :, :n_real, :].reshape(
+                T, B * n_real, 2
+            )
+            target_real = target_real.view(T, B, N, 2)[:, :, :n_real, :].reshape(
+                T, B * n_real, 2
+            )
         self.log("val/loss", loss, on_epoch=True, prog_bar=True)
         self.log(
             "val/ade_ft",
@@ -281,6 +368,15 @@ class NBAEqMotionLightningModel(L.LightningModule):
             on_epoch=True,
             prog_bar=True,
         )
+        # Per-entity-type breakdown: ball (isplayer==0) vs the 10 players, among
+        # the real entities (hoops already stripped above). Useful for spotting
+        # where residual MSE concentrates and judging ball-specialist training.
+        sq = (pred_real - target_real).view(T, B, n_real, 2) ** 2
+        ball_m = (y[:, 0, :n_real, 4] == 0).view(1, B, n_real, 1).expand_as(sq)
+        if ball_m.any():
+            self.log("val/mse_ball", sq[ball_m].mean(), on_epoch=True)
+        if (~ball_m).any():
+            self.log("val/mse_players", sq[~ball_m].mean(), on_epoch=True)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
@@ -341,6 +437,7 @@ class NBADataModule(L.LightningDataModule):
         horizon_size=12,
         seed=0,
         add_hoops=False,
+        landmarks=None,
         iso_norm=False,
         full_val=False,
         val_windows_per_seq=8,
@@ -351,7 +448,11 @@ class NBADataModule(L.LightningDataModule):
         self.context_size = context_size
         self.horizon_size = horizon_size
         self.seed = seed
-        self.add_hoops = add_hoops
+        # `landmarks` is the general form; `add_hoops` is a back-compat alias.
+        if landmarks is None:
+            landmarks = LANDMARK_SETS["hoops"] if add_hoops else []
+        self.landmarks = landmarks
+        self.add_hoops = add_hoops  # kept for any external readers; prefer landmarks
         self.iso_norm = iso_norm
         self.full_val = full_val
         self.val_windows_per_seq = val_windows_per_seq
@@ -365,12 +466,20 @@ class NBADataModule(L.LightningDataModule):
         val_files = [data_dir / f for f in manifest["val"]]
         self.mu, self.sigma = self._compute_normalization_statistics(train_files)
         self.train_dataset = NBADataset(
-            train_files, self.context_size, self.horizon_size, self.mu, self.sigma,
-            add_hoops=self.add_hoops,
+            train_files,
+            self.context_size,
+            self.horizon_size,
+            self.mu,
+            self.sigma,
+            landmarks=self.landmarks,
         )
         self.val_dataset = NBADataset(
-            val_files, self.context_size, self.horizon_size, self.mu, self.sigma,
-            add_hoops=self.add_hoops,
+            val_files,
+            self.context_size,
+            self.horizon_size,
+            self.mu,
+            self.sigma,
+            landmarks=self.landmarks,
         )
 
     def _compute_normalization_statistics(self, files):
@@ -407,7 +516,10 @@ class NBADataModule(L.LightningDataModule):
             )
         else:
             sampler = NBASampler(
-                self.batch_size, self.val_dataset.max_start, seed=self.seed, shuffle=False
+                self.batch_size,
+                self.val_dataset.max_start,
+                seed=self.seed,
+                shuffle=False,
             )
         return DataLoader(self.val_dataset, batch_size=self.batch_size, sampler=sampler)
 
@@ -424,16 +536,21 @@ class NBADataModule(L.LightningDataModule):
             vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
             seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
 
-            if self.add_hoops:
+            if self.landmarks:
+                # Mirror the dataset's landmark injection so the test input shape
+                # matches training (the model expects the same N landmark nodes).
                 T = seq.shape[0]
-                # Court-centered frame: hoops at x=+-41.75 (5.25 ft in), y=0.
-                raw_hoops = torch.tensor([[-41.75, 0.0], [41.75, 0.0]])
-                norm_hoops = (raw_hoops - self.mu) / self.sigma
-                hoop_nodes = torch.zeros((T, 2, 6), dtype=seq.dtype)
-                hoop_nodes[:, :, :2] = norm_hoops
-                hoop_nodes[:, :, 4] = 0.0
-                hoop_nodes[:, :, 5] = 3.0
-                seq = torch.cat([seq, hoop_nodes], dim=1)
+                L = len(self.landmarks)
+                raw = torch.tensor([[x, y] for x, y, _ in self.landmarks],
+                                   dtype=torch.float32)
+                norm = (raw - self.mu) / self.sigma
+                team_ids = torch.tensor([t for _, _, t in self.landmarks],
+                                        dtype=seq.dtype)
+                land_nodes = torch.zeros((T, L, 6), dtype=seq.dtype)
+                land_nodes[:, :, :2] = norm
+                land_nodes[:, :, 4] = 0.0
+                land_nodes[:, :, 5] = team_ids
+                seq = torch.cat([seq, land_nodes], dim=1)
 
             traj = model.get_trajectory(seq, self.mu, self.sigma)
             # traj = traj[8:, :, :2].reshape(-1)
@@ -473,27 +590,75 @@ if __name__ == "__main__":
     p.add_argument("--grad-clip", type=float, default=0.66)
     p.add_argument("--max-epochs", type=int, default=300)
     p.add_argument("--patience", type=int, default=40)
-    p.add_argument("--lr-scheduler", default="cosine", choices=["none", "cosine", "plateau"])
+    p.add_argument(
+        "--lr-scheduler", default="cosine", choices=["none", "cosine", "plateau"]
+    )
     p.add_argument("--warmup-epochs", type=int, default=5)
     p.add_argument("--iso-norm", action="store_true")
-    p.add_argument("--add-hoops", action="store_true",
-                   help="Inject 2 static basket nodes (court-frame / D2 structure).")
-    p.add_argument("--full-val", action="store_true",
-                   help="Deterministic multi-window validation for a stable val/mse_ft.")
-    p.add_argument("--val-windows", type=int, default=8,
-                   help="Windows per sequence for --full-val.")
+    p.add_argument(
+        "--add-hoops",
+        action="store_true",
+        help="Inject 2 static basket nodes (court-frame / D2 structure).",
+    )
+    p.add_argument(
+        "--full-val",
+        action="store_true",
+        help="Deterministic multi-window validation for a stable val/mse_ft.",
+    )
+    p.add_argument(
+        "--val-windows",
+        type=int,
+        default=8,
+        help="Windows per sequence for --full-val.",
+    )
+    p.add_argument(
+        "--landmarks",
+        default="",
+        help="Comma-separated landmark preset names from LANDMARK_SETS "
+             "(e.g. 'hoops,ft,3pt'). Overrides --add-hoops if given.",
+    )
+    p.add_argument(
+        "--ball-weight",
+        type=float,
+        default=1.0,
+        help="Loss weight on the ball entity (isplayer==0). 1.0 = plain MSE; "
+             ">1 trains a ball-specialist that still sees all agents jointly.",
+    )
+    p.add_argument(
+        "--ball-only-loss",
+        action="store_true",
+        help="Train a TRUE ball specialist: loss is computed ONLY on the ball "
+             "(zero gradient on players). Inputs are unchanged (joint context). "
+             "Pair with --monitor val/mse_ball — val/mse_ft will be garbage.",
+    )
+    p.add_argument(
+        "--monitor",
+        default="val/mse_ft",
+        help="Metric to monitor for ModelCheckpoint + EarlyStopping. Use "
+             "val/mse_ball when training with --ball-only-loss.",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-submit", action="store_true")
     args = p.parse_args()
 
     L.seed_everything(args.seed, workers=True)
 
+    # Resolve landmarks: explicit --landmarks wins; else fall back to --add-hoops.
+    if args.landmarks:
+        landmarks = landmarks_from_spec(args.landmarks)
+    elif args.add_hoops:
+        landmarks = LANDMARK_SETS["hoops"]
+    else:
+        landmarks = []
+    print(f"[{args.run_name}] landmarks={args.landmarks or ('hoops' if args.add_hoops else 'none')} "
+          f"(n={len(landmarks)})")
+
     data_module = NBADataModule(
         split_path=str(PROJECT_ROOT / "splits" / "fold0.json"),
         batch_size=args.batch_size,
         seed=args.seed,
         iso_norm=args.iso_norm,
-        add_hoops=args.add_hoops,
+        landmarks=landmarks,
         full_val=args.full_val,
         val_windows_per_seq=args.val_windows,
     )
@@ -507,7 +672,9 @@ if __name__ == "__main__":
         lr_scheduler=args.lr_scheduler,
         max_epochs=args.max_epochs,
         warmup_epochs=args.warmup_epochs,
-        n_landmarks=2 if args.add_hoops else 0,
+        n_landmarks=len(landmarks),
+        ball_weight=args.ball_weight,
+        ball_only_loss=args.ball_only_loss,
     )
 
     wandb_logger = WandbLogger(project="NML_base", name=args.run_name)
@@ -515,13 +682,11 @@ if __name__ == "__main__":
     ckpt_cb = ModelCheckpoint(
         dirpath=str(PROJECT_ROOT / "checkpoints" / "eqmotion" / args.run_name),
         filename="best",
-        monitor="val/mse_ft",
+        monitor=args.monitor,
         mode="min",
         save_top_k=1,
     )
-    early_stop = EarlyStopping(
-        monitor="val/mse_ft", patience=args.patience, mode="min"
-    )
+    early_stop = EarlyStopping(monitor=args.monitor, patience=args.patience, mode="min")
 
     trainer = L.Trainer(
         max_epochs=args.max_epochs,
@@ -532,13 +697,17 @@ if __name__ == "__main__":
     )
 
     trainer.fit(model, data_module)
-    print(f"[{args.run_name}] best val/mse_ft = {ckpt_cb.best_model_score.item():.4f}")
+    print(f"[{args.run_name}] best {args.monitor} = {ckpt_cb.best_model_score.item():.4f}")
 
     if not args.no_submit:
         # Submit from the BEST checkpoint, not the final-epoch model in memory
         # (final epoch is typically worse than the checkpointed minimum).
-        best = NBAEqMotionLightningModel.load_from_checkpoint(
-            ckpt_cb.best_model_path, strict=False
-        ).to(model.device).eval()
+        best = (
+            NBAEqMotionLightningModel.load_from_checkpoint(
+                ckpt_cb.best_model_path, strict=False
+            )
+            .to(model.device)
+            .eval()
+        )
         data_module.get_kaggle_submission(best, str(TEST_DIR), str(SUBMISSION_DIR))
         print(f"[{args.run_name}] submission written from {ckpt_cb.best_model_path}")

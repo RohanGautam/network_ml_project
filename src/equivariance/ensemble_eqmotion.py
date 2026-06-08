@@ -67,25 +67,34 @@ def predict(models, X, tta):
 
 @torch.no_grad()
 def eval_val(models, dm, device):
-    """Report honest 11-entity val/mse_ft for {single,ensemble}x{plain,tta}."""
+    """Report honest 11-entity val/mse_ft for {single,ensemble}x{plain,tta},
+    plus a per-entity-type breakdown (mse_ball vs mse_players) so we can see
+    where the residual error concentrates."""
     mu, sigma = dm.mu.to(device), dm.sigma.to(device)
     configs = {"single_plain": ([models[0]], False),
                "single_tta": ([models[0]], True),
                "ensemble_plain": (models, False),
                "ensemble_tta": (models, True)}
-    sse = {k: 0.0 for k in configs}
-    cnt = {k: 0 for k in configs}
+    parts = ("all", "ball", "players")  # "all" = 11 real entities (Kaggle metric)
+    sse = {k: {p: 0.0 for p in parts} for k in configs}
+    cnt = {k: {p: 0 for p in parts} for k in configs}
     for X, y in dm.val_dataloader():
         X = X.to(device)
         B, T, N, _ = y.shape
         tgt = y[..., :2].permute(1, 0, 2, 3).to(device) * sigma + mu  # [T,B,N,2]
         tgt = tgt[:, :, :N_ENTITIES, :]
+        # Ball among the 11 real entities has isplayer=0 (feature channel 4);
+        # static across timesteps, so read it from any frame of y.
+        ball_mask = (y[:, 0, :N_ENTITIES, 4] == 0).to(device)  # [B, 11]
+        ball_mask_full = ball_mask.view(1, B, N_ENTITIES, 1).expand(T, B, N_ENTITIES, 2)
         for k, (ms, tta) in configs.items():
             pred = predict(ms, X, tta) * sigma + mu
             pred = pred[:, :, :N_ENTITIES, :]
-            sse[k] += ((pred - tgt) ** 2).sum().item()
-            cnt[k] += pred.numel()
-    return {k: sse[k] / cnt[k] for k in configs}
+            sq = (pred - tgt) ** 2  # [T,B,11,2]
+            sse[k]["all"] += sq.sum().item();              cnt[k]["all"] += sq.numel()
+            sse[k]["ball"] += sq[ball_mask_full].sum().item();   cnt[k]["ball"] += int(ball_mask_full.sum())
+            sse[k]["players"] += sq[~ball_mask_full].sum().item(); cnt[k]["players"] += int((~ball_mask_full).sum())
+    return {k: {p: sse[k][p] / max(cnt[k][p], 1) for p in parts} for k in configs}
 
 
 def _build_test_X(seq, mu, sigma, add_hoops):
@@ -159,10 +168,12 @@ def main():
         m.register_buffer("sigma", dm.sigma.clone())
         models.append(m.to(device).eval())
 
-    print("\n=== val/mse_ft (honest, 11 entities) ===")
+    print("\n=== val/mse_ft (honest) — all=11 entities (Kaggle), ball=1, players=10 ===")
     res = eval_val(models, dm, device)
+    print(f"  {'config':18s} {'all':>8s} {'ball':>8s} {'players':>8s}  ball/players")
     for k, v in res.items():
-        print(f"  {k:16s} {v:.4f}")
+        ratio = v["ball"] / max(v["players"], 1e-9)
+        print(f"  {k:18s} {v['all']:8.4f} {v['ball']:8.4f} {v['players']:8.4f}  {ratio:5.2f}x")
 
     print("\n=== submissions ===")
     write_submission(models, dm, device, tta=False, tag="plain")

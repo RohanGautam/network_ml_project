@@ -3,23 +3,28 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from pathlib import Path
+import time
 
 # Add the 'src' directory to the python path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stgcnn.dataset import NBADataset
 from stgcnn.model import Social_STGCNN
-from stgcnn.loss import bivariate_loss
 from utils.metrics import compute_ade, compute_fde, compute_mse
-import time
 
-def train_model(model, train_loader, val_loader, optimizer, scheduler, epochs, device):
-    print("\n--- Starting Training ---")
+def train_model(model, train_loader, val_loader, optimizer, scheduler, epochs, device, checkpoint_path="src/stgcnn/best_model.pt", augment=True):
+    print("\n--- Starting Training (MSE Loss) ---")
     total_batches = len(train_loader)
     
     best_val_mse = float('inf')
     best_val_ade = float('inf')
-    checkpoint_path = str(Path(__file__).resolve().parent / "best_model.pt")
+    
+    # Registration values for denormalization
+    register_mu = torch.tensor([0.43076536, 0.04198149]).to(device)
+    register_sigma = torch.tensor([29.67073631, 11.54754257]).to(device)
+    
+    # Check in_channels of the model to know if kinematics are used (needed for augmentation helper)
+    in_channels = model.st_gcnn1.tcn.in_channels
     
     for epoch in range(epochs):
         model.train()
@@ -32,9 +37,37 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, epochs, d
             batch_start = time.time()
             X, Y, A = X.to(device), Y.to(device), A.to(device)
             
+            # Apply training-time augmentation (reflect coordinates/features)
+            if augment:
+                # Random flags for x-flip and y-flip per batch element
+                B = X.shape[0]
+                flip_x = torch.rand(B, device=device) < 0.5
+                flip_y = torch.rand(B, device=device) < 0.5
+                
+                X = X.clone()
+                Y = Y.clone()
+                
+                # Apply X-flip
+                X[flip_x, 0] = -X[flip_x, 0] - 2 * register_mu[0] / register_sigma[0]
+                Y[flip_x, ..., 0] = -Y[flip_x, ..., 0] - 2 * register_mu[0] / register_sigma[0]
+                if in_channels == 6:
+                    X[flip_x, 2] = -X[flip_x, 2] # Negate velocity
+                    X[flip_x, 4] = -X[flip_x, 4] # Negate acceleration
+                    
+                # Apply Y-flip
+                X[flip_y, 1] = -X[flip_y, 1] - 2 * register_mu[1] / register_sigma[1]
+                Y[flip_y, ..., 1] = -Y[flip_y, ..., 1] - 2 * register_mu[1] / register_sigma[1]
+                if in_channels == 6:
+                    X[flip_y, 3] = -X[flip_y, 3] # Negate velocity
+                    X[flip_y, 5] = -X[flip_y, 5] # Negate acceleration
+            
             optimizer.zero_grad()
             pred = model(X, A)
-            loss = bivariate_loss(pred, Y)
+            
+            # Extract means and compute normalized MSE loss
+            mu_x, mu_y = pred[0], pred[1]
+            mu = torch.stack([mu_x, mu_y], dim=-1)
+            loss = torch.mean((mu - Y) ** 2)
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -47,12 +80,12 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, epochs, d
                 batch_time = time.time() - batch_start
                 speed = X.shape[0] / batch_time if batch_time > 0 else 0
                 print(f"  Batch {batch_idx:04d}/{total_batches:04d} | "
-                      f"Loss: {loss.item():.4f} | "
+                      f"Train MSE Loss (norm): {loss.item():.6f} | "
                       f"Speed: {speed:.1f} seq/s | "
                       f"Elapsed: {elapsed:.1f}s")
             
         avg_train_loss = total_train_loss / total_batches
-        print(f"-> Epoch {epoch+1} Complete | Average Train NLL: {avg_train_loss:.4f}")
+        print(f"-> Epoch {epoch+1} Complete | Average Train MSE Loss (norm): {avg_train_loss:.6f}")
         
         # Validation
         model.eval()
@@ -61,22 +94,20 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, epochs, d
         total_fde = 0
         total_mse = 0
         
-        register_mu = torch.tensor([0.43076536, 0.04198149]).to(device)
-        register_sigma = torch.tensor([29.67073631, 11.54754257]).to(device)
-        
         print("  Running Validation...")
         with torch.no_grad():
             for X, Y, A in val_loader:
                 X, Y, A = X.to(device), Y.to(device), A.to(device)
                 
-                mu_x, mu_y, sig_x, sig_y, rho = model(X, A)
-                pred = (mu_x, mu_y, sig_x, sig_y, rho)
-                
-                loss = bivariate_loss(pred, Y)
-                total_val_loss += loss.item()
-                
+                pred = model(X, A)
+                mu_x, mu_y = pred[0], pred[1]
                 mu = torch.stack([mu_x, mu_y], dim=-1)
                 
+                # Val loss on normalized coords
+                loss = torch.mean((mu - Y) ** 2)
+                total_val_loss += loss.item()
+                
+                # Denormalize for physical metrics (in feet)
                 mu_denorm = mu * register_sigma + register_mu
                 Y_denorm = Y * register_sigma + register_mu
                 
@@ -99,11 +130,11 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, epochs, d
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
         
-        print(f"-> Epoch {epoch+1:02d} Results | Val NLL: {avg_val_loss:.4f} | "
+        print(f"-> Epoch {epoch+1:02d} Results | Val MSE (norm): {avg_val_loss:.6f} | "
               f"Val ADE: {avg_val_ade:.4f} ft | Val FDE: {avg_val_fde:.4f} ft | "
               f"Val MSE: {avg_val_mse:.4f} ft^2 | LR: {current_lr:.6f}")
         
-        # Checkpoint
+        # Checkpoint based on physical MSE (in feet squared)
         if avg_val_mse < best_val_mse:
             best_val_mse = avg_val_mse
             best_val_ade = avg_val_ade
@@ -113,11 +144,27 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, epochs, d
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_ade': best_val_ade,
                 'val_mse': best_val_mse,
-                'val_nll': avg_val_loss,
+                'val_loss': avg_val_loss, # normalized MSE
             }, checkpoint_path)
             print(f"  [Checkpoint] New best Val MSE. Model saved to {checkpoint_path}")
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--use_kinematics", action="store_true", help="Use 6-channel kinematics features")
+    parser.add_argument("--use_edge_importance", action="store_true", help="Use learnable edge weights")
+    parser.add_argument("--hidden_dim", type=int, default=128, help="Model hidden dimension size")
+    parser.add_argument("--lr", type=float, default=0.0003, help="Initial learning rate")
+    parser.add_argument("--weight_decay", type=float, default=1.155e-07, help="Adam weight decay")
+    parser.add_argument("--batch_size", type=int, default=256, help="Training batch size")
+    parser.add_argument("--step_size", type=int, default=30, help="Scheduler decay step size")
+    parser.add_argument("--gamma", type=float, default=0.1, help="Scheduler decay factor")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--save_path", type=str, default="src/stgcnn/best_model.pt", help="Checkpoint save path")
+    parser.add_argument("--augment", action="store_true", default=True, help="Enable train-time flips")
+    parser.add_argument("--no_augment", action="store_false", dest="augment", help="Disable train-time flips")
+    args = parser.parse_args()
+
     if torch.backends.mps.is_available():
         device = torch.device("mps")
     elif torch.cuda.is_available():
@@ -126,21 +173,44 @@ if __name__ == "__main__":
         device = torch.device("cpu")
         
     print(f"Using device: {device}")
-
-    BATCH_SIZE = 128
-    LEARNING_RATE = 0.001
-    EPOCHS = 30
+    print(f"Training Arguments: {args}")
 
     print("Loading datasets...")
 
-    train_dataset = NBADataset(split_file="splits/fold0.json", data_dir="data/train/train", split_key="train")
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    train_dataset = NBADataset(
+        split_file="splits/fold0.json", 
+        data_dir="data/train/train", 
+        split_key="train",
+        use_kinematics=args.use_kinematics
+    )
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     
-    val_dataset = NBADataset(split_file="splits/fold0.json", data_dir="data/train/train", split_key="val")
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    val_dataset = NBADataset(
+        split_file="splits/fold0.json", 
+        data_dir="data/train/train", 
+        split_key="val",
+        use_kinematics=args.use_kinematics
+    )
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
-    model = Social_STGCNN().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    in_channels = 6 if args.use_kinematics else 2
+    model = Social_STGCNN(
+        in_channels=in_channels,
+        hidden_dim=args.hidden_dim,
+        use_edge_importance=args.use_edge_importance
+    ).to(device)
+    
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
 
-    train_model(model, train_loader, val_loader, optimizer, scheduler, EPOCHS, device)
+    train_model(
+        model=model, 
+        train_loader=train_loader, 
+        val_loader=val_loader, 
+        optimizer=optimizer, 
+        scheduler=scheduler, 
+        epochs=args.epochs, 
+        device=device,
+        checkpoint_path=args.save_path,
+        augment=args.augment
+    )
