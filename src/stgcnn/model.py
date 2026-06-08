@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 class ST_GCNN_Layer(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3):
+    def __init__(self, in_channels, out_channels, kernel_size=3, use_edge_importance=False):
         super().__init__()
         self.tcn = nn.Conv2d(
             in_channels, out_channels, 
@@ -10,11 +10,18 @@ class ST_GCNN_Layer(nn.Module):
             padding=(kernel_size // 2, 0)
         )
         self.prelu = nn.PReLU()
+        self.use_edge_importance = use_edge_importance
+        if use_edge_importance:
+            self.edge_importance = nn.Parameter(torch.ones(11, 11))
 
     def forward(self, x, A):
         # x: [Batch, Channels, Time, Nodes]
         # A: [Batch, Time, Nodes, Nodes]
         
+        # Apply learnable edge weights if enabled
+        if self.use_edge_importance:
+            A = A * self.edge_importance
+            
         # 1. Spatial Graph Convolution
         spatial_out = torch.einsum('btvw, bctw -> bctv', A, x)
         
@@ -39,12 +46,12 @@ class TXP_CNN(nn.Module):
 
 
 class Social_STGCNN(nn.Module):
-    def __init__(self, in_channels=2, hidden_dim=64, obs_len=8, pred_len=12):
+    def __init__(self, in_channels=2, hidden_dim=64, obs_len=8, pred_len=12, use_edge_importance=False):
         super().__init__()
         
-        self.st_gcnn1 = ST_GCNN_Layer(in_channels, hidden_dim)
-        self.st_gcnn2 = ST_GCNN_Layer(hidden_dim, hidden_dim)
-        self.st_gcnn3 = ST_GCNN_Layer(hidden_dim, hidden_dim)
+        self.st_gcnn1 = ST_GCNN_Layer(in_channels, hidden_dim, use_edge_importance=use_edge_importance)
+        self.st_gcnn2 = ST_GCNN_Layer(hidden_dim, hidden_dim, use_edge_importance=use_edge_importance)
+        self.st_gcnn3 = ST_GCNN_Layer(hidden_dim, hidden_dim, use_edge_importance=use_edge_importance)
         
         self.txp = TXP_CNN(hidden_dim, obs_len, pred_len)
         
