@@ -67,6 +67,25 @@ network_ml_project/
 
 ---
 
+## Running on SLURM
+
+All experiments were run on the SCITAS (Izar) cluster. The `jobs/` folder holds
+one SLURM batch script per experiment — training runs, ablations, probes, and
+submission jobs (52 scripts in total). Submit any of them with `sbatch`:
+
+```bash
+sbatch jobs/train_mart_4k_curriculum_sw1k_lrdrop.sh   # the best model
+sbatch jobs/train_eqmotion_5k.sh                       # EqMotion backbone
+```
+
+Each script requests its GPU/CPU/memory, rsyncs the repo to node-local scratch,
+activates the environment, runs the underlying `src/` command, and syncs
+checkpoints back. The exact flags for each run live inside the corresponding
+script, so they double as a reproducible record of every experiment. To run
+locally instead, use the `uv run python ...` commands shown per model below.
+
+---
+
 ## Best model — curriculum-MART × EqMotion blend
 
 Our best submission (**Kaggle 2.93**) is a weighted blend of two independently
