@@ -461,9 +461,4 @@ python blend_csvs.py \
 
 Weights are normalized internally; omit `--weights` for an equal-weight average.
 
----
 
-## Full experiment log
-
-See `experiments.md` for the complete record of every run with val/mse_ft
-numbers, what changed, and what worked or didn't.
