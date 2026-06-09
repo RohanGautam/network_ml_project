@@ -10,20 +10,16 @@ mean squared error in feet² (val/mse_ft).
 
 ## Setup
 
-### Option A — conda
-
-```bash
-conda create -n nml python=3.12
-conda activate nml
-pip install torch==2.10.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-pip install lightning wandb optuna pandas python-box python-dotenv torch-geometric kagglehub tqdm
-```
-
-### Option B — uv
+We use [uv](https://docs.astral.sh/uv/) for environment and dependency
+management. Install the locked environment with:
 
 ```bash
 uv sync
 ```
+
+All scripts run inside that environment via `uv run` — e.g.
+`uv run python src/mart/main_nba_pt.py ...`. The `python ...` commands below are
+shorthand; prefix them with `uv run` (or activate `.venv` first).
 
 ### Wandb
 
@@ -40,7 +36,7 @@ WANDB_API_KEY=your_key_here
 Download from Kaggle (requires Kaggle API credentials in `.env`):
 
 ```bash
-python src/utils/download_dataset.py
+uv run python src/utils/download_dataset.py
 ```
 
 This places the data under `data/train/train/` and `data/test/test/` as `.pt`
@@ -338,7 +334,7 @@ interactions between agents.
 
 ```bash
 cd src/groupnet
-python train_hyper_nba_pt.py
+uv run python train_hyper_nba_pt.py --split_path ../../splits/fold0.json --gpu 0
 ```
 
 ---

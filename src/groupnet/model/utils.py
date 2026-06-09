@@ -5,7 +5,7 @@ import numpy as np
 import random
 import time
 import copy
-import glob, glob2
+import glob
 from torch import nn
 
 def initialize_weights(modules):

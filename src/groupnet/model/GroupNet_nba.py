@@ -1,5 +1,4 @@
 from random import sample
-from tkinter import TRUE
 import torch
 import numpy as np
 from torch import nn
