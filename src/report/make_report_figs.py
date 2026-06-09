@@ -1,9 +1,17 @@
-"""Generate report Figures 3 and 4 from the cached validation predictions.
+"""Generate the report figures.
 
-No model inference required -- both figures are built from:
+Fig 2 (training curves) is built from W&B validation logs:
+  src/report/wandb_val_mse_ft.csv               (run, epoch, val_mse_ft)
+  src/report/mart curriculum training val_mse log.csv  (curriculum run)
+  -> run `uv run python src/report/fetch_wandb_curves.py` first to (re)download.
+
+Figs 3 and 4 are built from cached validation predictions (no model inference):
   cache/mart_aug_5k/val.pt   (aug-MART: past, target, k_preds; z-scored iso frame)
   cache/eqm_residual/val.pt  (EqMotion ensemble: eqm_pred_ft in feet; target)
 
+Fig 2: side-by-side val/mse_ft training curves. Left: the three MART variants
+       that differ only in training loss (min-ADE / mean-MSE / curriculum) ->
+       mean-MSE overfits, curriculum wins. Right: best MART vs EqMotion.
 Fig 3: per-window BALL error of EqMotion vs aug-MART -> the rho~0.93 scatter that
        visually argues "same errors on the same samples => task floor."
 Fig 4: one play on the court -- players predicted tightly, the ball's K=20 modes
@@ -17,6 +25,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -47,6 +56,78 @@ def setup_court(ax, title=""):
 def per_window_entity_mse(pred_ft, tgt_ft):
     """[M,11,12,2] feet -> [M,11] MSE over (T, xy)."""
     return ((pred_ft - tgt_ft) ** 2).mean(axis=(2, 3))
+
+
+# ---------------------------------------------------------------------------
+# Figure 2 -- validation training curves (loss comparison + MART vs EqMotion)
+# ---------------------------------------------------------------------------
+def make_training_curves():
+    """Two side-by-side val/mse_ft panels, built from the W&B logs."""
+    wb = pd.read_csv(OUT / "wandb_val_mse_ft.csv")
+
+    def curve(run, smooth=11):
+        g = wb[wb.run == run].sort_values("epoch")
+        x = g.epoch.to_numpy(dtype=float)
+        y = g.val_mse_ft.to_numpy(dtype=float)
+        ys = pd.Series(y).rolling(smooth, min_periods=1, center=True).mean().to_numpy()
+        return x, y, ys
+
+    # The curriculum run was not retained in W&B; use the CSV the user exported.
+    cur = pd.read_csv(OUT / "mart curriculum training val_mse log.csv")
+    cur_x = cur["Step"].to_numpy(dtype=float)
+    cur_y = cur.iloc[:, 1].to_numpy(dtype=float)
+    cur_ys = pd.Series(cur_y).rolling(11, min_periods=1, center=True).mean().to_numpy()
+
+    SWITCH = 1000          # curriculum loss switch (min-ADE -> mean-MSE) + LR drop
+    YMIN, YMAX = 2.8, 5.0  # zoom to the plateau where the variants separate
+
+    C_MINADE = "#1E88E5"
+    C_MEANMSE = "#9E9E9E"
+    C_CURR = "#E53935"
+    C_EQM = "#00897B"
+
+    def plot_run(ax, x, y_raw, y_smooth, color, label):
+        ax.plot(x, y_raw, color=color, lw=0.8, alpha=0.25)
+        ax.plot(x, y_smooth, color=color, lw=1.6, label=label)
+
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(8.4, 3.5), sharey=True)
+
+    # --- Left: MART, holding everything fixed except the training loss ---
+    mx, my, mys = curve("mart_meanmse_iso_hoops_5k")
+    ax_, ay, ays = curve("mart_aug_iso_hoops_5k")
+    plot_run(axL, mx, my, mys, C_MEANMSE, f"mean-MSE  (best {my.min():.2f})")
+    plot_run(axL, ax_, ay, ays, C_MINADE, f"min-ADE  (best {ay.min():.2f})")
+    plot_run(axL, cur_x, cur_y, cur_ys, C_CURR, f"curriculum  (best {cur_y.min():.2f})")
+    axL.axvline(SWITCH, ls=":", color="k", lw=1.0, alpha=0.6)
+    axL.annotate("loss switch", xy=(SWITCH + 80, 4.93), ha="left", va="top",
+                 fontsize=7, color="0.3")
+    axL.set_title("(a) MART: effect of training loss")
+    axL.legend(frameon=False, fontsize=8, loc="upper right")
+
+    # --- Right: the best MART vs the EqMotion baseline ---
+    qx, qy, qys = curve("eqm_iso_hoops_5k")
+    plot_run(axR, qx, qy, qys, C_EQM, f"EqMotion  (best {qy.min():.2f})")
+    plot_run(axR, cur_x, cur_y, cur_ys, C_CURR, f"MART curriculum  (best {cur_y.min():.2f})")
+    axR.set_title("(b) Best MART vs EqMotion")
+    axR.legend(frameon=False, fontsize=8, loc="upper right")
+
+    for ax in (axL, axR):
+        ax.set_ylim(YMIN, YMAX)
+        ax.set_xlim(0, 5000)
+        ax.set_xlabel("epoch")
+        ax.grid(alpha=0.25)
+    axL.set_ylabel("validation MSE (ft$^2$)")
+
+    fig.tight_layout()
+    fig.savefig(OUT / "fig_training_curves.png", dpi=200)
+    fig.savefig(OUT / "fig_training_curves.pdf")
+    plt.close(fig)
+    print(f"[fig2] saved {OUT/'fig_training_curves.png'}  "
+          f"(min-ADE {ay.min():.2f}, mean-MSE {my.min():.2f}->{my[-1]:.2f}, "
+          f"curriculum {cur_y.min():.2f}, EqMotion {qy.min():.2f})")
+
+
+make_training_curves()
 
 
 # ---------------------------------------------------------------------------
