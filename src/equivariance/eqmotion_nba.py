@@ -568,7 +568,6 @@ class NBADataModule(L.LightningDataModule):
                 seq = torch.cat([seq, land_nodes], dim=1)
 
             traj = model.get_trajectory(seq, self.mu, self.sigma)
-            # traj = traj[8:, :, :2].reshape(-1)
             traj = traj[8:, :11, :2].reshape(-1)
             all_traj.append([int(f.removesuffix(".pt"))] + traj.tolist())
         df = (

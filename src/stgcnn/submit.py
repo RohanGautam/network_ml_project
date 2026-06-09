@@ -6,7 +6,6 @@ import csv
 from pathlib import Path
 from datetime import datetime
 
-# Add the 'src' directory to the python path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stgcnn.model import Social_STGCNN
@@ -20,11 +19,10 @@ def generate_submission(model_path: str, test_dir: str, output_csv: str):
         device = torch.device("cpu")
     print(f"Using device: {device}")
     
-    # Load checkpoint first to auto-detect architecture
     checkpoint = torch.load(model_path, map_location=device)
     state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
-    
-    # Auto-detect parameters
+
+    # auto-detect architecture from the weight shapes
     in_channels = state_dict["st_gcnn1.tcn.weight"].shape[1]
     hidden_dim = state_dict["st_gcnn1.tcn.weight"].shape[0]
     use_edge_importance = "st_gcnn1.edge_importance" in state_dict
@@ -34,7 +32,6 @@ def generate_submission(model_path: str, test_dir: str, output_csv: str):
     print(f"  hidden_dim: {hidden_dim}")
     print(f"  use_edge_importance: {use_edge_importance}")
     
-    # Load model
     model = Social_STGCNN(
         in_channels=in_channels,
         hidden_dim=hidden_dim,
@@ -42,8 +39,7 @@ def generate_submission(model_path: str, test_dir: str, output_csv: str):
     ).to(device)
     model.load_state_dict(state_dict)
     model.eval()
-    
-    # Normalization statistics
+
     mu = torch.tensor([0.43076536, 0.04198149])
     sigma = torch.tensor([29.67073631, 11.54754257])
     
@@ -58,42 +54,31 @@ def generate_submission(model_path: str, test_dir: str, output_csv: str):
             seq_id = int(f_path.stem)
             tensor = torch.load(f_path, weights_only=True).float() # [8, 11, 4]
             coords = tensor[..., :2] # [8, 11, 2]
-            
-            # Compute A based on raw coordinates (vectorized)
+
+            # adjacency from raw (un-normalized) coordinates
             dist = torch.cdist(coords, coords) # [8, 11, 11]
             A = torch.exp(-dist)
-                
-            # Normalize coordinates
+
             coords_norm = (coords - mu) / sigma
-            
+
             if in_channels == 6:
-                # Calculate velocity: v_t = x_t - x_{t-1}
                 vel = torch.zeros_like(coords_norm)
                 vel[1:] = coords_norm[1:] - coords_norm[:-1]
-                
-                # Calculate acceleration: a_t = v_t - v_{t-1}
                 acc = torch.zeros_like(vel)
                 acc[1:] = vel[1:] - vel[:-1]
-                
-                # Concatenate pos, vel, acc along feature axis
                 feat = torch.cat([coords_norm, vel, acc], dim=-1) # [8, 11, 6]
                 X = feat.permute(2, 0, 1) # [6, 8, 11]
             else:
                 X = coords_norm.permute(2, 0, 1) # [2, 8, 11]
-            
-            # Add batch dimension and send to device
+
             X = X.unsqueeze(0).to(device) # [1, C, 8, 11]
             A = A.unsqueeze(0).to(device) # [1, 8, 11, 11]
-            
-            # Predict
+
             mu_x, mu_y, _, _, _ = model(X, A)
             pred = torch.stack([mu_x, mu_y], dim=-1).squeeze(0) # [12, 11, 2]
-            
-            # Denormalize
             pred_denorm = pred.cpu() * sigma + mu # [12, 11, 2]
-            
-            # Flatten row-major
-            flat_pred = pred_denorm.numpy().flatten() # [264]
+
+            flat_pred = pred_denorm.numpy().flatten() # row-major [264]
             all_traj.append([seq_id] + flat_pred.tolist())
             
     columns = ["id"] + [

@@ -5,7 +5,6 @@ from torch.utils.data import DataLoader
 from pathlib import Path
 import time
 
-# Add the 'src' directory to the python path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stgcnn.dataset import NBADataset
@@ -18,12 +17,11 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, epochs, d
     
     best_val_mse = float('inf')
     best_val_ade = float('inf')
-    
-    # Registration values for denormalization
+
     register_mu = torch.tensor([0.43076536, 0.04198149]).to(device)
     register_sigma = torch.tensor([29.67073631, 11.54754257]).to(device)
-    
-    # Check in_channels of the model to know if kinematics are used (needed for augmentation helper)
+
+    # 6 channels means kinematics (pos+vel+acc) are in use, so flips must negate them too
     in_channels = model.st_gcnn1.tcn.in_channels
     
     for epoch in range(epochs):
@@ -37,34 +35,32 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, epochs, d
             batch_start = time.time()
             X, Y, A = X.to(device), Y.to(device), A.to(device)
             
-            # Apply training-time augmentation (reflect coordinates/features)
+            # Court-symmetry augmentation: random per-sample x/y reflections.
+            # In normalized space, reflecting raw coords about 0 maps n -> -n - 2*mu/sigma;
+            # velocity/acceleration channels are differences, so they simply negate.
             if augment:
-                # Random flags for x-flip and y-flip per batch element
                 B = X.shape[0]
                 flip_x = torch.rand(B, device=device) < 0.5
                 flip_y = torch.rand(B, device=device) < 0.5
-                
+
                 X = X.clone()
                 Y = Y.clone()
-                
-                # Apply X-flip
+
                 X[flip_x, 0] = -X[flip_x, 0] - 2 * register_mu[0] / register_sigma[0]
                 Y[flip_x, ..., 0] = -Y[flip_x, ..., 0] - 2 * register_mu[0] / register_sigma[0]
                 if in_channels == 6:
-                    X[flip_x, 2] = -X[flip_x, 2] # Negate velocity
-                    X[flip_x, 4] = -X[flip_x, 4] # Negate acceleration
-                    
-                # Apply Y-flip
+                    X[flip_x, 2] = -X[flip_x, 2]
+                    X[flip_x, 4] = -X[flip_x, 4]
+
                 X[flip_y, 1] = -X[flip_y, 1] - 2 * register_mu[1] / register_sigma[1]
                 Y[flip_y, ..., 1] = -Y[flip_y, ..., 1] - 2 * register_mu[1] / register_sigma[1]
                 if in_channels == 6:
-                    X[flip_y, 3] = -X[flip_y, 3] # Negate velocity
-                    X[flip_y, 5] = -X[flip_y, 5] # Negate acceleration
-            
+                    X[flip_y, 3] = -X[flip_y, 3]
+                    X[flip_y, 5] = -X[flip_y, 5]
+
             optimizer.zero_grad()
             pred = model(X, A)
-            
-            # Extract means and compute normalized MSE loss
+
             mu_x, mu_y = pred[0], pred[1]
             mu = torch.stack([mu_x, mu_y], dim=-1)
             loss = torch.mean((mu - Y) ** 2)
@@ -102,12 +98,11 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, epochs, d
                 pred = model(X, A)
                 mu_x, mu_y = pred[0], pred[1]
                 mu = torch.stack([mu_x, mu_y], dim=-1)
-                
-                # Val loss on normalized coords
-                loss = torch.mean((mu - Y) ** 2)
+
+                loss = torch.mean((mu - Y) ** 2)  # on normalized coords
                 total_val_loss += loss.item()
-                
-                # Denormalize for physical metrics (in feet)
+
+                # denormalize to feet for the physical metrics
                 mu_denorm = mu * register_sigma + register_mu
                 Y_denorm = Y * register_sigma + register_mu
                 

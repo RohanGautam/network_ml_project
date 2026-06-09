@@ -30,47 +30,40 @@ class NBADataset(Dataset):
         self._load_data()
 
     def _load_data(self):
-        # Pre-convert registers to float32
         mu = self.register_mu.float()
         sigma = self.register_sigma.float()
-        
+
         for file_name in self.file_names:
             file_path = self.data_dir / file_name
             tensor = torch.load(file_path, weights_only=True).float()
-            
+
             num_frames = tensor.shape[0]
             for start_idx in range(0, num_frames - self.seq_len + 1):
                 window = tensor[start_idx : start_idx + self.seq_len]
                 coords = window[..., :2] # [seq_len, 11, 2]
-                
-                # Compute A based on raw coordinates (vectorized cdist)
+
+                # adjacency from raw (un-normalized) coordinates: A_ij = exp(-‖xi-xj‖)
                 X_raw = coords[:self.obs_len] # [obs_len, 11, 2]
                 dist = torch.cdist(X_raw, X_raw) # [obs_len, 11, 11]
                 A = torch.exp(-dist)
-                
-                # Normalize coordinates
+
                 if self.normalize:
                     coords_norm = (coords - mu) / sigma
                 else:
                     coords_norm = coords
-                    
+
                 if self.use_kinematics:
-                    # Calculate velocity: v_t = x_t - x_{t-1}
                     vel = torch.zeros_like(coords_norm)
                     vel[1:] = coords_norm[1:] - coords_norm[:-1]
-                    
-                    # Calculate acceleration: a_t = v_t - v_{t-1}
                     acc = torch.zeros_like(vel)
                     acc[1:] = vel[1:] - vel[:-1]
-                    
-                    # Concatenate pos, vel, acc along feature axis
                     feat = torch.cat([coords_norm[:self.obs_len], vel[:self.obs_len], acc[:self.obs_len]], dim=-1) # [obs_len, 11, 6]
                     X = feat.permute(2, 0, 1) # [6, obs_len, 11]
                 else:
                     X = coords_norm[:self.obs_len].permute(2, 0, 1) # [2, obs_len, 11]
-                    
+
                 Y = coords_norm[self.obs_len:] # [pred_len, 11, 2]
-                
+
                 self.samples.append((X, Y, A))
 
     def __len__(self):
