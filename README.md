@@ -4,7 +4,7 @@ Multi-agent trajectory prediction on NBA game data. Given 8 frames of past
 positions for 10 players and the ball, predict the next 12 frames. Scored on
 mean squared error in feet² (val/mse_ft).
 
-**Best result:** 0.70 × aug-MART + 0.30 × EqMotion ensemble → **Kaggle 2.98**
+**Best result:** 0.70 × curriculum-MART + 0.30 × EqMotion blend → **Kaggle 2.93**
 
 ---
 
@@ -58,6 +58,8 @@ network_ml_project/
 ├── submissions/        generated CSV files for Kaggle
 ├── src/
 │   ├── utils/          shared metrics, dataset download, split utilities
+│   ├── baselines/      provided non-graph temporal baseline (GRU / transformer)
+│   ├── eda/            exploratory data analysis
 │   ├── mart/           MART model — our primary architecture
 │   ├── hht_cfi/        HHT-CFI model
 │   ├── equivariance/   EqMotion model
@@ -69,13 +71,20 @@ network_ml_project/
 
 ---
 
-## Best model — MART curriculum
+## Best model — curriculum-MART × EqMotion blend
 
-The best single model is an augmented MART with curriculum training: min-ADE
-loss for the first 1000 epochs, then mean-MSE for the remaining 3000, with an
-LR drop at the switch point.
+Our best submission (**Kaggle 2.93**) is a weighted blend of two independently
+trained models:
 
-**Train on SLURM:**
+- **0.70 × curriculum-MART** — an augmented MART trained with a curriculum:
+  min-ADE loss for the first 1000 epochs, then a 4× LR drop and a fresh cosine
+  schedule for the remaining 3000.
+- **0.30 × EqMotion** — the equivariant baseline (iso-norm + cosine + hoops),
+  whose errors are partially uncorrelated with MART and so help on blend.
+
+### Step 1 — train the curriculum-MART backbone
+
+**On SLURM:**
 
 ```bash
 sbatch jobs/train_mart_4k_curriculum_sw1k_lrdrop.sh
@@ -104,16 +113,40 @@ python main_nba_pt.py \
     --gpu 0
 ```
 
-**Generate submission:**
+Then write its test predictions:
 
 ```bash
-cd src/mart
 python submit_nba_pt.py \
     --checkpoint checkpoints/mart_curriculum_4k_sw1k_lrdrop_best.ckpt \
     --test_dir ../../data/test/test \
     --out_csv ../../submissions/mart_curriculum_4k_sw1k_lrdrop.csv \
     --gpu 0
 ```
+
+### Step 2 — train the EqMotion model
+
+```bash
+cd src/equivariance
+python eqmotion_nba.py --iso-norm --add-hoops --run-name eqmotion_best
+```
+
+This writes an EqMotion submission to `submissions/` automatically. (To
+regenerate it from a saved checkpoint, use `submit_eqmotion.py --ckpt <path>
+--iso-norm`.)
+
+### Step 3 — blend the two submissions
+
+```bash
+cd src/mart
+python blend_csvs.py \
+    --inputs ../../submissions/mart_curriculum_4k_sw1k_lrdrop.csv \
+             ../../submissions/<eqmotion_submission>.csv \
+    --weights 0.70 0.30 \
+    --out ../../submissions/blend_curriculum_mart70_eqm30.csv
+```
+
+The resulting `blend_curriculum_mart70_eqm30.csv` is the **Kaggle 2.93**
+submission.
 
 ---
 
@@ -256,14 +289,31 @@ serves as a strong baseline and blends well with MART.
 
 ```bash
 cd src/equivariance
-python eqmotion_nba.py --iso-norm --add-hoops --cosine-sched --run-name eqmotion_best
+python eqmotion_nba.py --iso-norm --add-hoops --run-name eqmotion_best
+```
+
+(`--lr-scheduler` defaults to `cosine`; pass `--lr-scheduler plateau|none` to
+change it. Training writes a Kaggle submission to `submissions/` unless
+`--no-submit` is given.)
+
+**Key flags:**
+
+```
+--iso-norm           isotropic z-score normalization
+--add-hoops          inject 2 static basket nodes (court-frame structure)
+--lr-scheduler       cosine | plateau | none (default: cosine)
+--full-val           deterministic multi-window val for a stable val/mse_ft
+--ball-weight W      up-weight the ball entity in the loss
+--train-all          train on the full labelled set (no val) for the final model
+--no-submit          skip writing the Kaggle submission
 ```
 
 **Experiments:**
 
 We explored isotropic normalization, cosine LR schedule, hoop nodes, capacity
 scaling, ball-weighted loss, and multi-seed ensembles. Best single model uses
-iso-norm + cosine + hoops. The 5-seed ensemble reached Kaggle 3.2.
+iso-norm + cosine + hoops. The 5-seed ensemble (`ensemble_eqmotion.py`) reached
+Kaggle 3.2.
 
 ---
 
@@ -311,7 +361,19 @@ Spatial-Temporal Graph Convolutional Network baseline.
 
 ```bash
 cd src/stgcnn
-python train.py --iso_norm --augment
+python train.py --use_kinematics --use_edge_importance --epochs 100
+```
+
+Train-time court flips are on by default (`--no_augment` disables them). Other
+flags: `--hidden_dim`, `--lr`, `--weight_decay`, `--batch_size`, `--step_size`,
+`--gamma`, `--save_path`.
+
+**Evaluate / submit:**
+
+```bash
+python evaluate.py --model_path best_model.pt --tta --clamp
+python submit.py --model_path best_model.pt \
+    --output_csv ../../submissions/submission_stgcnn.csv
 ```
 
 ---
@@ -324,29 +386,65 @@ Dynamic NRI learns the interaction graph structure jointly with trajectories.
 
 | File | Description |
 |---|---|
-| `dnri_nba.py` | NBA adapter |
+| `dnri_nba.py` | NBA adapter — training, validation, and submission |
+| `tune_dnri.py` | Optuna hyperparameter search (writes `dnri_v1` study) |
+| `retrain_topk.py` | Retrain the top-K Optuna trials |
 | `dnri_ref/` | Upstream DNRI reference implementation |
 
 **Train:**
 
 ```bash
 cd src/dynamic
-python dnri_nba.py
+python dnri_nba.py --add-hoops --submit --run-name dnri_best
 ```
+
+Flags: `--epochs`, `--batch-size`, `--lr`, `--weight-decay`, `--add-hoops`
+(append 2 static hoop nodes), `--submit` (write a Kaggle CSV after training),
+`--smoke` (run sanity checks and exit).
+
+---
+
+### Non-graph baseline (provided pipeline)
+
+The `baselines/` folder holds the naive temporal baseline shipped with the
+project (no graph prior) — the reference point our graph models are compared
+against. It also includes the dataset/visualization utilities the rest of the
+pipeline builds on.
+
+**Files:**
+
+| File | Description |
+|---|---|
+| `ref_script.py` | Original provided pipeline: dataset, sampler, naive trainer, submission |
+| `ref_script_lightning.py` | Lightning rewrite with a `gru` / `transformer` backbone toggle |
+
+**Train (parameters are set in the `__main__` block, no CLI flags):**
+
+```bash
+cd src/baselines
+python ref_script.py            # naive temporal baseline + submission
+python ref_script_lightning.py  # GRU / transformer backbone (edit BACKBONE)
+```
+
+Both write a Kaggle submission to `submissions/` after training.
 
 ---
 
 ## Blending submissions
 
-To blend two submission CSVs (e.g. MART + EqMotion at the production weights):
+To blend two submission CSVs (e.g. curriculum-MART + EqMotion at the production
+weights):
 
 ```bash
 cd src/mart
 python blend_csvs.py \
-    --csvs ../../submissions/mart_best.csv ../../submissions/eqmotion_ensemble.csv \
+    --inputs ../../submissions/mart_curriculum_4k_sw1k_lrdrop.csv \
+             ../../submissions/eqmotion_best.csv \
     --weights 0.70 0.30 \
-    --out ../../submissions/blend_mart70_eqm30.csv
+    --out ../../submissions/blend_curriculum_mart70_eqm30.csv
 ```
+
+Weights are normalized internally; omit `--weights` for an equal-weight average.
 
 ---
 
