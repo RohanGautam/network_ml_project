@@ -82,7 +82,9 @@ class ConvTemporalGraphical(nn.Module):
         super().__init__()
         self.kernel_size = kernel_size  # number of relations K
         self.out_channels = out_channels
-        self.conv = nn.Conv2d(in_channels, out_channels * kernel_size, kernel_size=(1, 1))
+        self.conv = nn.Conv2d(
+            in_channels, out_channels * kernel_size, kernel_size=(1, 1)
+        )
 
     def forward(self, x, A):
         # x: [B, C_in, T, V]   A: [B, K, T, V, V]
@@ -97,8 +99,14 @@ class st_gcn(nn.Module):
     """Spatial-temporal graph conv block: graph conv + temporal conv + residual."""
 
     def __init__(
-        self, in_channels, out_channels, kernel_size, use_mdn=False, stride=1,
-        dropout=0, residual=True,
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        use_mdn=False,
+        stride=1,
+        dropout=0,
+        residual=True,
     ):
         super().__init__()
         assert len(kernel_size) == 2
@@ -110,7 +118,9 @@ class st_gcn(nn.Module):
         self.tcn = nn.Sequential(
             nn.BatchNorm2d(out_channels),
             nn.PReLU(),
-            nn.Conv2d(out_channels, out_channels, (kernel_size[0], 1), (stride, 1), padding),
+            nn.Conv2d(
+                out_channels, out_channels, (kernel_size[0], 1), (stride, 1), padding
+            ),
             nn.BatchNorm2d(out_channels),
             nn.Dropout(dropout, inplace=True),
         )
@@ -137,8 +147,16 @@ class st_gcn(nn.Module):
 
 class social_stgcnn(nn.Module):
     def __init__(
-        self, n_stgcnn=1, n_txpcnn=1, input_feat=2, hidden_feat=5, output_feat=5,
-        seq_len=8, pred_seq_len=12, kernel_size=3, n_relations=1,
+        self,
+        n_stgcnn=1,
+        n_txpcnn=1,
+        input_feat=2,
+        hidden_feat=5,
+        output_feat=5,
+        seq_len=8,
+        pred_seq_len=12,
+        kernel_size=3,
+        n_relations=1,
     ):
         super().__init__()
         self.n_stgcnn = n_stgcnn
@@ -151,7 +169,9 @@ class social_stgcnn(nn.Module):
         self.st_gcns = nn.ModuleList()
         self.st_gcns.append(st_gcn(input_feat, hidden_feat, (kernel_size, n_relations)))
         for _ in range(1, self.n_stgcnn):
-            self.st_gcns.append(st_gcn(hidden_feat, hidden_feat, (kernel_size, n_relations)))
+            self.st_gcns.append(
+                st_gcn(hidden_feat, hidden_feat, (kernel_size, n_relations))
+            )
 
         self.tpcnns = nn.ModuleList()
         self.tpcnns.append(nn.Conv2d(seq_len, pred_seq_len, 3, padding=1))
@@ -175,7 +195,9 @@ class social_stgcnn(nn.Module):
         for k in range(1, self.n_txpcnn - 1):
             v = self.prelus[k](self.tpcnns[k](v)) + v
         v = self.tpcnn_ouput(v)
-        v = v.view(v.shape[0], v.shape[2], v.shape[1], v.shape[3])  # [B, hidden, pred, N]
+        v = v.view(
+            v.shape[0], v.shape[2], v.shape[1], v.shape[3]
+        )  # [B, hidden, pred, N]
         v = self.output_proj(v)  # [B, output_feat, pred, N]
         return v, a
 
@@ -223,14 +245,23 @@ class stgcnn_autoreg(nn.Module):
     """ST-GCN encoder over the observed window + autoregressive graph decoder."""
 
     def __init__(
-        self, n_stgcnn=2, input_feat=4, hidden_feat=64, output_feat=5,
-        seq_len=8, pred_seq_len=12, kernel_size=3, n_relations=1,
+        self,
+        n_stgcnn=2,
+        input_feat=4,
+        hidden_feat=64,
+        output_feat=5,
+        seq_len=8,
+        pred_seq_len=12,
+        kernel_size=3,
+        n_relations=1,
     ):
         super().__init__()
         self.st_gcns = nn.ModuleList()
         self.st_gcns.append(st_gcn(input_feat, hidden_feat, (kernel_size, n_relations)))
         for _ in range(1, n_stgcnn):
-            self.st_gcns.append(st_gcn(hidden_feat, hidden_feat, (kernel_size, n_relations)))
+            self.st_gcns.append(
+                st_gcn(hidden_feat, hidden_feat, (kernel_size, n_relations))
+            )
         self.decoder = GraphGRUDecoder(hidden_feat, pred_seq_len, output_feat)
 
     def forward(self, X, A, last_pos):
@@ -299,7 +330,7 @@ def bivariate_loss(V_pred: Tensor, V_trgt: Tensor) -> Tensor:
 
     sxsy = sx * sy
     z = (normx / sx) ** 2 + (normy / sy) ** 2 - 2 * ((corr * normx * normy) / sxsy)
-    negRho = 1 - corr ** 2
+    negRho = 1 - corr**2
 
     result = torch.exp(-z / (2 * negRho))
     denom = 2 * torch.pi * (sxsy * torch.sqrt(negRho))
@@ -325,7 +356,7 @@ def sample_displacements(V_pred: Tensor, k: int) -> Tensor:
     mean, sx, sy, corr = gaussian_params(V_pred)
     l11 = sx
     l21 = corr * sy
-    l22 = sy * torch.sqrt(torch.clamp(1 - corr ** 2, min=1e-6))
+    l22 = sy * torch.sqrt(torch.clamp(1 - corr**2, min=1e-6))
     eps = torch.randn((k,) + mean.shape, device=V_pred.device)  # [K, B, T, N, 2]
     s_x = l11 * eps[..., 0]
     s_y = l21 * eps[..., 0] + l22 * eps[..., 1]
@@ -416,7 +447,9 @@ class NBASampler(Sampler):
         perm_start = [(i, self.max_start[i]) for i in perm]
         for k in range(0, n, self.batch_size):
             for idx, max_start in perm_start[k : k + self.batch_size]:
-                start = torch.randint(0, max_start + 1, size=(), generator=self.generator)
+                start = torch.randint(
+                    0, max_start + 1, size=(), generator=self.generator
+                )
                 yield idx, start
 
     def __len__(self):
@@ -441,7 +474,7 @@ class NBASTGCNNLightningModel(L.LightningModule):
         lr: float = 1e-3,
         weight_decay: float = 0.0,
         n_samples: int = 20,
-        loss_mode: str = "mse",   # "mse" | "nll" | "nll+mse"
+        loss_mode: str = "mse",  # "mse" | "nll" | "nll+mse"
         mse_weight: float = 1.0,  # λ on the MSE term in "nll+mse"
         decoder: str = "autoreg",  # "txp" (one-shot) | "autoreg" (graph rollout)
         augment: bool = True,  # random court-symmetry reflections (train only)
@@ -490,7 +523,9 @@ class NBASTGCNNLightningModel(L.LightningModule):
         B = V_pred.shape[0]
         comps = {}
         if self.hparams.loss_mode in ("nll", "nll+mse"):
-            comps["nll"] = bivariate_loss(V_pred.reshape(B, -1, 5), V_tr.reshape(B, -1, 2))
+            comps["nll"] = bivariate_loss(
+                V_pred.reshape(B, -1, 5), V_tr.reshape(B, -1, 2)
+            )
         if self.hparams.loss_mode in ("mse", "nll+mse"):
             abs_pred = self._abs_mean(V_pred, last_pos)
             comps["mse"] = ((abs_pred - abs_target) ** 2).mean()
@@ -547,9 +582,24 @@ class NBASTGCNNLightningModel(L.LightningModule):
         target_flat = abs_target.permute(1, 0, 2, 3).reshape(T, B * N, 2)
 
         self.log("val/loss", loss, on_epoch=True, prog_bar=True)
-        self.log("val/ade_ft", compute_ade(pred_flat, target_flat), on_epoch=True, prog_bar=True)
-        self.log("val/fde_ft", compute_fde(pred_flat, target_flat), on_epoch=True, prog_bar=True)
-        self.log("val/mse_ft", compute_mse(pred_flat, target_flat), on_epoch=True, prog_bar=True)
+        self.log(
+            "val/ade_ft",
+            compute_ade(pred_flat, target_flat),
+            on_epoch=True,
+            prog_bar=True,
+        )
+        self.log(
+            "val/fde_ft",
+            compute_fde(pred_flat, target_flat),
+            on_epoch=True,
+            prog_bar=True,
+        )
+        self.log(
+            "val/mse_ft",
+            compute_mse(pred_flat, target_flat),
+            on_epoch=True,
+            prog_bar=True,
+        )
 
         # Best-of-K metrics only make sense when the Gaussian head is trained.
         if "nll" in self.hparams.loss_mode:
@@ -557,9 +607,21 @@ class NBASTGCNNLightningModel(L.LightningModule):
             disp_samples = sample_displacements(V_pred, k)  # [K, B, T, N, 2]
             abs_samples = rel_to_abs(disp_samples, last_pos.unsqueeze(0), time_dim=2)
             samples_flat = abs_samples.permute(0, 2, 1, 3, 4).reshape(k, T, B * N, 2)
-            self.log(f"val/min_ade_ft_k{k}", compute_min_ade(samples_flat, target_flat), on_epoch=True)
-            self.log(f"val/min_fde_ft_k{k}", compute_min_fde(samples_flat, target_flat), on_epoch=True)
-            self.log(f"val/min_mse_ft_k{k}", compute_min_mse(samples_flat, target_flat), on_epoch=True)
+            self.log(
+                f"val/min_ade_ft_k{k}",
+                compute_min_ade(samples_flat, target_flat),
+                on_epoch=True,
+            )
+            self.log(
+                f"val/min_fde_ft_k{k}",
+                compute_min_fde(samples_flat, target_flat),
+                on_epoch=True,
+            )
+            self.log(
+                f"val/min_mse_ft_k{k}",
+                compute_min_mse(samples_flat, target_flat),
+                on_epoch=True,
+            )
 
         self._log_diagnostics(X, last_pos, abs_pred, abs_target)
 
@@ -591,11 +653,13 @@ class NBASTGCNNLightningModel(L.LightningModule):
     def configure_optimizers(self):
         if self.hparams.optimizer == "adam":
             return torch.optim.Adam(
-                self.parameters(), lr=self.hparams.lr,
+                self.parameters(),
+                lr=self.hparams.lr,
                 weight_decay=self.hparams.weight_decay,
             )
         return torch.optim.SGD(
-            self.parameters(), lr=self.hparams.lr,
+            self.parameters(),
+            lr=self.hparams.lr,
             weight_decay=self.hparams.weight_decay,
         )
 
@@ -623,7 +687,9 @@ class NBASTGCNNLightningModel(L.LightningModule):
             for ax in axes:
                 Xf[:, ax] = -Xf[:, ax]
                 lp[:, :, ax] = -lp[:, :, ax]
-            ap = self._abs_mean(self(Xf, A, lp), lp)  # [B, pred, N, 2] in reflected frame
+            ap = self._abs_mean(
+                self(Xf, A, lp), lp
+            )  # [B, pred, N, 2] in reflected frame
             for ax in axes:
                 ap[..., ax] = -ap[..., ax]
             preds.append(ap)
@@ -634,8 +700,15 @@ class NBASTGCNNLightningModel(L.LightningModule):
 
 
 class NBADataModule(L.LightningDataModule):
-    def __init__(self, split_path, batch_size=128, context_size=8, horizon_size=12,
-                 seed=0, graph_space="pos"):
+    def __init__(
+        self,
+        split_path,
+        batch_size=128,
+        context_size=8,
+        horizon_size=12,
+        seed=0,
+        graph_space="pos",
+    ):
         super().__init__()
         self.split_path = split_path
         self.batch_size = batch_size
@@ -660,7 +733,9 @@ class NBADataModule(L.LightningDataModule):
         sampler = NBASampler(
             self.batch_size, self.train_dataset.max_start, seed=self.seed, shuffle=True
         )
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, sampler=sampler)
+        return DataLoader(
+            self.train_dataset, batch_size=self.batch_size, sampler=sampler
+        )
 
     def val_dataloader(self):
         sampler = NBASampler(
@@ -675,13 +750,19 @@ class NBADataModule(L.LightningDataModule):
         c = self.context_size
         rel_obs = torch.zeros_like(abs_obs)
         rel_obs[1:] = abs_obs[1:] - abs_obs[:-1]
-        A = build_graph(abs_obs, rel_obs, self.graph_space).unsqueeze(0)  # [1, R, obs, N, N]
+        A = build_graph(abs_obs, rel_obs, self.graph_space).unsqueeze(
+            0
+        )  # [1, R, obs, N, N]
         static_obs = static.unsqueeze(0).expand(rel_obs.shape[0], -1, -1)  # [obs, N, 2]
-        X = torch.cat([rel_obs, static_obs], dim=-1).permute(2, 0, 1).unsqueeze(0)  # [1,4,obs,N]
+        X = (
+            torch.cat([rel_obs, static_obs], dim=-1).permute(2, 0, 1).unsqueeze(0)
+        )  # [1,4,obs,N]
         last_pos = abs_obs[c - 1].unsqueeze(0)  # [1, N, 2]
         return model.predict_abs_mean(X, A, last_pos)[0]  # [pred, N, 2]
 
-    def get_kaggle_submission(self, model, test_dir: str, target_dir: str, tta: bool = False):
+    def get_kaggle_submission(
+        self, model, test_dir: str, target_dir: str, tta: bool = False
+    ):
         # Court-symmetry reflections (negate coord(s)); reflection is an isometry
         # so this is exact. For TTA we average the un-reflected predictions.
         flips = [(), (0,), (1,), (0, 1)] if tta else [()]
@@ -740,10 +821,14 @@ def eval_tta_and_submit(model, data_module, logger=None):
         se_tta += ((tta - abs_target) ** 2).sum().item()
         n += abs_target.numel()
     use_tta = (se_tta / n) < (se_plain / n)
-    print(f"[val] mse_ft plain={se_plain / n:.4f}  tta={se_tta / n:.4f}  -> submit tta={use_tta}")
+    print(
+        f"[val] mse_ft plain={se_plain / n:.4f}  tta={se_tta / n:.4f}  -> submit tta={use_tta}"
+    )
     if logger is not None:
         logger.experiment.summary["val/mse_ft_tta"] = se_tta / n
-    data_module.get_kaggle_submission(model, str(TEST_DIR), str(SUBMISSION_DIR), tta=use_tta)
+    data_module.get_kaggle_submission(
+        model, str(TEST_DIR), str(SUBMISSION_DIR), tta=use_tta
+    )
 
 
 if __name__ == "__main__":
@@ -751,7 +836,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--ckpt", type=str, default=None,
+        "--ckpt",
+        type=str,
+        default=None,
         help="Eval-only: load this checkpoint, run plain-vs-TTA val comparison + submission (no training).",
     )
     args = parser.parse_args()
@@ -781,8 +868,11 @@ if __name__ == "__main__":
     )
 
     model = NBASTGCNNLightningModel(
-        loss_mode="mse", optimizer="adam", graph_space=GRAPH_SPACE,
-        decoder="autoreg", augment=False,  # aug didn't help (not overfitting)
+        loss_mode="mse",
+        optimizer="adam",
+        graph_space=GRAPH_SPACE,
+        decoder="autoreg",
+        augment=False,  # aug didn't help (not overfitting)
     )
 
     h = model.hparams
