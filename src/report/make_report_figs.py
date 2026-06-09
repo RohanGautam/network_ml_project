@@ -108,6 +108,8 @@ print(f"[fig4] window {idx}: ball travel {travel[idx]:.1f} ft, K-endpoint spread
 
 fig, ax = plt.subplots(figsize=(7.8, 4.4))
 setup_court(ax)
+# Convention: solid line = past context (leads INTO the dot), dot = position at
+# the prediction instant t=C, dashed/fan = future (leads OUT of the dot).
 # Players first, de-emphasized, so the ball reads as the focus.
 for n in range(11):
     if n == BALL:
@@ -117,7 +119,7 @@ for n in range(11):
     ax.plot(p[:, 0], p[:, 1], "-", color=col, lw=1.3, alpha=0.55, zorder=2)
     ax.plot([p[-1, 0], g[0, 0]], [p[-1, 1], g[0, 1]], "-", color=col, lw=1.3, alpha=0.55, zorder=2)
     ax.plot(g[:, 0], g[:, 1], "--", color=col, lw=1.3, alpha=0.55, zorder=2)
-    ax.scatter(p[0, 0], p[0, 1], s=14, color=col, alpha=0.7, zorder=3)
+    ax.scatter(p[-1, 0], p[-1, 1], s=16, color=col, alpha=0.8, zorder=3)            # present (t=C)
 
 # Ball: faint orange K modes underneath, then bold context + GT on top.
 for k in range(kpreds_ft.shape[2]):
@@ -127,18 +129,21 @@ pb = to_display(past_ft[idx, BALL]); gb = to_display(tgt_ft[idx, BALL])
 ax.plot(pb[:, 0], pb[:, 1], "-", color="k", lw=2.4, zorder=6)                      # ball context
 ax.plot([pb[-1, 0], gb[0, 0]], [pb[-1, 1], gb[0, 1]], "--", color="k", lw=2.4, zorder=6)
 ax.plot(gb[:, 0], gb[:, 1], "--", color="k", lw=2.4, zorder=6)                     # ball GT future
-ax.scatter(pb[0, 0], pb[0, 1], s=45, color="k", zorder=7, label="_")              # ball start
+ax.scatter(pb[-1, 0], pb[-1, 1], s=60, color="k", zorder=7,                        # ball present (t=C)
+           marker="o", edgecolors="white", linewidths=1.2)
 
 handles = [
-    plt.Line2D([0], [0], color="k", lw=2.2, ls="-", label="ball: context"),
+    plt.Line2D([0], [0], marker="o", color="k", lw=0, markersize=7,
+               markeredgecolor="white", label="position at $t{=}C$"),
+    plt.Line2D([0], [0], color="k", lw=2.2, ls="-", label="ball: past"),
     plt.Line2D([0], [0], color="k", lw=2.2, ls="--", label="ball: actual future"),
     plt.Line2D([0], [0], color="#FB8C00", lw=1.4, alpha=0.7, label="ball: 20 predicted modes"),
-    plt.Line2D([0], [0], color="#E53935", lw=1.4, alpha=0.7, label="Team A (faded)"),
-    plt.Line2D([0], [0], color="#1E88E5", lw=1.4, alpha=0.7, label="Team B (faded)"),
+    plt.Line2D([0], [0], color="#E53935", lw=1.4, alpha=0.7, label="Team A"),
+    plt.Line2D([0], [0], color="#1E88E5", lw=1.4, alpha=0.7, label="Team B"),
 ]
 ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.18),
           ncol=3, frameon=False, fontsize=8)
-ax.set_title("Players are near-deterministic; the ball fans across plausible pass targets")
+ax.set_title("Players move predictably; the ball fans across plausible futures")
 fig.tight_layout()
 fig.savefig(OUT / "fig4.png", dpi=200, bbox_inches="tight")
 plt.close(fig)

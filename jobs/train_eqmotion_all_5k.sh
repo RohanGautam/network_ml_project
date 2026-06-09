@@ -34,7 +34,7 @@ python src/equivariance/eqmotion_nba.py \
     --run-name "$NAME" \
     --iso-norm --add-hoops \
     --train-all \
-    --max-epochs 5000
+    --max-epochs 1000
 
 # Preserve checkpoints AND submissions in $HOME (scratch is wiped by the next
 # job's rsync --delete).

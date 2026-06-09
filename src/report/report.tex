@@ -9,6 +9,7 @@
 \usepackage{url}
 \usepackage{graphicx}
 \usepackage{booktabs}
+\usepackage{multirow}
 
 
 \title{Graph-Based Methods for Multi-Agent\\ NBA Trajectory Forecasting}
@@ -37,7 +38,7 @@ EPFL, Spring 2025/2026 \\
 \maketitle
 
 \begin{abstract}
-% 1 paragraph: task (NBA C=8 -> H=12, single-shot mean-MSE / ADE); we sweep the
+% 1 paragraph: task (NBA C=8 -> H=12, single-shot mean MSE); we sweep the
 % graph taxonomy but the paper centers on TWO winners -- EqMotion (exactly
 % O(2)-equivariant) and augmented MART (soft O(2) invariance via augmentation);
 % headline = 0.70 aug-MART + 0.30 EqMotion blend, Kaggle 2.98; central insight =
@@ -64,11 +65,13 @@ EPFL, Spring 2025/2026 \\
 %   unlabelled); Kaggle as external reference. Metric hygiene (see 4.1).
 % The metric (positions only, single-shot) is:
 \begin{equation}
-\label{eq:ade}
-\mathrm{ADE} = \frac{1}{H\times N}\sum_{t=C+1}^{C+H}\sum_{n}
+\label{eq:mse}
+\mathrm{MSE} = \frac{1}{H\times N}\sum_{t=C+1}^{C+H}\sum_{n}
 \big\lVert \hat{z}^n_t - z^n_t \big\rVert_2^2,
 \qquad \hat{z}^n_t, z^n_t \in \mathbb{R}^2 .
 \end{equation}
+% NB: the proposal/Kaggle call this "ADE", but the formula is mean SQUARED error
+% (a squared L2, not a displacement). We refer to it as MSE for accuracy.
 
 \section{Method}
 \label{sec:method}
@@ -102,38 +105,25 @@ EPFL, Spring 2025/2026 \\
 \section{Results}
 \label{sec:results}
 
-All numbers are \texttt{val/mse\_ft}: the single-shot mean squared error in
-feet$^2$ over the $H{=}12$ horizon, evaluated on the 11 real entities of the
-held-out validation fold (497 sequences), matching the Kaggle ADE definition
-(Eq.~\ref{eq:ade}). We report Kaggle scores where a submission was made.
-
-\subsection{Setup \& metric hygiene}
-\label{sec:hygiene}
-Before comparing models we fixed two measurement artifacts, each of which moved
-the apparent error by $0.2$--$0.5$~ft$^2$. \textbf{(i)~Window noise:} drawing one
-random window per sequence per epoch made \texttt{val/mse\_ft} bounce between
-$3.2$ and $3.9$ across epochs, so checkpoint-on-minimum selected lucky draws; a
-deterministic sampler with 8 evenly-spaced windows per sequence gives a stable
-selection signal. \textbf{(ii)~Landmark deflation:} when the static hoop nodes
-(Sec.~\ref{sec:eqmotion}) are added, naively averaging over all 13 nodes includes
-two near-zero-error stationary hoops and deflates the metric
-($2.82\times13/11=3.33$); a landmark-aware metric strips them so it matches the
-11-entity Kaggle score. After both fixes the validation metric tracks Kaggle
-closely (e.g.\ $3.33$ val vs $3.2$ Kaggle), and the validation$\rightarrow$Kaggle
-gap is consistently favorable ($\sim{+}0.08$, val is slightly pessimistic), so we
-treat the local fold as a trustworthy selector.
-
-% FIGURE 1 -- export from wandb: overlay val/mse_ft vs epoch for the noisy
-% single-window run vs the deterministic --full-val run (two lines). Shows the
-% selection signal stabilizing. Optional; cut first if space is tight.
+All numbers are \texttt{val/mse\_ft}: single-shot mean squared error (feet$^2$,
+$H{=}12$) on the 11 real entities of the held-out fold (497 sequences), matching
+the Kaggle metric (Eq.~\ref{eq:mse}; the proposal labels it ``ADE'' but it is an
+MSE). Two fixes make the fold a reliable selector: a deterministic multi-window
+sampler in place of a noisy single-window draw, and a metric that excludes the
+static hoop nodes (Sec.~\ref{sec:eqmotion}) from the average. The
+val$\rightarrow$Kaggle gap is then consistent ($\sim{+}0.08$, val slightly
+pessimistic).
 
 \subsection{Main comparison}
 \label{sec:main-results}
 Table~\ref{tab:main} collects the families we explored. Two patterns stand out.
-First, every graph model that predicts a single trajectory beats the non-graph
-temporal baseline, while the multimodal generative models (STGCNN-CVAE,
-SocialVAE) \emph{lose}: they optimise best-of-$K$ (minADE), whereas the leaderboard
-scores a single-shot mean, which rewards predicting the conditional mean.
+First, the strong point predictors (STGCNN, EqMotion, MART) beat the non-graph
+transformer baseline, but graph structure alone is not enough: the
+learned-dynamic-graph dNRI ($\sim$5.5) barely edges the baseline, and the
+multimodal VAEs (STGCNN-CVAE, SocialVAE) trail the point predictors. The metric
+rewards the conditional mean, and MART -- though trained with a best-of-$K$
+(minADE) loss like the VAEs -- recovers that mean by averaging its $K$ diverse
+heads (mean-of-$K$), whereas the sampled VAE outputs estimate it less well.
 Second, our two strongest models come from opposite ends of the equivariance
 spectrum (Sec.~\ref{sec:tradeoff}): the exactly-O(2)-equivariant EqMotion and the
 non-equivariant augmented MART. The augmented MART backbone alone
@@ -144,15 +134,19 @@ $0.70$\,/\,$0.30$ blend of the two is our production submission at
 \begin{table}[t]
 \caption{Main comparison across model families. Lower is better; \texttt{val}
 is feet$^2$ on the held-out fold, \texttt{Kaggle} is the public leaderboard.
-The production blend combines the two best models (Sec.~\ref{sec:tradeoff}).}
+STGCNN, EqMotion and MART are Optuna-tuned (Appendix~\ref{sec:hp}); the STGCNN
+entry is its tuned top-5 retrain + TTA ensemble. The production blend combines
+the two best models (Sec.~\ref{sec:tradeoff}).}
 \label{tab:main}
 \begin{center}
 \begin{tabular}{llcc}
 \toprule
 \textbf{Family} & \textbf{Model} & \textbf{val} & \textbf{Kaggle} \\
 \midrule
-Non-graph        & Temporal baseline                 & $\sim$3.7 & -- \\
-Fixed graph      & STGCNN (pos.\ graph + autoreg.)   & $\sim$3.8 & -- \\
+Non-graph        & Transformer + velocity            & $\sim$5.8 & 5.79 \\
+Fixed graph      & STGCNN (tuned, TTA ensemble)      & $\sim$3.8 & -- \\
+Dynamic graph    & dNRI (learned, single)            & $\sim$5.5 & 5.48 \\
+Dynamic graph    & dNRI (learned, ensemble)          & $\sim$5.3 & 5.22 \\
 Multimodal       & STGCNN-CVAE                       & 4.3       & -- \\
 Multimodal       & SocialVAE                         & 5.0       & -- \\
 Hypergraph       & MART (300 ep, fair baseline)      & 3.79      & -- \\
@@ -169,11 +163,18 @@ Hypergraph       & \quad + D2 test-time augmentation & 3.08      & -- \\
 
 \subsection{Ablations on the winners}
 \label{sec:ablations}
+All three models in this section have their
+architecture and optimization hyperparameters chosen by Optuna (TPE) studies
+rather than by hand; full search spaces, selection metrics and winning
+configurations are in Appendix~\ref{sec:hp}.
+
 \textbf{What the symmetry buys (EqMotion).} Starting from an anisotropically
 normalized baseline ($3.69$), isotropic normalization, which restores exact O(2)
 equivariance, drops the error to $3.46$, and adding the two court-frame hoop
 nodes drops it further to $3.33$ -- the single biggest structural lever
-(Table~\ref{tab:abl}, left). Hoops are the \emph{right amount} of court
+(Table~\ref{tab:abl}, left). These deltas are on top of an Optuna-tuned EqMotion
+configuration, and the top trials were statistically tied, so the structural
+levers (normalization, hoops), not the continuous hyperparameters, dominate. Hoops are the \emph{right amount} of court
 structure: adding free-throw lines, three-point apexes or corners all hurt
 monotonically (e.g.\ $3.33\rightarrow3.36\rightarrow3.42$), because those points
 sit on the basket axis already encoded by the hoops and merely dilute message
@@ -188,17 +189,17 @@ EqMotion cannot: scale. Table~\ref{tab:abl} (right) shows error falling
 monotonically as the schedule lengthens ($3.79\rightarrow3.55\rightarrow
 3.47\rightarrow3.11$) with a 7.5M-parameter model that shows \emph{zero}
 overfitting (train$\,\approx\,$val$\,\approx\,0.026$). Two diagnostics confirm
-$3.11$ is a genuine model/data floor rather than a tuning artifact: budget-matched
-SGDR warm restarts tie it ($3.116$), and a 10k-epoch single-cosine run does not
-beat it. The remaining free gains come from variance reduction orthogonal to the
+$3.11$ is a model/data floor rather than a tuning artifact: budget-matched SGDR
+warm restarts tie it ($3.116$), and a 10k-epoch single-cosine run does not beat
+it. The remaining free gains come from variance reduction orthogonal to the
 backbone: D2 test-time augmentation ($-0.03$, and its non-zero per-transform
 spread \emph{measures} aug-MART's departure from exact equivariance) and the
 EqMotion blend ($-0.04$).
 
 \begin{table}[t]
 \caption{Ablations on the two winning models. \textbf{Left:} EqMotion structural
-levers (honest 11-entity metric). \textbf{Right:} augmented MART scaling --
-augmentation is what lets the larger model and longer schedule pay off.}
+levers. \textbf{Right:} augmented MART scaling -- augmentation is what lets the
+larger model and longer schedule pay off.}
 \label{tab:abl}
 \begin{center}
 \begin{tabular}{lc@{\hspace{2.5em}}lc}
@@ -250,16 +251,15 @@ learned per-agent head selector (re-run on the \emph{best} model, still only
 $-5\%$), possession-anchoring (the ground-truth-handler oracle is $2\times$
 \emph{worse} than the model), constant-velocity physics ($61.6$, the ball is
 strongly non-ballistic), residual boosting, and direct \texttt{mean\_mse}
-regression -- the ball MSE never leaves the $13$--$14$~ft$^2$ band. The
-\texttt{mean\_mse} run is decisive (Fig.~\ref{fig:loss}): optimising the
-single-shot target directly \emph{overfits} (best $3.20$ then climbing to $3.58$)
-and loses to $3.11$, so the head-averaged conditional mean is already the
-best-regularized estimator.
-This also closes the generative lever: any point-estimate generative model
-(MDN, flow-matching, diffusion) must submit the conditional mean under a
-single-shot mean-MSE metric, and that target cannot beat $3.11$. The published
-MoFlow/SocialVAE NBA wins are all on minADE (best-of-$K$), which our metric
-structurally cannot exploit. The residual error is thus irreducible ball
+regression -- the ball MSE never leaves the $13$--$14$~ft$^2$ band. Direct
+\texttt{mean\_mse} regression is the clearest case (Fig.~\ref{fig:loss}):
+optimising the single-shot target overfits (best $3.20$, then climbing to $3.58$)
+and loses to $3.11$, so MART's head-averaged mean is the better-regularized
+estimate of the conditional mean. This also bounds generative models: any
+point-estimate model (MDN, flow-matching, diffusion) submits the conditional mean
+under a single-shot metric, and that target cannot beat $3.11$. Published
+MoFlow/SocialVAE NBA results report best-of-$K$ (minADE) over many samples -- a
+protocol our single-submission setup cannot use. The residual error is thus irreducible ball
 multimodality -- which player receives the pass, and when -- that an 8-frame past
 simply does not determine (Fig.~\ref{fig:play}); an oracle that picks the best of
 MART's $K$ heads per sample reaches $0.45$~ft$^2$, but the winning mode sits in the
@@ -299,11 +299,10 @@ is a property of the data, not of either model.}
 \begin{center}
 \includegraphics[width=0.92\linewidth]{fig4.png}
 \end{center}
-\caption{One play. Players (faded) follow near-deterministic paths the model
-recovers tightly, but the ball's $K{=}20$ predicted modes (orange) fan out toward
-distinct plausible pass targets, only one of which is realized (black dashed).
-The mean of these modes is far from every one of them -- the source of the
-irreducible ball error.}
+\caption{One play (context solid, future dashed, dot $=$ position at $t{=}C$).
+Players follow paths the model recovers tightly; the ball's $K{=}20$ modes
+(orange) fan toward distinct futures, only one realized (black). Their mean is far
+from each -- the source of the ball error.}
 \label{fig:play}
 \end{figure}
 
@@ -317,7 +316,76 @@ irreducible ball error.}
 \appendix
 \section{Appendix}
 \label{sec:appendix}
-% Extra tables, hyperparameters, reproducibility details.
+
+\subsection{Hyperparameter search}
+\label{sec:hp}
+The three tuned models (STGCNN, EqMotion, MART) each use an Optuna study with a
+TPE sampler and SQLite-backed persistence; the per-model search spaces, budgets
+and selection metrics are in Table~\ref{tab:hp}. Two protocol details matter for
+interpreting the results. (i)~\textbf{STGCNN} is tuned directly on the Kaggle
+metric \texttt{val/mse\_ft} with median pruning (60 trials, 50 epochs each); the
+top-5 trials are then retrained at 250 epochs and combined with court-symmetry
+test-time augmentation into the single ensemble reported in
+Table~\ref{tab:main}. (ii)~\textbf{MART}'s search is ranked by the \emph{last}
+epoch's mean-of-$K$ error rather than the best epoch (to avoid double-dipping the
+validation signal) with no pruner, followed by a 100-epoch retrain of the
+winning configuration. \textbf{EqMotion} is pruned on \texttt{val/loss} with a
+median pruner (40 trials, 50 epochs); its top trials were statistically tied
+(val/loss $0.0134$--$0.0135$), confirming the model is insensitive to these
+knobs within range and that the structural levers in Sec.~\ref{sec:ablations}
+are what move the metric. The augmented 7.5M MART backbone
+(Sec.~\ref{sec:augmart}) is a deliberately hand-scaled configuration, not an
+Optuna output.
+
+\begin{table}[h]
+\caption{Optuna search spaces. ``cat'' = categorical choice set, ``log'' =
+log-uniform continuous range.}
+\label{tab:hp}
+\begin{center}
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Model} & \textbf{Searched hyperparameter} & \textbf{Range / choices} \\
+\midrule
+\multirow{8}{*}{EqMotion}
+ & hidden\_nf            & cat $\{32, 64, 128, 256\}$ \\
+ & hid\_channel         & cat $\{8, 16, 32, 64\}$ \\
+ & n\_layers            & int $[2, 5]$ \\
+ & learning rate        & log $[10^{-4}, 10^{-2}]$ \\
+ & weight decay         & log $[10^{-6}, 10^{-2}]$ \\
+ & batch size           & cat $\{32, 64, 128\}$ \\
+ & gradient clip        & $[0.25, 2.0]$ \\
+\cmidrule(l){2-3}
+ & \emph{selection / budget} & val/loss, median pruning, 40 trials $\times$ 50 ep \\
+\midrule
+\multirow{8}{*}{MART}
+ & learning rate        & log $[10^{-4}, 10^{-3}]$ \\
+ & weight decay         & log $[10^{-10}, 10^{-4}]$ \\
+ & dropout              & cat $\{0.0, 0.1, 0.2\}$ \\
+ & num\_layers          & cat $\{2, 3, 4\}$ \\
+ & model\_dim           & cat $\{32, 64, 128\}$ \\
+ & hidden\_dim          & cat $\{64, 128, 256\}$ \\
+ & decoder\_hidden\_dim & cat $\{64, 128, 256\}$ \\
+\cmidrule(l){2-3}
+ & \emph{selection / budget} & last-epoch mean-$K$ MSE, no pruner, 40 $\times$ 80 ep, retrain 100 ep \\
+\midrule
+\multirow{11}{*}{STGCNN}
+ & graph\_space         & cat $\{$pos, vel, both$\}$ \\
+ & decoder              & cat $\{$autoreg, txp$\}$ \\
+ & n\_stgcnn            & int $[1, 3]$ \\
+ & hidden\_feat         & cat $\{32, 64, 128\}$ \\
+ & kernel\_size         & cat $\{3, 5\}$ \\
+ & n\_txpcnn            & cat $\{3, 5, 7\}$ \\
+ & learning rate        & log $[10^{-4}, 3\!\times\!10^{-3}]$ \\
+ & weight decay         & log $[10^{-7}, 10^{-3}]$ \\
+ & batch size           & cat $\{64, 128, 256\}$ \\
+ & augmentation         & cat $\{$on, off$\}$ \\
+\cmidrule(l){2-3}
+ & \emph{selection / budget} & val/mse\_ft, median pruning, 60 $\times$ 50 ep, top-5 retrain @250 ep + TTA \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
 
 \iffalse
 % ====== ORIGINAL ICLR FORMATTING TEMPLATE (kept for reference) ======
