@@ -22,7 +22,6 @@ import lightning as L
 import pandas as pd
 import torch
 import torch.nn as nn
-from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.loggers import WandbLogger
 from torch import Tensor
 from torch.utils.data import Dataset, DataLoader, Sampler
@@ -154,15 +153,6 @@ class NBADNRILightningModel(L.LightningModule):
     def _full_window(self, X: Tensor, y: Tensor) -> Tensor:
         return torch.cat([self._strip_static(X), self._strip_static(y)], dim=1)
 
-        # def training_step(self, batch, batch_idx):
-        #     X, y = batch
-        #     inputs = self._full_window(X, y)  # [B, C+H, N, 4]
-        #     loss, loss_nll, loss_kl = self.net.training_loss(inputs)
-        #     self.log("train/loss", loss, on_epoch=True, prog_bar=True)
-        #     self.log("train/nll", loss_nll.mean(), on_epoch=True)
-        #     self.log("train/kl", loss_kl.mean(), on_epoch=True)
-        # return loss
-
     def training_step(self, batch, batch_idx):
         X, y = batch
 
@@ -245,13 +235,7 @@ class NBADNRILightningModel(L.LightningModule):
             lr=self.hparams.lr,
             weight_decay=self.hparams.weight_decay,
         )
-        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        #     optimizer, mode="min", factor=0.5, patience=18, min_lr=1e-6
-        # )
-        return {
-            "optimizer": optimizer,
-            # "lr_scheduler": {"scheduler": scheduler, "monitor": "val/loss"},
-        }
+        return {"optimizer": optimizer}
 
     @torch.no_grad()
     def get_trajectory(self, X: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
@@ -426,7 +410,6 @@ def train(args):
         weight_decay=args.weight_decay,
     )
 
-    # callbacks = [EarlyStopping(monitor="val/loss", patience=100, mode="min")]
     if args.wandb:
         logger = WandbLogger(project="NML_base", name=args.run_name or "dnri")
     else:
@@ -437,7 +420,6 @@ def train(args):
         logger=logger,
         accelerator="auto",
         gradient_clip_val=1.0,
-        # callbacks=callbacks,
     )
     trainer.fit(model, data_module)
 

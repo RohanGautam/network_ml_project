@@ -15,19 +15,11 @@ class ST_GCNN_Layer(nn.Module):
             self.edge_importance = nn.Parameter(torch.ones(11, 11))
 
     def forward(self, x, A):
-        # x: [Batch, Channels, Time, Nodes]
-        # A: [Batch, Time, Nodes, Nodes]
-        
-        # Apply learnable edge weights if enabled
+        # x: [Batch, Channels, Time, Nodes]   A: [Batch, Time, Nodes, Nodes]
         if self.use_edge_importance:
             A = A * self.edge_importance
-            
-        # 1. Spatial Graph Convolution
         spatial_out = torch.einsum('btvw, bctw -> bctv', A, x)
-        
-        # 2. Temporal Convolution
         temporal_out = self.prelu(self.tcn(spatial_out))
-        
         return temporal_out
 
 
@@ -54,30 +46,21 @@ class Social_STGCNN(nn.Module):
         self.st_gcnn3 = ST_GCNN_Layer(hidden_dim, hidden_dim, use_edge_importance=use_edge_importance)
         
         self.txp = TXP_CNN(hidden_dim, obs_len, pred_len)
-        
-        # Final projection (5 params)
         self.predict = nn.Conv2d(hidden_dim, 5, kernel_size=1)
 
     def forward(self, x, A):
         x = self.st_gcnn1(x, A)
         x = self.st_gcnn2(x, A)
         x = self.st_gcnn3(x, A)
-        
-        # Temporal extrapolation (8 -> 12)
-        x = self.txp(x) 
-        out = self.predict(x) # [Batch, 5_params, 12_frames, 11_nodes]
-        
-        # Split and apply constraints
+        x = self.txp(x)        # temporal extrapolation, obs_len -> pred_len
+        out = self.predict(x)  # [Batch, 5_params, 12_frames, 11_nodes]
+
         mu_x = out[:, 0, :, :]
         mu_y = out[:, 1, :, :]
-        
-        # Clip exponential so variance doesn't explode
-        log_sig_x = torch.clamp(out[:, 2, :, :], min=-4.6, max=6.9) # exp(-4.6) ~= 0.01, exp(6.9) ~= 1000
+        # clamp log-σ before exp so variance can't explode: exp(-4.6)≈0.01, exp(6.9)≈1000
+        log_sig_x = torch.clamp(out[:, 2, :, :], min=-4.6, max=6.9)
         log_sig_y = torch.clamp(out[:, 3, :, :], min=-4.6, max=6.9)
         sig_x = torch.exp(log_sig_x)
         sig_y = torch.exp(log_sig_y)
-        
-        # Clip correlation to avoid -1/1
         rho = torch.clamp(torch.tanh(out[:, 4, :, :]), min=-0.99, max=0.99)
-        
         return mu_x, mu_y, sig_x, sig_y, rho

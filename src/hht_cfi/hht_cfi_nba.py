@@ -30,34 +30,34 @@ import lightning as L
 import pandas as pd
 import dotenv
 
-_SRC  = Path(__file__).resolve().parents[1]          # .../src/
-_ROOT = Path(__file__).resolve().parents[2]          # .../network_ml_project/
+_SRC = Path(__file__).resolve().parents[1]  # .../src/
+_ROOT = Path(__file__).resolve().parents[2]  # .../network_ml_project/
 
-sys.path.insert(0, str(_SRC))   # utils.metrics + hht_cfi package
+sys.path.insert(0, str(_SRC))  # utils.metrics + hht_cfi package
 
 from hht_cfi.models import MyTraj  # noqa: E402
 from utils.metrics import compute_ade, compute_fde, compute_mse  # noqa: E402
 
 dotenv.load_dotenv(dotenv.find_dotenv())
 
-DATA_DIR  = _ROOT / "data"
+DATA_DIR = _ROOT / "data"
 TRAIN_DIR = DATA_DIR / "train" / "train"
-TEST_DIR  = DATA_DIR / "test"  / "test"
-SUB_DIR   = _ROOT / "submissions"
+TEST_DIR = DATA_DIR / "test" / "test"
+SUB_DIR = _ROOT / "submissions"
 SUB_DIR.mkdir(exist_ok=True)
 
 
 class _Args:
-    hidden_size      = 64
-    obs_length       = 8
-    pred_length      = 12
-    seq_length       = 20
-    final_mode       = 20
-    input_offset     = True   # use velocity offsets as encoder input
-    input_mix        = False
-    input_position   = False
+    hidden_size = 64
+    obs_length = 8
+    pred_length = 12
+    seq_length = 20
+    final_mode = 20
+    input_offset = True  # use velocity offsets as encoder input
+    input_mix = False
+    input_position = False
     x_encoder_layers = 3
-    x_encoder_head   = 8
+    x_encoder_head = 8
 
     def __init__(self, **kw):
         for k, v in kw.items():
@@ -69,7 +69,7 @@ class NBADataset(Dataset):
         super().__init__()
         self.context_size = context_size
         self.horizon_size = horizon_size
-        self.window_size  = context_size + horizon_size
+        self.window_size = context_size + horizon_size
         self._load(files, mu, sigma)
 
     def _load(self, files, mu, sigma):
@@ -90,18 +90,20 @@ class NBADataset(Dataset):
     def __getitem__(self, index):
         seq_idx, start = index
         X = self.sequences[seq_idx][start : start + self.context_size]
-        y = self.sequences[seq_idx][start + self.context_size : start + self.window_size]
+        y = self.sequences[seq_idx][
+            start + self.context_size : start + self.window_size
+        ]
         return X, y
 
 
 class NBASampler(Sampler):
     def __init__(self, batch_size, max_start, seed=0, shuffle=True):
         self.batch_size = batch_size
-        self.max_start  = max_start
-        self.seed       = seed
-        self.shuffle    = shuffle
-        self.epoch      = 0
-        self.generator  = torch.Generator().manual_seed(seed)
+        self.max_start = max_start
+        self.seed = seed
+        self.shuffle = shuffle
+        self.epoch = 0
+        self.generator = torch.Generator().manual_seed(seed)
 
     def set_epoch(self, epoch):
         self.epoch = epoch
@@ -111,54 +113,80 @@ class NBASampler(Sampler):
         return len(self.max_start)
 
     def __iter__(self):
-        n    = len(self)
-        perm = torch.randperm(n, generator=self.generator).tolist() if self.shuffle else list(range(n))
+        n = len(self)
+        perm = (
+            torch.randperm(n, generator=self.generator).tolist()
+            if self.shuffle
+            else list(range(n))
+        )
         perm_start = [(i, self.max_start[i]) for i in perm]
         for k in range(0, n, self.batch_size):
             for idx, max_start in perm_start[k : k + self.batch_size]:
-                start = torch.randint(0, max_start + 1, size=(), generator=self.generator)
+                start = torch.randint(
+                    0, max_start + 1, size=(), generator=self.generator
+                )
                 yield idx, start
 
 
 class NBADataModule(L.LightningDataModule):
-    def __init__(self, split_path, batch_size=16, context_size=8, horizon_size=12, seed=0,
-                 data_fraction=1.0):
+    def __init__(
+        self,
+        split_path,
+        batch_size=16,
+        context_size=8,
+        horizon_size=12,
+        seed=0,
+        data_fraction=1.0,
+    ):
         super().__init__()
-        self.split_path    = split_path
-        self.batch_size    = batch_size
-        self.context_size  = context_size
-        self.horizon_size  = horizon_size
-        self.seed          = seed
+        self.split_path = split_path
+        self.batch_size = batch_size
+        self.context_size = context_size
+        self.horizon_size = horizon_size
+        self.seed = seed
         self.data_fraction = data_fraction
         self.mu = self.sigma = None
 
     def setup(self, stage=None):
         import random
-        manifest    = json.loads(Path(self.split_path).read_text())
-        data_dir    = _ROOT / manifest["data_dir"]
+
+        manifest = json.loads(Path(self.split_path).read_text())
+        data_dir = _ROOT / manifest["data_dir"]
         train_files = [data_dir / f for f in manifest["train"]]
-        val_files   = [data_dir / f for f in manifest["val"]]
+        val_files = [data_dir / f for f in manifest["val"]]
         if self.data_fraction < 1.0:
             rng = random.Random(self.seed)
-            k   = max(1, int(len(train_files) * self.data_fraction))
+            k = max(1, int(len(train_files) * self.data_fraction))
             train_files = rng.sample(train_files, k)
         self.mu, self.sigma = self._norm_stats(train_files)
-        self.train_ds = NBADataset(train_files, self.context_size, self.horizon_size, self.mu, self.sigma)
-        self.val_ds   = NBADataset(val_files,   self.context_size, self.horizon_size, self.mu, self.sigma)
+        self.train_ds = NBADataset(
+            train_files, self.context_size, self.horizon_size, self.mu, self.sigma
+        )
+        self.val_ds = NBADataset(
+            val_files, self.context_size, self.horizon_size, self.mu, self.sigma
+        )
 
     def _norm_stats(self, files):
-        all_pos = torch.cat([torch.load(f, weights_only=False)[:, :, :2] for f in files])
+        all_pos = torch.cat(
+            [torch.load(f, weights_only=False)[:, :, :2] for f in files]
+        )
         return all_pos.mean((0, 1)), all_pos.std((0, 1))
 
     def train_dataloader(self):
-        s = NBASampler(self.batch_size, self.train_ds.max_start, seed=self.seed, shuffle=True)
+        s = NBASampler(
+            self.batch_size, self.train_ds.max_start, seed=self.seed, shuffle=True
+        )
         return DataLoader(self.train_ds, batch_size=self.batch_size, sampler=s)
 
     def val_dataloader(self):
-        s = NBASampler(self.batch_size, self.val_ds.max_start, seed=self.seed, shuffle=False)
+        s = NBASampler(
+            self.batch_size, self.val_ds.max_start, seed=self.seed, shuffle=False
+        )
         return DataLoader(self.val_ds, batch_size=self.batch_size, sampler=s)
 
-    def get_kaggle_submission(self, model: "NBAHHTCFILightningModel", test_dir: str, target_dir: str):
+    def get_kaggle_submission(
+        self, model: "NBAHHTCFILightningModel", test_dir: str, target_dir: str
+    ):
         rows = []
         for f in sorted(os.listdir(test_dir)):
             if not f.endswith(".pt"):
@@ -168,9 +196,9 @@ class NBADataModule(L.LightningDataModule):
             vel = torch.zeros_like(seq[:, :, :2])
             vel[1:] = seq[1:, :, :2] - seq[:-1, :, :2]
             seq = torch.cat([seq[:, :, :2], vel, seq[:, :, 2:]], dim=-1)
-            context = seq[-self.context_size:]               # last 8 frames
+            context = seq[-self.context_size :]  # last 8 frames
             traj = model.get_trajectory(context, self.mu, self.sigma)
-            flat = traj[self.context_size:, :, :2].reshape(-1)
+            flat = traj[self.context_size :, :, :2].reshape(-1)
             rows.append([int(f.removesuffix(".pt"))] + flat.tolist())
 
         cols = ["id"] + [
@@ -179,8 +207,8 @@ class NBADataModule(L.LightningDataModule):
             for i in range(11)
             for ax in ["x", "y"]
         ]
-        ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-        df  = pd.DataFrame(rows, columns=cols).set_index("id").sort_index()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        df = pd.DataFrame(rows, columns=cols).set_index("id").sort_index()
         out = os.path.join(target_dir, f"solution_hhtcfi_{ts}.csv")
         df.to_csv(out)
         print(f"Saved: {out}")
@@ -208,28 +236,32 @@ def _to_hht_inputs(X: Tensor, y: Tensor, mu: Tensor, sigma: Tensor):
     """
     B, T_obs, N, _ = X.shape
     T_pred = y.shape[1]
-    H      = T_obs + T_pred
-    dev    = X.device
+    H = T_obs + T_pred
+    dev = X.device
 
     # 1. Denormalize to absolute feet
-    abs_obs  = X[:, :, :, :2] * sigma + mu           # [B, T_obs,  N, 2]
-    abs_pred = y[:, :, :, :2] * sigma + mu           # [B, T_pred, N, 2]
-    abs_full = torch.cat([abs_obs, abs_pred], dim=1) # [B, H, N, 2]
+    abs_obs = X[:, :, :, :2] * sigma + mu  # [B, T_obs,  N, 2]
+    abs_pred = y[:, :, :, :2] * sigma + mu  # [B, T_pred, N, 2]
+    abs_full = torch.cat([abs_obs, abs_pred], dim=1)  # [B, H, N, 2]
 
     # 2. HHT-CFI per-agent normalization
-    shift   = abs_obs[:, -1, :, :]                               # [B, N, 2]
-    centered = abs_full - shift.unsqueeze(1)                     # [B, H, N, 2]
-    max_v   = centered[:, :T_obs].abs().amax(dim=1).clamp(min=1.0)  # [B, N, 2]
-    hht_norm = centered / max_v.unsqueeze(1)                    # [B, H, N, 2]
+    shift = abs_obs[:, -1, :, :]  # [B, N, 2]
+    centered = abs_full - shift.unsqueeze(1)  # [B, H, N, 2]
+    max_v = centered[:, :T_obs].abs().amax(dim=1).clamp(min=1.0)  # [B, N, 2]
+    hht_norm = centered / max_v.unsqueeze(1)  # [B, H, N, 2]
 
     # 3. Flatten: scene-major order [H, B*N, 2]
     norm_flat = hht_norm.permute(1, 0, 2, 3).reshape(H, B * N, 2)
-    abs_flat  = abs_full.permute(1, 0, 2, 3).reshape(H, B * N, 2)
+    abs_flat = abs_full.permute(1, 0, 2, 3).reshape(H, B * N, 2)
 
     # Agent type: ball=0, team_A=1, team_B=2
     # is_player ∈ {0,1}, team_id ∈ {-1,0,1} (-1=team_B, 0=ball, 1=team_A)
-    agent_type = (X[:, 0, :, 4].long() + (X[:, 0, :, 5] < 0).long()).reshape(B * N)  # [B*N]
-    agent_type_col = agent_type.float().unsqueeze(0).expand(H, -1).unsqueeze(-1)       # [H, B*N, 1]
+    agent_type = (X[:, 0, :, 4].long() + (X[:, 0, :, 5] < 0).long()).reshape(
+        B * N
+    )  # [B*N]
+    agent_type_col = (
+        agent_type.float().unsqueeze(0).expand(H, -1).unsqueeze(-1)
+    )  # [H, B*N, 1]
     batch_abs_gt = torch.cat([abs_flat, agent_type_col], dim=-1)
 
     # batch_split: one (left, right) tensor pair per scene
@@ -237,28 +269,28 @@ def _to_hht_inputs(X: Tensor, y: Tensor, mu: Tensor, sigma: Tensor):
 
     # shift_values [1, B*N, 2]: decoder does squeeze(0) → [B*N, 2]
     shift_flat = shift.reshape(1, B * N, 2)
-    max_flat   = max_v.reshape(B * N, 2)
+    max_flat = max_v.reshape(B * N, 2)
 
     inputs = (batch_abs_gt, norm_flat, batch_split, shift_flat, max_flat)
 
     # edge_pair: full directed graph with LOCAL indices 0..N-1 per scene
     local_edges = _full_graph_edges(N, dev)
-    edge_pair   = {(i * N, (i + 1) * N): [local_edges] for i in range(B)}
+    edge_pair = {(i * N, (i + 1) * N): [local_edges] for i in range(B)}
 
     return inputs, edge_pair
 
 
 # mode selection: only one should be True at a time
-_USE_MIN_SCALE      = True   # most confident mode (min total Laplace scale)
+_USE_MIN_SCALE = True  # most confident mode (min total Laplace scale)
 _USE_SIGMA_WEIGHTED = False  # precision-weighted mean over all K modes
-_USE_PER_AGENT_TYPE = False   # velocity-continuity for players, equal-mean for ball
-_USE_NMS            = False  # NMS: centroid of densest endpoint cluster
+_USE_PER_AGENT_TYPE = False  # velocity-continuity for players, equal-mean for ball
+_USE_NMS = False  # NMS: centroid of densest endpoint cluster
 
 # stackable toggles
-_USE_TTA   = True   # 4-way test-time augmentation (orig + y-flip + x-flip + both)
-_USE_CLAMP = True    # clip predictions to NBA court bounds
+_USE_TTA = True  # 4-way test-time augmentation (orig + y-flip + x-flip + both)
+_USE_CLAMP = True  # clip predictions to NBA court bounds
 
-_NMS_RADIUS     = 0.5   # neighbor radius in HHT-normalised space for NMS
+_NMS_RADIUS = 0.5  # neighbor radius in HHT-normalised space for NMS
 _COURT_HALF_LEN = 47.5  # ft  (x-axis: baseline to baseline)
 _COURT_HALF_WID = 25.0  # ft  (y-axis: sideline to sideline)
 
@@ -273,8 +305,8 @@ class NBAHHTCFIModel(nn.Module):
             x_encoder_layers=x_encoder_layers,
             x_encoder_head=x_encoder_head,
         )
-        self.model  = MyTraj(self.args)
-        self.T_obs  = self.args.obs_length
+        self.model = MyTraj(self.args)
+        self.T_obs = self.args.obs_length
         self.T_pred = self.args.pred_length
 
     def forward(self, X: Tensor, y: Tensor, mu: Tensor, sigma: Tensor, epoch: int = 0):
@@ -292,58 +324,60 @@ class NBAHHTCFIModel(nn.Module):
         BN = B * N
 
         # CV dummy future (used by the training loss path inside the model).
-        vel_norm   = X_obs[:, -1, :, 2:4]
-        pos_norm   = X_obs[:, -1, :, :2]
-        t          = torch.arange(1, self.T_pred + 1, dtype=X_obs.dtype, device=X_obs.device)
+        vel_norm = X_obs[:, -1, :, 2:4]
+        pos_norm = X_obs[:, -1, :, :2]
+        t = torch.arange(1, self.T_pred + 1, dtype=X_obs.dtype, device=X_obs.device)
         future_pos = pos_norm.unsqueeze(1) + vel_norm.unsqueeze(1) * t.view(1, -1, 1, 1)
-        dummy_y    = X_obs[:, -1:, :, :].expand(-1, self.T_pred, -1, -1).clone()
+        dummy_y = X_obs[:, -1:, :, :].expand(-1, self.T_pred, -1, -1).clone()
         dummy_y[:, :, :, :2] = future_pos
 
         inputs, edge_pair = _to_hht_inputs(X_obs, dummy_y, mu, sigma)
-        _, full_pre_tra   = self.model(inputs, edge_pair, epoch=0)
+        _, full_pre_tra = self.model(inputs, edge_pair, epoch=0)
 
-        out_mu_all    = full_pre_tra[2]   # [K, B*N, T_pred, 2]  HHT-normalised space
-        out_sigma_all = full_pre_tra[3]   # [K, B*N, T_pred, 2]
-        K             = out_mu_all.shape[0]
+        out_mu_all = full_pre_tra[2]  # [K, B*N, T_pred, 2]  HHT-normalised space
+        out_sigma_all = full_pre_tra[3]  # [K, B*N, T_pred, 2]
+        K = out_mu_all.shape[0]
 
         abs_obs = X_obs[:, :, :, :2] * sigma + mu
-        shift   = abs_obs[:, -1].reshape(BN, 2)
-        max_v   = (abs_obs - abs_obs[:, -1:]).abs().amax(1).reshape(BN, 2).clamp(min=1.0)
+        shift = abs_obs[:, -1].reshape(BN, 2)
+        max_v = (abs_obs - abs_obs[:, -1:]).abs().amax(1).reshape(BN, 2).clamp(min=1.0)
 
         # mode selection
         if _USE_SIGMA_WEIGHTED:
             # Precision-weighted mixture: modes with lower total scale get higher weight.
-            weights  = (1.0 / out_sigma_all.sum(dim=(-1, -2)))**10     # [K, B*N]
-            weights  = weights / weights.sum(dim=0, keepdim=True)  # normalise
+            weights = (1.0 / out_sigma_all.sum(dim=(-1, -2))) ** 10  # [K, B*N]
+            weights = weights / weights.sum(dim=0, keepdim=True)  # normalise
             pred_hht = (out_mu_all * weights[:, :, None, None]).sum(0).permute(1, 0, 2)
 
         elif _USE_PER_AGENT_TYPE:
             # Players  → velocity-continuity: pick mode whose first step best matches
             #            the last observed velocity (smooth handoff at boundary).
             # Ball     → equal-weight mean (ball is stochastic; hedge across modes).
-            is_player    = X_obs[:, 0, :, 4].reshape(BN).bool()
-            last_vel_abs = (X_obs[:, -1, :, 2:4] * sigma).reshape(BN, 2)     # [BN, 2]
-            first_disp   = out_mu_all[:, :, 0, :] * max_v.unsqueeze(0)       # [K, BN, 2]
-            vel_err      = torch.norm(first_disp - last_vel_abs.unsqueeze(0), dim=-1)  # [K, BN]
-            best_player  = vel_err.argmin(dim=0)                              # [BN]
+            is_player = X_obs[:, 0, :, 4].reshape(BN).bool()
+            last_vel_abs = (X_obs[:, -1, :, 2:4] * sigma).reshape(BN, 2)  # [BN, 2]
+            first_disp = out_mu_all[:, :, 0, :] * max_v.unsqueeze(0)  # [K, BN, 2]
+            vel_err = torch.norm(
+                first_disp - last_vel_abs.unsqueeze(0), dim=-1
+            )  # [K, BN]
+            best_player = vel_err.argmin(dim=0)  # [BN]
 
-            pred_hht_bn             = out_mu_all.mean(dim=0).clone()          # [BN, T, 2] ball default
-            player_idx              = is_player.nonzero(as_tuple=True)[0]
+            pred_hht_bn = out_mu_all.mean(dim=0).clone()  # [BN, T, 2] ball default
+            player_idx = is_player.nonzero(as_tuple=True)[0]
             pred_hht_bn[player_idx] = out_mu_all[best_player[player_idx], player_idx]
-            pred_hht = pred_hht_bn.permute(1, 0, 2)                          # [T, BN, 2]
+            pred_hht = pred_hht_bn.permute(1, 0, 2)  # [T, BN, 2]
 
         elif _USE_NMS:
             # Endpoint clustering: pick the mode that has the most neighbours
             # (densest cluster in final-position space) — consensus trajectory.
-            endpoints = out_mu_all[:, :, -1, :]                               # [K, BN, 2]
-            diff      = endpoints.unsqueeze(0) - endpoints.unsqueeze(1)       # [K, K, BN, 2]
-            dists     = torch.norm(diff, dim=-1)                              # [K, K, BN]
-            neighbors = (dists < _NMS_RADIUS).sum(dim=1)                     # [K, BN]
-            best_nms  = neighbors.argmax(dim=0)                               # [BN]
-            pred_hht  = out_mu_all[best_nms, torch.arange(BN)].permute(1, 0, 2)
+            endpoints = out_mu_all[:, :, -1, :]  # [K, BN, 2]
+            diff = endpoints.unsqueeze(0) - endpoints.unsqueeze(1)  # [K, K, BN, 2]
+            dists = torch.norm(diff, dim=-1)  # [K, K, BN]
+            neighbors = (dists < _NMS_RADIUS).sum(dim=1)  # [K, BN]
+            best_nms = neighbors.argmax(dim=0)  # [BN]
+            pred_hht = out_mu_all[best_nms, torch.arange(BN)].permute(1, 0, 2)
 
         else:  # _USE_MIN_SCALE or default fallback
-            best     = out_sigma_all.sum(dim=(-1, -2)).argmin(dim=0)         # [BN]
+            best = out_sigma_all.sum(dim=(-1, -2)).argmin(dim=0)  # [BN]
             pred_hht = out_mu_all[best, torch.arange(BN)].permute(1, 0, 2)
 
         return pred_hht * max_v.unsqueeze(0) + shift.unsqueeze(0)
@@ -360,7 +394,7 @@ class NBAHHTCFIModel(nn.Module):
                                      _USE_PER_AGENT_TYPE / _USE_NMS
           Stackable:                 _USE_TTA, _USE_CLAMP
         """
-        pred = self._forward_single(X_obs, mu, sigma)   # [T_pred, B*N, 2]
+        pred = self._forward_single(X_obs, mu, sigma)  # [T_pred, B*N, 2]
 
         if _USE_TTA:
             # 4-way augmentation: orig + y-flip + x-flip + both-flip (180° rotation).
@@ -418,33 +452,37 @@ class NBAHHTCFIModel(nn.Module):
         out_mu_all = full_pre_tra[2]  # [K=20, B*N, T_pred, 2] in HHT space
 
         abs_obs = X_obs[:, :, :, :2] * sigma + mu
-        shift   = abs_obs[:, -1].reshape(B * N, 2)                                     # [B*N, 2]
-        max_v   = (abs_obs - abs_obs[:, -1:]).abs().amax(1).reshape(B * N, 2).clamp(min=1.0)
+        shift = abs_obs[:, -1].reshape(B * N, 2)  # [B*N, 2]
+        max_v = (
+            (abs_obs - abs_obs[:, -1:]).abs().amax(1).reshape(B * N, 2).clamp(min=1.0)
+        )
 
         # denormalize: [K, B*N, T_pred, 2] → [K, T_pred, B*N, 2]
-        denorm = out_mu_all * max_v.unsqueeze(0).unsqueeze(2) + shift.unsqueeze(0).unsqueeze(2)
+        denorm = out_mu_all * max_v.unsqueeze(0).unsqueeze(2) + shift.unsqueeze(
+            0
+        ).unsqueeze(2)
         return denorm.permute(0, 2, 1, 3)
 
 
 class NBAHHTCFILightningModel(L.LightningModule):
     def __init__(
         self,
-        hidden_size: int      = 64,
+        hidden_size: int = 64,
         x_encoder_layers: int = 3,
-        x_encoder_head: int   = 8,
-        lr: float             = 1e-3,
+        x_encoder_head: int = 8,
+        lr: float = 1e-3,
     ):
         super().__init__()
         self.save_hyperparameters()
         self.net = NBAHHTCFIModel(hidden_size, x_encoder_layers, x_encoder_head)
-        self.mu: Tensor | None    = None
+        self.mu: Tensor | None = None
         self.sigma: Tensor | None = None
 
     def on_fit_start(self):
         dm = self.trainer.datamodule
         # Plain attributes (not buffers) so mu/sigma don't pollute the checkpoint
         # state dict.  The notebook reattaches them from the datamodule after load.
-        self.mu    = dm.mu.to(self.device)
+        self.mu = dm.mu.to(self.device)
         self.sigma = dm.sigma.to(self.device)
 
     def training_step(self, batch, batch_idx):
@@ -456,27 +494,45 @@ class NBAHHTCFILightningModel(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         X, y = batch
         B, T_pred, N = y.shape[0], y.shape[1], y.shape[2]
-        loss, full_pre_tra = self.net(X, y, self.mu, self.sigma, epoch=self.current_epoch)
+        loss, full_pre_tra = self.net(
+            X, y, self.mu, self.sigma, epoch=self.current_epoch
+        )
 
         # pred_hht: [T_pred, B*N, 2] in HHT-CFI normalized space
         pred_hht = full_pre_tra[0][-T_pred:]
 
         # denormalize to absolute feet
-        abs_obs  = X[:, :, :, :2] * self.sigma + self.mu
-        shift    = abs_obs[:, -1].reshape(B * N, 2)
-        max_v    = (abs_obs - abs_obs[:, -1:]).abs().amax(1).reshape(B * N, 2).clamp(min=1.0)
-        pred_abs = pred_hht * max_v.unsqueeze(0) + shift.unsqueeze(0)   # [T_pred, B*N, 2]
+        abs_obs = X[:, :, :, :2] * self.sigma + self.mu
+        shift = abs_obs[:, -1].reshape(B * N, 2)
+        max_v = (
+            (abs_obs - abs_obs[:, -1:]).abs().amax(1).reshape(B * N, 2).clamp(min=1.0)
+        )
+        pred_abs = pred_hht * max_v.unsqueeze(0) + shift.unsqueeze(
+            0
+        )  # [T_pred, B*N, 2]
 
-        tgt_abs  = (y[:, :, :, :2] * self.sigma + self.mu).permute(1, 0, 2, 3).reshape(T_pred, B * N, 2)
+        tgt_abs = (
+            (y[:, :, :, :2] * self.sigma + self.mu)
+            .permute(1, 0, 2, 3)
+            .reshape(T_pred, B * N, 2)
+        )
 
-        self.log("val/loss",   loss,                            on_epoch=True, prog_bar=True)
-        self.log("val/ade_ft", compute_ade(pred_abs, tgt_abs),  on_epoch=True, prog_bar=True)
-        self.log("val/fde_ft", compute_fde(pred_abs, tgt_abs),  on_epoch=True, prog_bar=True)
-        self.log("val/mse_ft", compute_mse(pred_abs, tgt_abs),  on_epoch=True, prog_bar=True)
+        self.log("val/loss", loss, on_epoch=True, prog_bar=True)
+        self.log(
+            "val/ade_ft", compute_ade(pred_abs, tgt_abs), on_epoch=True, prog_bar=True
+        )
+        self.log(
+            "val/fde_ft", compute_fde(pred_abs, tgt_abs), on_epoch=True, prog_bar=True
+        )
+        self.log(
+            "val/mse_ft", compute_mse(pred_abs, tgt_abs), on_epoch=True, prog_bar=True
+        )
 
     def configure_optimizers(self):
-        opt   = torch.optim.Adam(self.parameters(), lr=self.hparams.lr, weight_decay=5e-4)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=1000, eta_min=1e-5)
+        opt = torch.optim.Adam(self.parameters(), lr=self.hparams.lr, weight_decay=5e-4)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=1000, eta_min=1e-5
+        )
         return {"optimizer": opt, "lr_scheduler": sched}
 
     def predict_batch(self, X_batch: Tensor) -> Tensor:
@@ -503,14 +559,17 @@ class NBAHHTCFILightningModel(L.LightningModule):
         with torch.no_grad():
             pred_abs = self.net.predict(
                 X_context.unsqueeze(0).to(self.device),
-                mu.to(self.device), sigma.to(self.device),
-            ).cpu()                                                 # [T_pred, N, 2]
+                mu.to(self.device),
+                sigma.to(self.device),
+            ).cpu()  # [T_pred, N, 2]
 
-        obs_abs  = (X_context[:, :, :2] * sigma + mu).cpu()       # [T_obs, N, 2]
-        static   = X_context[-1, :, 4:].unsqueeze(0).expand(self.net.T_pred, -1, -1).cpu()
-        pred_out = torch.cat([pred_abs, static], dim=-1)           # [T_pred, N, 4]
-        obs_out  = torch.cat([obs_abs,  X_context[:, :, 4:].cpu()], dim=-1)   # [T_obs, N, 4]
-        return torch.cat([obs_out, pred_out], dim=0)               # [T_obs+T_pred, N, 4]
+        obs_abs = (X_context[:, :, :2] * sigma + mu).cpu()  # [T_obs, N, 2]
+        static = X_context[-1, :, 4:].unsqueeze(0).expand(self.net.T_pred, -1, -1).cpu()
+        pred_out = torch.cat([pred_abs, static], dim=-1)  # [T_pred, N, 4]
+        obs_out = torch.cat(
+            [obs_abs, X_context[:, :, 4:].cpu()], dim=-1
+        )  # [T_obs, N, 4]
+        return torch.cat([obs_out, pred_out], dim=0)  # [T_obs+T_pred, N, 4]
 
 
 if __name__ == "__main__":
@@ -521,7 +580,7 @@ if __name__ == "__main__":
 
     dm = NBADataModule(
         split_path=str(_ROOT / "splits" / "fold0.json"),
-        batch_size=16,   # smaller than EqMotion — decoder builds [B*N, B*N] distance matrix
+        batch_size=16,  # smaller than EqMotion — decoder builds [B*N, B*N] distance matrix
     )
 
     model = NBAHHTCFILightningModel(lr=1e-3)

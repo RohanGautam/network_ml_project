@@ -3,7 +3,6 @@ import torch
 from pathlib import Path
 from torch.utils.data import DataLoader
 
-# Add 'src' directory to python path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stgcnn.dataset import NBADataset
@@ -19,12 +18,10 @@ def evaluate(model_path: str, tta: bool = False, clamp: bool = False):
         device = torch.device("cpu")
     print(f"Using device: {device}")
     
-    # Load checkpoint first to auto-detect model parameters
     checkpoint = torch.load(model_path, map_location=device)
     state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
-    
-    # Auto-detect parameters
-    # st_gcnn1.tcn.weight shape is [hidden_dim, in_channels, kernel_size, 1]
+
+    # auto-detect architecture from weights; st_gcnn1.tcn.weight is [hidden_dim, in_channels, kernel_size, 1]
     in_channels = state_dict["st_gcnn1.tcn.weight"].shape[1]
     hidden_dim = state_dict["st_gcnn1.tcn.weight"].shape[0]
     use_edge_importance = "st_gcnn1.edge_importance" in state_dict
@@ -34,7 +31,6 @@ def evaluate(model_path: str, tta: bool = False, clamp: bool = False):
     print(f"  hidden_dim: {hidden_dim}")
     print(f"  use_edge_importance: {use_edge_importance}")
     
-    # Load dataset with matching kinematics setting
     val_dataset = NBADataset(
         split_file="splits/fold0.json", 
         data_dir="data/train/train", 
@@ -42,8 +38,7 @@ def evaluate(model_path: str, tta: bool = False, clamp: bool = False):
         use_kinematics=(in_channels == 6)
     )
     val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
-    
-    # Load model
+
     model = Social_STGCNN(
         in_channels=in_channels,
         hidden_dim=hidden_dim,
@@ -87,14 +82,11 @@ def evaluate(model_path: str, tta: bool = False, clamp: bool = False):
                         # Negate acceleration in that axis (ax + 4)
                         X_flip[:, ax + 4] = -X_flip[:, ax + 4]
                 
-                # Predict
                 mu_x, mu_y, _, _, _ = model(X_flip, A)
                 pred = torch.stack([mu_x, mu_y], dim=-1) # [B, 12, 11, 2]
-                
-                # Denormalize
                 pred_denorm = pred * sigma + mu
-                
-                # Un-reflect output coordinates
+
+                # un-reflect the predictions back to the original frame
                 for ax in axes:
                     pred_denorm[..., ax] = -pred_denorm[..., ax]
                 preds.append(pred_denorm)
@@ -108,11 +100,10 @@ def evaluate(model_path: str, tta: bool = False, clamp: bool = False):
             all_preds.append(pred_final.cpu())
             all_targets.append(Y_denorm.cpu())
             
-    # Concatenate all batches
     all_preds_t = torch.cat(all_preds, dim=0) # [Total, 12, 11, 2]
     all_targets_t = torch.cat(all_targets, dim=0) # [Total, 12, 11, 2]
-    
-    # Reshape to [12, Total * 11, 2] to match metric expectation
+
+    # reshape to [12, Total * 11, 2] to match the metric functions' expected layout
     preds_flat = all_preds_t.permute(1, 0, 2, 3).reshape(12, -1, 2)
     targets_flat = all_targets_t.permute(1, 0, 2, 3).reshape(12, -1, 2)
     

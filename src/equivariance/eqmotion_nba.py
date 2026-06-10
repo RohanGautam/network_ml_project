@@ -441,6 +441,7 @@ class NBADataModule(L.LightningDataModule):
         iso_norm=False,
         full_val=False,
         val_windows_per_seq=8,
+        train_all=False,
     ):
         super().__init__()
         self.split_path = split_path
@@ -456,6 +457,10 @@ class NBADataModule(L.LightningDataModule):
         self.iso_norm = iso_norm
         self.full_val = full_val
         self.val_windows_per_seq = val_windows_per_seq
+        # train_all: fold the val split into training and skip validation entirely
+        # (for the final Kaggle model — uses every labelled sequence). Normalization
+        # stats are then computed over train+val so they match the data trained on.
+        self.train_all = train_all
         self.mu = None
         self.sigma = None
 
@@ -464,6 +469,10 @@ class NBADataModule(L.LightningDataModule):
         data_dir = PROJECT_ROOT / manifest["data_dir"]
         train_files = [data_dir / f for f in manifest["train"]]
         val_files = [data_dir / f for f in manifest["val"]]
+        if self.train_all:
+            # No held-out fold: train on everything, no val_dataset.
+            train_files = train_files + val_files
+            val_files = []
         self.mu, self.sigma = self._compute_normalization_statistics(train_files)
         self.train_dataset = NBADataset(
             train_files,
@@ -473,13 +482,17 @@ class NBADataModule(L.LightningDataModule):
             self.sigma,
             landmarks=self.landmarks,
         )
-        self.val_dataset = NBADataset(
-            val_files,
-            self.context_size,
-            self.horizon_size,
-            self.mu,
-            self.sigma,
-            landmarks=self.landmarks,
+        self.val_dataset = (
+            None
+            if self.train_all
+            else NBADataset(
+                val_files,
+                self.context_size,
+                self.horizon_size,
+                self.mu,
+                self.sigma,
+                landmarks=self.landmarks,
+            )
         )
 
     def _compute_normalization_statistics(self, files):
@@ -508,6 +521,8 @@ class NBADataModule(L.LightningDataModule):
         )
 
     def val_dataloader(self):
+        if self.train_all or self.val_dataset is None:
+            return None
         if self.full_val:
             # Deterministic, evenly-spaced windows → stable val/mse_ft for robust
             # checkpoint selection (no epoch-to-epoch window-draw noise).
@@ -553,7 +568,6 @@ class NBADataModule(L.LightningDataModule):
                 seq = torch.cat([seq, land_nodes], dim=1)
 
             traj = model.get_trajectory(seq, self.mu, self.sigma)
-            # traj = traj[8:, :, :2].reshape(-1)
             traj = traj[8:, :11, :2].reshape(-1)
             all_traj.append([int(f.removesuffix(".pt"))] + traj.tolist())
         df = (
@@ -639,6 +653,13 @@ if __name__ == "__main__":
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-submit", action="store_true")
+    p.add_argument(
+        "--train-all",
+        action="store_true",
+        help="Train on the FULL labelled dataset (train+val folded together) with "
+             "NO validation — for the final Kaggle model. Disables val/checkpoint "
+             "selection + early stopping; submits from the final-epoch model.",
+    )
     args = p.parse_args()
 
     L.seed_everything(args.seed, workers=True)
@@ -661,6 +682,7 @@ if __name__ == "__main__":
         landmarks=landmarks,
         full_val=args.full_val,
         val_windows_per_seq=args.val_windows,
+        train_all=args.train_all,
     )
 
     model = NBAEqMotionLightningModel(
@@ -679,35 +701,57 @@ if __name__ == "__main__":
 
     wandb_logger = WandbLogger(project="NML_base", name=args.run_name)
 
-    ckpt_cb = ModelCheckpoint(
-        dirpath=str(PROJECT_ROOT / "checkpoints" / "eqmotion" / args.run_name),
-        filename="best",
-        monitor=args.monitor,
-        mode="min",
-        save_top_k=1,
-    )
-    early_stop = EarlyStopping(monitor=args.monitor, patience=args.patience, mode="min")
+    ckpt_dir = str(PROJECT_ROOT / "checkpoints" / "eqmotion" / args.run_name)
+    if args.train_all:
+        # No val metric to select on: just persist the final-epoch weights.
+        ckpt_cb = ModelCheckpoint(dirpath=ckpt_dir, filename="last", save_last=True)
+        callbacks = [ckpt_cb]
+    else:
+        ckpt_cb = ModelCheckpoint(
+            dirpath=ckpt_dir,
+            filename="best",
+            monitor=args.monitor,
+            mode="min",
+            save_top_k=1,
+        )
+        early_stop = EarlyStopping(
+            monitor=args.monitor, patience=args.patience, mode="min"
+        )
+        callbacks = [ckpt_cb, early_stop]
 
     trainer = L.Trainer(
         max_epochs=args.max_epochs,
         logger=wandb_logger,
         accelerator="auto",
         gradient_clip_val=args.grad_clip,
-        callbacks=[ckpt_cb, early_stop],
+        callbacks=callbacks,
+        # No validation loop when training on the full dataset.
+        limit_val_batches=0 if args.train_all else 1.0,
+        num_sanity_val_steps=0 if args.train_all else 2,
     )
 
     trainer.fit(model, data_module)
-    print(f"[{args.run_name}] best {args.monitor} = {ckpt_cb.best_model_score.item():.4f}")
+    if not args.train_all:
+        print(f"[{args.run_name}] best {args.monitor} = "
+              f"{ckpt_cb.best_model_score.item():.4f}")
 
     if not args.no_submit:
-        # Submit from the BEST checkpoint, not the final-epoch model in memory
-        # (final epoch is typically worse than the checkpointed minimum).
-        best = (
-            NBAEqMotionLightningModel.load_from_checkpoint(
-                ckpt_cb.best_model_path, strict=False
+        if args.train_all:
+            # No held-out val ⇒ no "best" checkpoint; the final-epoch model in
+            # memory (trained on every sequence) is what we submit.
+            best = model.eval()
+            data_module.get_kaggle_submission(best, str(TEST_DIR), str(SUBMISSION_DIR))
+            print(f"[{args.run_name}] submission written from final-epoch model "
+                  f"(train-all; ckpt at {ckpt_cb.best_model_path or ckpt_dir})")
+        else:
+            # Submit from the BEST checkpoint, not the final-epoch model in memory
+            # (final epoch is typically worse than the checkpointed minimum).
+            best = (
+                NBAEqMotionLightningModel.load_from_checkpoint(
+                    ckpt_cb.best_model_path, strict=False
+                )
+                .to(model.device)
+                .eval()
             )
-            .to(model.device)
-            .eval()
-        )
-        data_module.get_kaggle_submission(best, str(TEST_DIR), str(SUBMISSION_DIR))
-        print(f"[{args.run_name}] submission written from {ckpt_cb.best_model_path}")
+            data_module.get_kaggle_submission(best, str(TEST_DIR), str(SUBMISSION_DIR))
+            print(f"[{args.run_name}] submission written from {ckpt_cb.best_model_path}")
