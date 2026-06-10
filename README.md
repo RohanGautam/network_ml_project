@@ -5,6 +5,7 @@ positions for 10 players and the ball, predict the next 12 frames. Scored on
 mean squared error in feet² (val/mse_ft).
 
 **Best result:** 0.70 × curriculum-MART + 0.30 × EqMotion blend → **Kaggle 2.93**
+
 Note: We got kaggle score of 2.92 using the entire dataset, which is just for the competetion!
 
 ---
