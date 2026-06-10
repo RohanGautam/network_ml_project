@@ -4,7 +4,7 @@ Multi-agent trajectory prediction on NBA game data. Given 8 frames of past
 positions for 10 players and the ball, predict the next 12 frames. Scored on
 mean squared error in feet² (val/mse_ft).
 
-**Best result:** 0.70 × curriculum-MART + 0.30 × EqMotion blend → **Kaggle 2.93**
+**Best result:** 0.70 × curriculum-MART + 0.30 × EqMotion blend → **Kaggle 2.92**
 
 ---
 
@@ -88,7 +88,7 @@ locally instead, use the `uv run python ...` commands shown per model below.
 
 ## Best model - curriculum-MART × EqMotion blend
 
-Our best submission (**Kaggle 2.93**) is a weighted blend of two independently
+Our best submission (**Kaggle 2.92**) is a weighted blend of two independently
 trained models:
 
 - **0.70 × curriculum-MART** - an augmented MART trained with a curriculum:
@@ -160,7 +160,7 @@ python blend_csvs.py \
     --out ../../submissions/blend_curriculum_mart70_eqm30.csv
 ```
 
-The resulting `blend_curriculum_mart70_eqm30.csv` is the **Kaggle 2.93**
+The resulting `blend_curriculum_mart70_eqm30.csv` is the **Kaggle 2.92**
 submission.
 
 ---
