@@ -37,7 +37,7 @@ sys.path.append(os.getcwd())
 # on `.metrics`. Loading by absolute file path bypasses the collision and
 # leaves both modules independently usable.
 HERE = Path(__file__).resolve().parent
-METRICS_PATH = HERE.parent / 'network_ml_project' / 'src' / 'utils' / 'metrics.py'
+METRICS_PATH = HERE.parent / 'utils' / 'metrics.py'
 if not METRICS_PATH.exists():
     raise RuntimeError(
         f'Expected metrics.py at {METRICS_PATH} — adjust the path if your '
@@ -58,6 +58,7 @@ from models.mart_id import MART_ID   # noqa: E402
 from loaders.dataloader_nba_pt import (   # noqa: E402
     MARTNBAPTDataset,
     WindowSampler,
+    WindowEvalSampler,
     load_split_files,
 )
 from loaders.dataloader_nba_pt_hoops import (   # noqa: E402
@@ -130,7 +131,7 @@ def main():
 
     # ---- Load checkpoint ----
     print(f'[INFO] loading checkpoint: {args.checkpoint}')
-    ckpt = torch.load(args.checkpoint, map_location='cpu')
+    ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     opts = Box(ckpt['opts'])
     mu = ckpt['mu'].float()         # [2]
     sigma = ckpt['sigma'].float()   # [2]
@@ -154,9 +155,7 @@ def main():
     val_set = DatasetCls(
         val_files, mu, sigma, opts.past_length, opts.future_length,
     )
-    val_sampler = WindowSampler(
-        opts.batch_size, val_set.max_start, seed=args.seed, shuffle=False,
-    )
+    val_sampler = WindowEvalSampler(val_set.max_start, windows_per_seq=8)
     val_loader = DataLoader(
         val_set, batch_size=args.batch_size, sampler=val_sampler,
         num_workers=args.num_workers,
